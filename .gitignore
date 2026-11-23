@@ -1,0 +1,44 @@
+# ---- Rust ----
+/target/
+**/*.rs.bk
+*.pdb
+*.exe.manifest
+
+# ---- 构建/发布暂存 ----
+/dist/
+/installer/*-setup.exe
+/installer/*.log
+installer/*.tmp
+
+# ---- 编辑器与 IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- 本地环境 ----
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.cer
+*.key
+secrets/
+
+# ---- 日志与本地调试产物 ----
+*.log
+*.dmp
+logs/
+
+# ---- 依赖缓存 ----
+node_modules/
+.cache/
+
+# ---- 协作/代理工作区（本地草稿、工作日志、检索索引，不进仓库）----
+/.scratch/
+/.memsearch/
+/.dsh/
+/.dsh-compat/

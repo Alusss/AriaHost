@@ -1,0 +1,24 @@
+# AriaHost — Cargo 构建配置（D13-A：静态链接 MSVC CRT）
+#
+# 这就是 D13-A「静态 CRT」的落点：x64 目标下所有 crate（含第三方依赖）都以
+# +crt-static 编译，产出的 ariahost.exe 不依赖 VCRUNTIME140.dll / MSVCP140.dll /
+# VCRUNTIME140_1.dll，用户机器无需预装 VC++ 运行库。
+#
+# 验收方式（验收 #15a，手工/CI 均可）：
+#     dumpbin /dependents target\x86_64-pc-windows-msvc\release\ariahost.exe
+# 依赖列表里不得出现 VCRUNTIME140*.dll 与 MSVCP140*.dll；出现即说明 rustflags 没生效
+# （常见原因：在别处用 --config 或 RUSTFLAGS 覆盖了它，RUSTFLAGS 环境变量优先于本文件）。
+#
+# 已知边界（【推断】未经实测，首次 CI 需实测确认）：
+# - proc-macro（如 serde_derive 等编译期 .dll）是宿主编译产物，不受 target rustflags 影响，
+#   仍动态链接 CRT；这不改变最终 ariahost.exe 的依赖集，但「pid 进程内是否引入 MSVCP140」
+#   需要实测确认，不要据此下结论。
+# - 改动 rustflags 会让 Cargo 的增量缓存整体失效（换一次全量重编，属预期）。
+#
+# 本文件从未在 CI 中实跑验证。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# M4 恢复 x86 时取消注释（Q3/Q15；同时同步 rust-toolchain.toml 的 targets 与 release.yml）：
+# [target.i686-pc-windows-msvc]
+# rustflags = ["-C", "target-feature=+crt-static"]

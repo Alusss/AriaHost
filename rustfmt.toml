@@ -1,0 +1,6 @@
+# rustfmt 配置：只使用 stable 通道支持的选项。
+# 需要 nightly 的键（imports_granularity / group_imports / …）不要加，CI 是 stable，会直接失败。
+edition = "2021"
+max_width = 100
+use_field_init_shorthand = true
+use_try_shorthand = true

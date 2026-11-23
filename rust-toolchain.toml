@@ -1,0 +1,15 @@
+# AriaHost 工具链 pin —— 全仓唯一事实源（S2 已定：Rust 1.95）
+#
+# 规则（违反即失效）：
+# - 不要在 workflow 里给 rust toolchain action 传 toolchain / targets / components 输入：
+#   该 action 在无输入时按本文件装工具链，传了就覆盖本文件的 pin。
+# - 在本仓库目录内跑任何 cargo / rustc，rustup 自动切到 1.95（首次会下载，需联网）。
+# - 升级只改下面 channel 一处，两个 workflow 自动跟随；不要在多处重复写版本号。
+# - 本文件的内容未经 CI 实跑验证（本仓库 CI 从未在 GitHub 上运行过）。
+[toolchain]
+channel = "1.95"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]
+# M4 恢复 x86 时，把上一行 targets 换成下面这行（Q3/Q15；同时同步 .cargo/config.toml 的 i686 段
+# 与 release.yml 里被注释掉的 build-x86 job）：
+# targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
