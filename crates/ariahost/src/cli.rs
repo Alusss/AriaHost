@@ -164,7 +164,20 @@ pub fn run(args: &[String]) -> i32 {
 fn execute(command: &Command) -> i32 {
     match command {
         Command::Panel => {
-            println!("panel: not implemented (M2)");
+            // M1 桩：图形面板在 M2 实现。双击快捷方式时这是用户唯一能看到的输出，所以：
+            //   ① 必须是中文、可读、说明「下一步该看什么」；
+            //   ② 不能一闪而过（v0.1.0 只 println 一行英文就 exit 0，用户报的是「启动闪退」，
+            //      见 docs/dev/release.md §9 记录）。M2 面板落地后删掉本分支与等待逻辑。
+            println!("AriaHost {VERSION}（预览版：命令行内核）");
+            println!();
+            println!("图形面板尚未实现（计划在 M2 提供）。当前版本可用的命令：");
+            println!("  ariahost --help             查看全部命令与用法");
+            println!("  ariahost --version          显示版本");
+            println!("  ariahost --service          以 Windows 服务方式运行（ServiceHost）");
+            println!();
+            println!("说明：本程序是 aria2 的服务管理器，不是下载器本身；");
+            println!("      面板、托盘、任务列表在 M2 交付，届时双击即开窗口。");
+            wait_for_enter_if_console();
             EXIT_OK
         }
         Command::Service => match ariahost_svc::run() {
@@ -204,6 +217,20 @@ fn execute(command: &Command) -> i32 {
             EXIT_OK
         }
     }
+}
+
+/// 双击快捷方式时控制台是新建的，进程一退出窗口立刻消失——用户看到的就是「启动闪退」。
+/// 只在 stdin 是终端时等待，避免 CI / 管道 / 服务场景（stdin 被重定向或为空）被阻塞。
+fn wait_for_enter_if_console() {
+    use std::io::{IsTerminal, Write};
+
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    print!("按回车键退出…");
+    let _ = std::io::stdout().flush();
+    let mut discard = String::new();
+    let _ = std::io::stdin().read_line(&mut discard);
 }
 
 #[cfg(test)]

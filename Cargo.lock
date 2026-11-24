@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ariahost"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ariahost-common",
  "ariahost-svc",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-aria2"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -21,11 +21,11 @@ dependencies = [
 
 [[package]]
 name = "ariahost-common"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "ariahost-svc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ariahost-common",
  "windows-service",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ariahost-common",
  "axum",
