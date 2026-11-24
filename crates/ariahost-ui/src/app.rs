@@ -1,25 +1,28 @@
 //! 面板本体（eframe / egui）。
 //!
-//! 只做技术闸门的可见证据：渲染后端、系统字体、单实例、内存读数、IME 自检输入框、启动日志。
-//! 不接服务控制、不接 RPC、不做任务列表（M2-1）。
+//! M2-1 起面板显示**真数据**：Windows 服务状态（SCM 只读）+ aria2 状态（JSON-RPC），
+//! 全部来自 [`crate::worker`] 的后台线程；UI 线程只做三件事：
+//! 1. 每帧 `try_recv` 一次快照（非阻塞）；
+//! 2. 把快照渲染成「徽章 + 错误码 + 下一步」；
+//! 3. 关窗时把窗口几何原子写回 `window.json`。
 //!
-//! 两处关键钩子：
-//! - [`PanelApp::raw_input_hook`]：每帧把 `RawInput.max_texture_side` 压回图集上限（EG-7），
-//!   从而让「设备/交换链上限」保持 8192 而不牺牲显存（解耦原理见 crate 文档）。
-//! - `wgpu` 未捕获错误回调：交换链尺寸被设备拒绝时 wgpu 会走这里
-//!   （`wgpu-30.0.2/src/backend/wgpu_core.rs:3978-3981`），所以错误计数就是
-//!   `--panel-selftest` 的 `ok=` 判据之一。
+//! 另有两处 M2-0 留下的钩子继续保持：
+//! - [`PanelApp::raw_input_hook`]：每帧把 `RawInput.max_texture_side` 压回图集上限（EG-7）；
+//! - wgpu 未捕获错误回调：交换链尺寸被设备拒绝时计数，作为 `--panel-selftest` 的 `ok=` 判据。
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use ariahost_common::{PRODUCT_NAME, VERSION};
+use ariahost_common::{ErrorCode, PRODUCT_NAME, VERSION};
 use egui::{Color32, RichText};
 
 use crate::instance::InstanceLock;
 use crate::logbuf::LogBuffer;
 use crate::metrics;
+use crate::window::{self, Geometry};
+use crate::worker::{self, Aria2Update, ServiceSnapshot, Worker};
 
 /// 请求窗口尺寸后最多尝试多少帧（约 3 秒 @60fps）；超过就放弃并把 `ok=0`。
 const MAX_SIZE_ATTEMPTS: u32 = 200;
@@ -27,10 +30,17 @@ const MAX_SIZE_ATTEMPTS: u32 = 200;
 /// 尺寸判定容差（物理像素）：DPI 换算与窗口边框会带来 ±1~2 px 误差。
 const SIZE_TOLERANCE: i64 = 2;
 
+/// 空闲时的重绘周期：worker 是 `mpsc`，没有事件能唤醒 egui，所以只能定时轮询一次
+/// 「通道里有没有新快照」。500ms 足够跟手（刷新本身是 2s 一次），又不会烧 CPU。
+const IDLE_REPAINT: Duration = Duration::from_millis(500);
+
+/// 操作提示的显示时长（复制成功 / 打开目录失败等）。
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// 起窗后收集到的运行事实：面板信息区显示，`--panel-selftest` 用它打印机器可读行。
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeFacts {
-    /// wgpu adapter 名（`Adapter::get_info().name`）。
+    /// 渲染适配器名。
     pub adapter: String,
     /// 渲染后端（`Adapter::get_info().backend` 的调试字符串）。
     pub backend: String,
@@ -79,10 +89,25 @@ pub struct PanelApp {
     last_memory_at: Instant,
     /// wgpu 未捕获错误计数（与错误回调共享）。
     wgpu_errors: Arc<AtomicU64>,
+    /// 中文字体接入结果（EG-5 的可见证据，信息区用 `FontState::is_system_font` 判定）。
+    font_state: crate::fonts::FontState,
+    /// 后台刷新线程（SCM + aria2）。
+    worker: Worker,
+    /// 最近一轮 aria2 结果（`None` = 还没刷新过）。
+    aria2: Option<Aria2Update>,
+    /// 最近一次服务状态。
+    service: Option<ServiceSnapshot>,
+    /// 一次性操作提示（文案 + 产生时刻）。
+    notice: Option<(String, Instant)>,
+    /// 上次成功写盘的窗口几何（没变就不重复写）。
+    last_saved: Option<Geometry>,
+    /// 本次启动是否已经写过窗口几何（只写一次）。
+    geometry_saved: bool,
 }
 
 impl PanelApp {
-    /// 起窗后第一件事：接入系统字体（EG-5/EG-6）、抓渲染后端事实、挂 wgpu 错误钩子（EG-10）。
+    /// 建面板：先装字体、收集运行事实，再起后台刷新线程。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         log: Arc<LogBuffer>,
@@ -91,14 +116,14 @@ impl PanelApp {
         selftest_frames: Option<u32>,
         requested_size: Option<(u32, u32)>,
         atlas_cap: u32,
+        saved_geometry: Option<Geometry>,
     ) -> Self {
         let font = crate::fonts::install(&cc.egui_ctx, &log);
         log.push(format!(
-            "中文字体来源：{}",
-            if font.is_system_font() {
-                "系统字体（EG-5 满足）"
-            } else {
-                "未确认（可能缺字，见上一条日志）"
+            "中文字体：{}",
+            match font.resolved.as_deref() {
+                Some(name) => format!("系统字体已解析（{name}，EG-5）"),
+                None => "未确认（可能缺字，见上一条日志）".to_owned(),
             }
         ));
         log.push(format!(
@@ -136,10 +161,9 @@ impl PanelApp {
                 render_state.device.on_uncaptured_error(handler);
             }
             None => {
-                runtime.adapter = "未知（未拿到 wgpu 渲染状态）".to_owned();
-                runtime.backend = "unknown".to_owned();
                 log.push(
-                    "未拿到 wgpu 渲染状态：渲染后端信息不可用（EG-10 的兜底归 M2-1）".to_owned(),
+                    "未拿到 wgpu 渲染状态：面板以非硬件渲染路径运行（不应出现在产品环境）"
+                        .to_owned(),
                 );
             }
         }
@@ -148,6 +172,15 @@ impl PanelApp {
         if let Some((width, height)) = requested_size {
             log.push(format!("自测请求窗口物理尺寸 {width}×{height} px"));
         }
+
+        let worker = Worker::spawn(Arc::clone(&log));
+        log.push(format!(
+            "后台刷新已启动：aria2 默认每 {}s（{} 可覆盖，失败退避 2→4→8→{}s），服务状态每 {}s",
+            worker::ARIA2_REFRESH_INTERVAL.as_secs(),
+            worker::REFRESH_INTERVAL_ENV,
+            worker::BACKOFF_CAP.as_secs(),
+            worker::SERVICE_REFRESH_INTERVAL.as_secs()
+        ));
 
         Self {
             log,
@@ -165,6 +198,13 @@ impl PanelApp {
             last_memory_kb: metrics::private_working_set_kb(),
             last_memory_at: Instant::now(),
             wgpu_errors,
+            font_state: font,
+            worker,
+            aria2: None,
+            service: None,
+            notice: None,
+            last_saved: saved_geometry,
+            geometry_saved: false,
         }
     }
 
@@ -180,6 +220,134 @@ impl PanelApp {
         }
         self.last_memory_kb = metrics::private_working_set_kb();
         self.last_memory_at = Instant::now();
+    }
+
+    /// 把 worker 通道里积压的更新收干净（非阻塞；只保留每类最后一条）。
+    fn drain_worker(&mut self) {
+        while let Some(update) = self.worker.try_recv() {
+            match update {
+                worker::Update::Aria2(update) => self.aria2 = Some(update),
+                worker::Update::Service(snapshot) => self.service = Some(snapshot),
+            }
+        }
+    }
+
+    /// 记一条操作提示（8 秒后自动消失）。
+    fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
+    /// 状态区：服务 + aria2，两条都是「徽章 + 主文案 + 详情 + 下一步」。
+    fn show_status(&mut self, ui: &mut egui::Ui) {
+        let aria2 = worker::aria2_view(self.aria2.as_ref());
+        let service = worker::service_view(self.service.as_ref());
+
+        ui.horizontal(|ui| {
+            ui.heading("Windows 服务");
+            badge(ui, &service);
+        });
+        ui.label(RichText::new(&service.headline).strong());
+        for line in &service.details {
+            ui.label(RichText::new(line).weak());
+        }
+        if let Some(next) = &service.next_step {
+            ui.label(RichText::new(format!("下一步：{next}")).color(tone_color(service.tone)));
+        }
+
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.heading("aria2 核心");
+            badge(ui, &aria2);
+        });
+        ui.label(RichText::new(&aria2.headline).strong());
+        if let Some(code) = aria2.code {
+            ui.label(
+                RichText::new(format!("错误码：{code}"))
+                    .color(tone_color(aria2.tone))
+                    .monospace(),
+            );
+        }
+        for line in &aria2.details {
+            ui.label(RichText::new(line).weak());
+        }
+        if let Some(next) = &aria2.next_step {
+            ui.label(RichText::new(format!("下一步：{next}")).color(tone_color(aria2.tone)));
+        }
+        if !self.worker.is_running() {
+            ui.label(
+                RichText::new("自动刷新未启用（后台线程未启动，见启动日志）")
+                    .color(tone_color(worker::Tone::Bad)),
+            );
+        }
+    }
+
+    /// 操作区：只放本批次真的做得了的四件事。
+    fn show_actions(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .button("立即刷新")
+                .on_hover_text("立刻再拉一次 aria2 与服务状态（非阻塞，不会卡界面）")
+                .clicked()
+            {
+                self.worker.request_refresh();
+                self.notify("已请求立即刷新");
+            }
+
+            if ui
+                .button("打开配置目录")
+                .on_hover_text("用资源管理器打开 %APPDATA%\\AriaHost\\")
+                .clicked()
+            {
+                match config_dir() {
+                    Some(dir) => match open_in_file_manager(&dir) {
+                        Ok(()) => self.notify(format!("已打开配置目录：{}", dir.display())),
+                        Err(error) => {
+                            let code = ErrorCode::Usage.code();
+                            self.log.push(format!(
+                                "打开配置目录失败（{code}）：{error}（{}）",
+                                dir.display()
+                            ));
+                            self.notify(format!(
+                                "{code} 无法打开配置目录（{error}）；可手动访问 {}",
+                                dir.display()
+                            ));
+                        }
+                    },
+                    None => {
+                        let code = ErrorCode::Usage.code();
+                        self.log
+                            .push(format!("打开配置目录失败（{code}）：%APPDATA% 不可用"));
+                        self.notify(format!("{code} 找不到 %APPDATA%，无法打开配置目录"));
+                    }
+                }
+            }
+
+            if ui
+                .button("复制 RPC 端点")
+                .on_hover_text(worker::endpoint_text())
+                .clicked()
+            {
+                ui.ctx().copy_text(worker::endpoint_text());
+                self.notify(format!("已复制 RPC 端点：{}", worker::endpoint_text()));
+            }
+
+            if ui
+                .button("退出")
+                .on_hover_text("关闭面板（托盘与后台常驻是后续批次）")
+                .clicked()
+            {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+
+        if let Some((text, at)) = &self.notice {
+            if at.elapsed() < NOTICE_TIMEOUT {
+                ui.label(RichText::new(text).color(Color32::from_rgb(140, 200, 255)));
+            } else {
+                self.notice = None;
+            }
+        }
     }
 
     /// 信息区：渲染后端 / 图集上限 / 中文字体 / 单实例 / 内存。
@@ -202,13 +370,21 @@ impl PanelApp {
                 ui.end_row();
 
                 ui.label("中文字体");
-                ui.label(match facts.font_resolved.as_deref() {
-                    Some(name) => format!("系统字体已解析：{name}（EG-5）"),
-                    None => format!(
-                        "未解析到系统字体：中文可能显示为方块（EG-5，locale={}）",
-                        crate::fonts::LOCALE
-                    ),
-                });
+                // `FontState::is_system_font` 是 EG-5 的唯一判定入口：不是「有没有字符串」，
+                // 而是「解析出的字体名是不是 system: 前缀」。
+                ui.label(
+                    match (
+                        self.font_state.is_system_font(),
+                        self.font_state.resolved.as_deref(),
+                    ) {
+                        (true, Some(name)) => format!("系统字体已解析：{name}（EG-5）"),
+                        (true, None) => "系统字体已接入（EG-5）".to_owned(),
+                        (false, _) => format!(
+                            "未解析到系统字体：中文可能显示为方块（EG-5，locale={}）",
+                            crate::fonts::LOCALE
+                        ),
+                    },
+                );
                 ui.end_row();
 
                 ui.label("单实例锁");
@@ -256,9 +432,9 @@ impl PanelApp {
             "启动日志（内部环形缓冲，最多 {} 行）",
             crate::logbuf::CAPACITY
         ));
-        let height = (ui.available_height() - 4.0).max(80.0);
         egui::ScrollArea::vertical()
-            .max_height(height)
+            .id_salt("ariahost_log")
+            .max_height(260.0)
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -276,6 +452,68 @@ impl PanelApp {
             (points.x * scale).round().max(0.0) as u32,
             (points.y * scale).round().max(0.0) as u32,
         )
+    }
+
+    /// 当前窗口几何（点）：位置取外框左上角，尺寸取客户区。
+    fn current_geometry(ui: &egui::Ui) -> Option<Geometry> {
+        ui.ctx().input(|input| {
+            let viewport = input.viewport();
+            let outer = viewport.outer_rect?;
+            let inner = viewport.inner_rect?;
+            Some(Geometry {
+                x: outer.min.x,
+                y: outer.min.y,
+                width: inner.width(),
+                height: inner.height(),
+            })
+        })
+    }
+
+    /// 关窗时把几何写回：只写一次，且自测模式完全不碰（否则一次 4K 自测会把面板拉成 4K）。
+    fn persist_geometry(&mut self, ui: &egui::Ui) {
+        if !should_persist_geometry(self.selftest_frames.is_some(), self.geometry_saved) {
+            return;
+        }
+        let Some(path) = window::window_file() else {
+            self.geometry_saved = true;
+            self.log.push("窗口状态未保存：%LOCALAPPDATA% 不可用");
+            return;
+        };
+        let Some(geometry) = Self::current_geometry(ui) else {
+            // Wayland/Android 之类拿不到窗口位置：不猜，保持原文件不动。
+            return;
+        };
+        let screen = ui
+            .ctx()
+            .input(|input| input.viewport().monitor_size)
+            .map(|size| (size.x, size.y));
+        let clean = window::sanitize(geometry, screen);
+        if self
+            .last_saved
+            .is_some_and(|previous| previous.same_as(clean))
+        {
+            self.geometry_saved = true;
+            return;
+        }
+        match window::save(&path, clean) {
+            Ok(()) => {
+                self.geometry_saved = true;
+                self.last_saved = Some(clean);
+                self.log.push(format!(
+                    "窗口状态已保存：{:.0}×{:.0} pt @ ({:.0}, {:.0}) → {}",
+                    clean.width,
+                    clean.height,
+                    clean.x,
+                    clean.y,
+                    path.display()
+                ));
+            }
+            Err(error) => {
+                self.geometry_saved = true;
+                self.log
+                    .push(format!("窗口状态保存失败：{error}（{}）", path.display()));
+            }
+        }
     }
 
     /// `--panel-selftest --size WxH`：把窗口调到指定物理像素（可以超出屏幕，用于验交换链）。
@@ -408,29 +646,92 @@ impl eframe::App for PanelApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frames = self.frames.saturating_add(1);
         self.sample_memory();
+        self.drain_worker();
         self.apply_requested_size(ui);
         if self.requested_size.is_none() || self.size_settled {
             self.frames_after_ready = self.frames_after_ready.saturating_add(1);
         }
 
+        // 关窗时保存几何；eframe 本帧之后就退出主循环，所以必须在这里同步写完。
+        if ui.ctx().input(|input| input.viewport().close_requested()) {
+            self.persist_geometry(ui);
+        }
+
+        // 交互模式下 worker 是 mpsc，没有人能「推醒」egui，只能定时问一次（不是忙轮询）。
+        ui.ctx().request_repaint_after(IDLE_REPAINT);
+
         ui.horizontal(|ui| {
             ui.heading(format!("{PRODUCT_NAME} {VERSION}"));
-            ui.label(RichText::new("M2 技术闸门切片").weak());
+            ui.label(RichText::new("M2-1 状态面板").weak());
         });
-        ui.label(
-            RichText::new("面板处于 M2 开发中；服务控制与任务列表在 M2-1。")
-                .color(Color32::from_rgb(240, 190, 90)),
-        );
-        ui.add_space(6.0);
-        ui.separator();
+        ui.add_space(4.0);
 
-        self.show_facts(ui);
-        ui.separator();
-        self.show_ime_probe(ui);
-        ui.separator();
-        self.show_log(ui);
+        egui::ScrollArea::vertical()
+            .id_salt("ariahost_panel")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.show_status(ui);
+                ui.separator();
+                self.show_actions(ui);
+                ui.separator();
+                self.show_facts(ui);
+                ui.separator();
+                self.show_ime_probe(ui);
+                ui.separator();
+                self.show_log(ui);
+            });
 
         self.maybe_finish_selftest(ui);
+    }
+}
+
+/// 是否该写窗口几何：自测模式永不写，本进程只写一次。
+fn should_persist_geometry(selftest: bool, already_saved: bool) -> bool {
+    !selftest && !already_saved
+}
+
+/// 配置目录：`%APPDATA%\AriaHost\`（`paths::config_file` 的父目录）。
+fn config_dir() -> Option<PathBuf> {
+    ariahost_common::paths::config_file()
+        .and_then(|file| file.parent().map(Path::to_path_buf))
+        .filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// 用系统文件管理器打开目录（只要求「进程起来了」；explorer 的退出码不可靠）。
+fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(dir)
+            .spawn()
+            .map(|_child| ())
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map(|_child| ())
+    }
+}
+
+/// 状态徽章：底色按语气区分，文字永远是中文状态词。
+fn badge(ui: &mut egui::Ui, view: &worker::StatusView) {
+    let color = tone_color(view.tone);
+    ui.label(
+        RichText::new(format!("[{}]", view.badge))
+            .color(color)
+            .strong(),
+    );
+}
+
+/// 语气 → 颜色（深色主题下也够对比）。
+fn tone_color(tone: worker::Tone) -> Color32 {
+    match tone {
+        worker::Tone::Good => Color32::from_rgb(110, 205, 130),
+        worker::Tone::Warn => Color32::from_rgb(240, 190, 90),
+        worker::Tone::Bad => Color32::from_rgb(235, 110, 110),
+        worker::Tone::Idle => Color32::from_rgb(170, 170, 170),
     }
 }
 
@@ -487,5 +788,22 @@ mod tests {
         assert!(approx_eq(3838, 3840));
         assert!(!approx_eq(3837, 3840));
         assert!(!approx_eq(2000, 3840));
+    }
+
+    #[test]
+    fn geometry_is_never_persisted_in_selftest_or_twice() {
+        assert!(!should_persist_geometry(true, false));
+        assert!(!should_persist_geometry(true, true));
+        assert!(!should_persist_geometry(false, true));
+        assert!(should_persist_geometry(false, false));
+    }
+
+    #[test]
+    fn config_dir_points_at_appdata_ariahost() {
+        // 测试机可能没有 %APPDATA%（非 Windows）：返回 None 是预期，不在这里断言平台
+        // （纯常量断言会踩 clippy 的 `assertions_on_constants`）。
+        if let Some(dir) = config_dir() {
+            assert!(dir.ends_with("AriaHost"), "{dir:?}");
+        }
     }
 }

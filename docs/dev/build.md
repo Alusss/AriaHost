@@ -45,8 +45,11 @@ x86 包在 M4 之前**不进 CI**：`release.yml` 里整段 `build-x86` job 被�
 CLI 契约见架构 §7.1（R9），落地时若有微调，必须同步本节与 `installer/ariahost.nsi`。
 
 ```powershell
-# ① 面板（默认）：M2 起真的开窗（eframe/egui + wgpu，技术闸门切片；托盘属 M2-1）
+# ① 面板（默认）：M2 起真的开窗（eframe/egui + wgpu）；M2-1 起显示真实服务/aria2 状态
 .\target\release\ariahost.exe
+.\target\release\ariahost.exe --backend dx12           # 只允许 D3D12（产品主路径的强制验证）
+.\target\release\ariahost.exe --backend vulkan         # 只允许 Vulkan（多数机器上 wgpu 的自选项）
+.\target\release\ariahost.exe --backend auto           # 默认：wgpu 自选，并尊重 WGPU_BACKEND
 
 # ② headless：面板进程直接托管 aria2，关闭面板即停止（无 SCM）
 .\target\release\ariahost.exe --headless
@@ -68,9 +71,12 @@ sc query AriaHost
 .\target\release\ariahost.exe --panel-selftest                        # 默认 120 帧
 .\target\release\ariahost.exe --panel-selftest --frames 300           # 指定帧数（>0）
 .\target\release\ariahost.exe --panel-selftest --size 3840x2160       # 物理像素，窗口可超出屏幕
+.\target\release\ariahost.exe --panel-selftest --backend dx12         # 钉死后端（DX12/Vulkan 只能二选一）
 # 输出示例：
 # SELFTEST adapter=NVIDIA_GeForce_RTX_4060 atlas=2048x128 atlas_cap=2048 surface=3840x2160 window=3840x2160 backend=Dx12 frames=120 ok=1 wgpu_errors=0 private_kb=48213
 ```
+
+- `backend=` = **实际选中的**后端（`Adapter::get_info().backend`），不是 `--backend` 的回显：`--backend auto` 时它会如实报出 wgpu 选了谁；`--backend dx12` 在无 D3D12 的机器上会以 `SELFTEST failed reason=...` + 非 0 退出，这是预期。
 
 - `atlas=宽x高` / `atlas_cap` = 字形图集纹理的**实际尺寸**与配置上限（EG-7）。
 - `surface=` / `window=` = 窗口客户区物理像素，eframe 用它作为交换链 extent，故两者同值。
@@ -84,6 +90,14 @@ sc query AriaHost
 - 现在的做法：设备上限取 **8192**（覆盖 4K 与 200% 缩放），图集上限另取 **2048**，经 `App::raw_input_hook`（`eframe/src/native/epi_integration.rs:423` 每帧调用）写回 `RawInput.max_texture_side`，落到 `TextOptions.max_texture_side`（`egui/src/context.rs:587`、`:628`）。
 - 图集分配语义：宽度 = 上限，高度从 32 起按需翻倍（`epaint/src/text/glyph_atlas.rs:217-224`、`epaint/src/texture_atlas.rs:270-282`），2048 的稳态开销是「2048 × 实际高度 × 4B」，最坏 16.8MB；上限放 8192 会让宽度 ×4。
 - `ARIAHOST_ATLAS_SIDE` 现在**只影响图集**（不再影响窗口），是临时放大图集的逃生口，默认 2048。
+
+#### 4.1.2 面板数据刷新（M2-1）
+
+- **全部在后台线程**：`crates/ariahost-ui/src/worker.rs` 的 `Worker` 持有 `RpcClient`，用 `std::sync::mpsc` 把快照送回 UI；UI 每帧 `try_recv` 一次，从不等待网络（RPC 单次超时 5s，见 `ariahost-aria2` 的 `DEFAULT_TIMEOUT`）。
+- **刷新节奏**：aria2 每 2s（`ARIA2_REFRESH_INTERVAL`）；失败按 2→4→8→16→30s 退避（`BACKOFF_CAP`，AH-E2005 语义），成功即清零。服务状态每 5s 读一次 SCM。**没有忙轮询**：交互模式靠 `request_repaint_after(500ms)` 定时问一次通道。
+- **调用面**：`getVersion` + `getGlobalStat`（队列数三个字段 `getGlobalStat` 已给，不再额外打 `tell*`，少两次可能超时的 RPC）。
+- **错误上屏规则**：`RpcCallError` 的 `detail`（IO 原文/JSON）**永不进 UI**，只归类成 `Aria2Failure`（不可达/超时/HTTP 状态/协议/远端码）→ 固定中文 + `AH-E2003`（403/404 走 `AH-E3003`）。连续 5 次失败后追加 `AH-E2005` 提示。`AH-E2003` 的下一步固定是「aria2 核心尚未接入（M1-3 提供）」，服务未安装固定是「一键注册在 M1-2B」。
+- **窗口状态**：`%LOCALAPPDATA%\AriaHost\window.json`，单位**点**（不是物理像素），原子写（`window.json.tmp` → `rename`）；越界回中心、尺寸仍受 EG-11 的 8191 夹住；`--panel-selftest` 既不读也不写（否则一次 4K 自测会把面板永久拉成 4K）。
 
 调试顺序：`sc query AriaHost` 看状态 → `%APPDATA%\AriaHost\logs\ariahost.log` 与 `aria2.log` 看原因 → `sc stop AriaHost` 验证停止链是否在 25s 内收尾。
 

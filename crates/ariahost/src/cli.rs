@@ -18,6 +18,7 @@ AriaHost — aria2 Windows 服务管理器
 
 用法：
   ariahost                         启动面板
+  ariahost --backend <name>        启动面板并指定渲染后端（auto|dx12|vulkan）
   ariahost --service               以 Windows 服务方式运行（ServiceHost）
   ariahost --install-service       注册 Windows 服务（需管理员）
   ariahost --uninstall-service     注销 Windows 服务（需管理员）
@@ -35,14 +36,20 @@ AriaHost — aria2 Windows 服务管理器
 /// 解析后的子命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// 无参数：启动面板（M2 起真的开窗）。
-    Panel,
-    /// `--panel-selftest [--frames N] [--size WxH]`：隐藏自测入口，开窗渲染 N 帧后打印机器可读行并退出。
+    /// 无参数（或只给 `--backend`）：启动面板（M2 起真的开窗）。
+    Panel {
+        /// 渲染后端（`--backend`，默认 [`ariahost_ui::Backend::Auto`]）。
+        backend: ariahost_ui::Backend,
+    },
+    /// `--panel-selftest [--frames N] [--size WxH] [--backend ...]`：
+    /// 隐藏自测入口，开窗渲染 N 帧后打印机器可读行并退出。
     PanelSelftest {
         /// 渲染帧数（尺寸到位后才开始计）。
         frames: u32,
         /// 目标窗口物理像素尺寸 `(宽, 高)`；用于验证大于 2048 的交换链。
         size: Option<(u32, u32)>,
+        /// 渲染后端（`--backend`）。
+        backend: ariahost_ui::Backend,
     },
     /// `--service`：ServiceHost。
     Service,
@@ -118,12 +125,27 @@ impl QuitOutcome {
 /// 严格模式：已识别的子命令不接受额外参数；未知参数一律 [`ErrorCode::Usage`]。
 pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     let Some(first) = args.first() else {
-        return Ok(Command::Panel);
+        return Ok(Command::Panel {
+            backend: ariahost_ui::Backend::Auto,
+        });
     };
     let rest = &args[1..];
 
     if first == "--panel-selftest" {
         return parse_selftest(rest);
+    }
+
+    // 面板的 `--backend`：只影响渲染后端，不影响任何退出码。
+    if first == "--backend" {
+        let (backend, consumed) = parse_backend_arg(args, 0)?;
+        let leftover = &args[consumed..];
+        if !leftover.is_empty() {
+            return Err(UsageError::new(format!(
+                "--backend 只接受一个取值：{}",
+                leftover.join(" ")
+            )));
+        }
+        return Ok(Command::Panel { backend });
     }
 
     if first == "--write-aumid" {
@@ -158,15 +180,33 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     Ok(command)
 }
 
-/// 解析 `--panel-selftest` 的尾部参数：`--frames N` 与 `--size WxH`，顺序自由、各至多一次。
+/// 解析 `--backend <name>`：`args[index]` 必须是 `--backend`，返回后端与消耗到的下标。
+fn parse_backend_arg(
+    args: &[String],
+    index: usize,
+) -> Result<(ariahost_ui::Backend, usize), UsageError> {
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| UsageError::new("--backend 缺少取值（auto|dx12|vulkan）"))?;
+    let backend = ariahost_ui::Backend::parse(value).ok_or_else(|| {
+        UsageError::new(format!("--backend 只接受 auto|dx12|vulkan，收到：{value}"))
+    })?;
+    Ok((backend, index + 2))
+}
+
+/// 解析 `--panel-selftest` 的尾部参数：`--frames N`、`--size WxH`、`--backend <name>`，
+/// 顺序自由、各至多一次。
 ///
 /// 这是隐藏入口（不进 `--help`），供验收/CI 在无人值守下量内存与交换链上限：
-/// 开窗渲染 N 帧后打印 `SELFTEST adapter=... atlas=... surface=... window=... ok=1` 再退出。
-/// `--size` 是**物理像素**，窗口允许超出屏幕——这是验证 1440p/4K 交换链的手段。
+/// 开窗渲染 N 帧后打印 `SELFTEST adapter=... atlas=... surface=... backend=... ok=1` 再退出。
+/// `--size` 是**物理像素**，窗口允许超出屏幕——这是验证 1440p/4K 交换链的手段；
+/// `--backend` 用来把 DX12/Vulkan 单独钉死（本机 wgpu 自选 Vulkan，DX12 从未被验证过）。
 fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
     let mut frames = ariahost_ui::DEFAULT_SELFTEST_FRAMES;
     let mut frames_seen = false;
     let mut size = None;
+    let mut backend = ariahost_ui::Backend::Auto;
+    let mut backend_seen = false;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -191,6 +231,15 @@ fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
                 size = Some(parse_size(value)?);
                 index += 2;
             }
+            "--backend" => {
+                if backend_seen {
+                    return Err(UsageError::new("--backend 重复"));
+                }
+                backend_seen = true;
+                let (parsed, consumed) = parse_backend_arg(rest, index)?;
+                backend = parsed;
+                index = consumed;
+            }
             other => {
                 return Err(UsageError::new(format!(
                     "--panel-selftest 不认识的参数：{other}"
@@ -198,7 +247,11 @@ fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
             }
         }
     }
-    Ok(Command::PanelSelftest { frames, size })
+    Ok(Command::PanelSelftest {
+        frames,
+        size,
+        backend,
+    })
 }
 
 /// `--frames` 的取值：正整数。
@@ -225,7 +278,7 @@ fn parse_size(value: &str) -> Result<(u32, u32), UsageError> {
     ))
 }
 
-/// 单个边长：320..=[`arihost_ui::MAX_SELFTEST_SIDE`]。
+/// 单个边长：320..=[`ariahost_ui::MAX_SELFTEST_SIDE`]。
 fn parse_dimension(raw: &str, label: &str) -> Result<u32, UsageError> {
     raw.parse::<u32>()
         .ok()
@@ -257,8 +310,12 @@ fn execute(command: &Command) -> i32 {
     match command {
         // 面板：M2 起真的起窗（eframe/egui + wgpu）。这里不再有「等待回车」的占位逻辑——
         // 双击快捷方式时用户看到的是窗口，不是控制台输出。
-        Command::Panel => ariahost_ui::run_panel(),
-        Command::PanelSelftest { frames, size } => ariahost_ui::run_selftest(*frames, *size),
+        Command::Panel { backend } => ariahost_ui::run_panel(*backend),
+        Command::PanelSelftest {
+            frames,
+            size,
+            backend,
+        } => ariahost_ui::run_selftest(*frames, *size, *backend),
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {
@@ -318,7 +375,12 @@ mod tests {
     /// 在 CI / 无人值守环境调用它会阻塞或失败（M2 起面板是真的 GUI）。
     #[test]
     fn no_args_is_panel() {
-        assert_eq!(parse_args(&[]), Ok(Command::Panel));
+        assert_eq!(
+            parse_args(&[]),
+            Ok(Command::Panel {
+                backend: ariahost_ui::Backend::Auto
+            })
+        );
     }
 
     #[test]
@@ -328,13 +390,15 @@ mod tests {
             Ok(Command::PanelSelftest {
                 frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
                 size: None,
+                backend: ariahost_ui::Backend::Auto,
             })
         );
         assert_eq!(
             parse_args(&["--panel-selftest", "--frames", "5"]),
             Ok(Command::PanelSelftest {
                 frames: 5,
-                size: None
+                size: None,
+                backend: ariahost_ui::Backend::Auto,
             })
         );
     }
@@ -346,6 +410,7 @@ mod tests {
             Ok(Command::PanelSelftest {
                 frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
                 size: Some((2560, 1440)),
+                backend: ariahost_ui::Backend::Auto,
             })
         );
         assert_eq!(
@@ -353,6 +418,7 @@ mod tests {
             Ok(Command::PanelSelftest {
                 frames: 30,
                 size: Some((3840, 2160)),
+                backend: ariahost_ui::Backend::Auto,
             })
         );
         assert_eq!(
@@ -360,8 +426,83 @@ mod tests {
             Ok(Command::PanelSelftest {
                 frames: 30,
                 size: Some((1920, 1080)),
+                backend: ariahost_ui::Backend::Auto,
             })
         );
+    }
+
+    #[test]
+    fn backend_flag_selects_the_render_backend() {
+        // 面板：裸 `--backend` 与 selftest 内的 `--backend` 指向同一个枚举。
+        assert_eq!(
+            parse_args(&["--backend", "dx12"]),
+            Ok(Command::Panel {
+                backend: ariahost_ui::Backend::Dx12
+            })
+        );
+        assert_eq!(
+            parse_args(&["--backend", "vulkan"]),
+            Ok(Command::Panel {
+                backend: ariahost_ui::Backend::Vulkan
+            })
+        );
+        assert_eq!(
+            parse_args(&["--backend", "auto"]),
+            Ok(Command::Panel {
+                backend: ariahost_ui::Backend::Auto
+            })
+        );
+        // 大小写不敏感（运维手打不会记得小写）。
+        assert_eq!(
+            parse_args(&["--backend", "DX12"]),
+            Ok(Command::Panel {
+                backend: ariahost_ui::Backend::Dx12
+            })
+        );
+        // selftest：与 --frames/--size 任意顺序组合。
+        assert_eq!(
+            parse_args(&[
+                "--panel-selftest",
+                "--backend",
+                "dx12",
+                "--frames",
+                "3",
+                "--size",
+                "1920x1080"
+            ]),
+            Ok(Command::PanelSelftest {
+                frames: 3,
+                size: Some((1920, 1080)),
+                backend: ariahost_ui::Backend::Dx12,
+            })
+        );
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--frames", "3", "--backend", "vulkan"]),
+            Ok(Command::PanelSelftest {
+                frames: 3,
+                size: None,
+                backend: ariahost_ui::Backend::Vulkan,
+            })
+        );
+    }
+
+    #[test]
+    fn backend_flag_rejects_bad_values() {
+        assert!(parse_args(&["--backend", "metal"]).is_err());
+        assert!(parse_args(&["--backend", "gl"]).is_err());
+        assert!(parse_args(&["--backend"]).is_err());
+        // 面板分支：多给参数是用法错误（不再有「忽略多余参数」的宽松路径）。
+        assert!(parse_args(&["--backend", "dx12", "extra"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--backend"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--backend", "dx11"]).is_err());
+        assert!(parse_args(&[
+            "--panel-selftest",
+            "--backend",
+            "dx12",
+            "--backend",
+            "vulkan"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -458,10 +599,16 @@ mod tests {
             "--quit",
             "--version",
             "--help",
+            "--backend",
             "退出码",
         ] {
             assert!(USAGE.contains(needle), "帮助文本缺少 {needle}");
         }
+        // `--panel-selftest` 是隐藏入口：帮助里不出现（但它必须真能工作，测试见上）。
+        assert!(
+            !USAGE.contains("--panel-selftest"),
+            "自测入口不该出现在 --help 里"
+        );
     }
 
     #[test]

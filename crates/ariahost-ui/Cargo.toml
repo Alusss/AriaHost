@@ -5,14 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AriaHost 面板（eframe/egui）：M2 技术闸门切片，不含服务控制与任务列表"
+description = "AriaHost 面板（eframe/egui）：M2 技术闸门 + M2-1 真实状态（SCM/aria2 RPC）"
 
 [dependencies]
 ariahost-common = { path = "../ariahost-common" }
+# M2-1：面板显示真数据——SCM 只读查询（服务状态）与 aria2 JSON-RPC（版本/速率/队列）。
+# 两者都是纯库：aria2 侧零依赖手写 HTTP，svc 侧的 windows-service 在非 Windows 上是空的，
+# 所以 ui crate 仍然可以在 Linux 上 `cargo check`（CI 只编 Windows）。
+ariahost-aria2 = { path = "../ariahost-aria2" }
+ariahost-svc = { path = "../ariahost-svc" }
 # EG-1：egui 整条栈 pin 0.37（防版本漂移）；eframe 默认 features 已含 wgpu 与 system_fonts。
 eframe.workspace = true
 egui.workspace = true
 egui_system_font_provider.workspace = true
+# 窗口状态（%LOCALAPPDATA%\AriaHost\window.json）的读写；工作区已有同一套 serde，不新增供应链。
+serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # EG-4 内存口径：K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize

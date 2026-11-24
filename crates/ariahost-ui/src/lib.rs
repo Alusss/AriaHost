@@ -14,10 +14,13 @@
 //! （`.github/workflows/ci.yml` 的 windows job），不要以本地 `cargo build` 为据。
 
 mod app;
+mod backend;
 mod fonts;
 mod instance;
 mod logbuf;
 mod metrics;
+mod window;
+mod worker;
 
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +28,10 @@ use ariahost_common::{ErrorCode, EXIT_ERR, EXIT_OK, PRODUCT_NAME, VERSION};
 use egui::ViewportBuilder;
 
 pub use app::RuntimeFacts;
+pub use backend::Backend;
 pub use logbuf::LogBuffer;
+pub use window::Geometry;
+pub use worker::{endpoint_text, Aria2Failure, Aria2Snapshot, ServiceSnapshot};
 
 /// 面板单实例已被占用时的提示（中文，退出码 [`EXIT_ERR`]）。
 pub const DUPLICATE_INSTANCE_HINT: &str = "AriaHost 面板已在运行，本次不再重复开窗。";
@@ -75,27 +81,48 @@ pub const MAX_SELFTEST_SIDE: u32 = 8192;
 pub const DEFAULT_SELFTEST_FRAMES: u32 = 120;
 
 /// 启动面板（无参数入口）；返回进程退出码。
-pub fn run_panel() -> i32 {
-    run(None, None)
+pub fn run_panel(backend: Backend) -> i32 {
+    run(None, None, backend)
 }
 
-/// `--panel-selftest [--frames N] [--size WxH]`：开窗 → 渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
+/// `--panel-selftest [--frames N] [--size WxH] [--backend ...]`：
+/// 开窗 → 渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
 ///
 /// `size` 是**物理像素**（窗口客户区，等于交换链 extent）；窗口可以比屏幕大，用来验证
 /// 「超过 2048 的交换链在真机上能不能建起来」。输出格式见 [`report`]。
-pub fn run_selftest(frames: u32, size: Option<(u32, u32)>) -> i32 {
-    run(Some(frames), size)
+pub fn run_selftest(frames: u32, size: Option<(u32, u32)>, backend: Backend) -> i32 {
+    run(Some(frames), size, backend)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。
-fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>) -> i32 {
+fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>, backend: Backend) -> i32 {
     let log = Arc::new(LogBuffer::new());
     log.push(format!(
         "AriaHost {VERSION} 启动（{}）",
         mode_text(selftest_frames, requested_size)
     ));
+    log.push(format!(
+        "渲染后端选择：--backend {} → wgpu {:?}",
+        backend.as_str(),
+        backend.backends()
+    ));
 
     let atlas_side = atlas_max_side(&log);
+
+    // 窗口几何：自测模式不读也不写（否则一次 4K 自测会把用户的面板永久拉成 4K）。
+    let saved_geometry = if selftest_frames.is_none() {
+        window::window_file()
+            .inspect(|path| log.push(format!("窗口状态文件：{}", path.display())))
+            .and_then(|path| window::load(&path))
+    } else {
+        None
+    };
+    if let Some(geometry) = saved_geometry {
+        log.push(format!(
+            "恢复窗口几何：{:.0}×{:.0} pt @ ({:.0}, {:.0})",
+            geometry.width, geometry.height, geometry.x, geometry.y
+        ));
+    }
 
     // EG-12：单实例。本切片用 std::fs::File::try_lock 锁文件（Rust 1.89+ 稳定 API），
     // M2-1 换成 CreateMutexW + ERROR_ALREADY_EXISTS + 命令行转发（见架构 §4.1.4）。
@@ -130,7 +157,7 @@ fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>) -> i32 
     // EG-10：panic 也先进内部日志，再交给系统默认行为（不吞异常，但用户能在面板里看到记录）。
     install_panic_hook(&log);
 
-    let options = native_options(&log);
+    let options = native_options(&log, backend, saved_geometry);
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
     let app_facts = Arc::clone(&facts);
@@ -147,6 +174,7 @@ fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>) -> i32 
                 selftest_frames,
                 requested_size,
                 atlas_side,
+                saved_geometry,
             );
             Ok(Box::new(panel))
         }),
@@ -247,29 +275,50 @@ fn atlas_max_side(log: &LogBuffer) -> u32 {
 }
 
 /// 组装 eframe 原生窗口选项。
-fn native_options(log: &LogBuffer) -> eframe::NativeOptions {
+///
+/// `geometry` 是上次退出时保存的窗口几何（点）；为 `None` 时保持「默认尺寸 + 居中」。
+fn native_options(
+    log: &LogBuffer,
+    backend: Backend,
+    geometry: Option<Geometry>,
+) -> eframe::NativeOptions {
     let icon = load_icon(log);
+    let mut viewport = ViewportBuilder::default()
+        .with_title(app::title_text())
+        .with_app_id("AriaHost")
+        .with_min_inner_size([window::MIN_WIDTH, window::MIN_HEIGHT])
+        // EG-11：窗口尺寸钳制（用户拉伸也不得越过 8191，egui #8361 未修）。
+        .with_max_inner_size([MAX_WINDOW_SIDE, MAX_WINDOW_SIDE])
+        .with_icon(icon);
+    let mut centered = true;
+    if let Some(geometry) = geometry {
+        // 持久化几何按「点」存；尺寸再夹一次，避免手改 json 绕过 EG-11。
+        let clean = window::sanitize(geometry, None);
+        viewport = viewport
+            .with_inner_size([clean.width, clean.height])
+            .with_position([clean.x, clean.y]);
+        centered = false;
+    } else {
+        viewport = viewport.with_inner_size([window::DEFAULT_WIDTH, window::DEFAULT_HEIGHT]);
+    }
     eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_title(app::title_text())
-            .with_app_id("AriaHost")
-            .with_inner_size([1200.0, 760.0])
-            .with_min_inner_size([760.0, 480.0])
-            // EG-11：窗口尺寸钳制（用户拉伸也不得越过 8191，egui #8361 未修）。
-            .with_max_inner_size([MAX_WINDOW_SIDE, MAX_WINDOW_SIDE])
-            .with_icon(icon),
+        viewport,
         // EG-5：eframe 的默认 provider 不带 locale（会按系统 locale 选字，中文可能落到日文字形），
         // 所以这里关掉它，改由 `fonts::install` 注册带 `zh-CN` 的 provider（首帧前完成，EG-6）。
         system_font_fallback: false,
-        centered: true,
-        wgpu_options: wgpu_configuration(),
+        centered,
+        wgpu_options: wgpu_configuration(backend),
         ..Default::default()
     }
 }
 
-/// wgpu 设备配置：内存策略见 EG-3，设备上限见 [`DEVICE_MAX_SIDE`]（与图集上限解耦）。
-fn wgpu_configuration() -> eframe::WgpuConfiguration {
+/// wgpu 设备配置：内存策略见 EG-3，设备上限见 [`DEVICE_MAX_SIDE`]（与图集上限解耦），
+/// 后端位集见 [`Backend`]（`--backend` 唯一的落点）。
+fn wgpu_configuration(backend: Backend) -> eframe::WgpuConfiguration {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    // `InstanceDescriptor` 在 wgpu 30 里没有 `Default`：`without_display_handle()` 已经给出
+    // `new_without_display_handle()` 的实例，这里只改唯一关心的字段（后端位集）。
+    setup.instance_descriptor.backends = backend.backends();
     setup.device_descriptor = Arc::new(move |_adapter: &eframe::wgpu::Adapter| {
         eframe::wgpu::DeviceDescriptor {
             label: Some("ariahost wgpu device"),
