@@ -72,7 +72,8 @@ impl std::error::Error for HttpError {
     }
 }
 
-/// 解析后的响应头。
+/// 解析后的响应头（`Debug` 是给单测的 `expect_err` 用的）。
+#[derive(Debug)]
 struct Head {
     /// 状态码（只用于 2xx 判定；非 2xx 已在校验后立刻返回 [`HttpError::Status`]）。
     status: u16,
