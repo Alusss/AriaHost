@@ -54,6 +54,12 @@
 ;
 ;  注意：本脚本**不弹** aria2 来源页（v2.0 决定），也不分发 aria2c.exe；
 ;  dist\<arch>\ 里存在 aria2c.exe 时才会一并安装（打包口径见 docs/dev/release.md §7）。
+;
+;  图标管线（2026-11-25 落地）：installer\ariahost.ico 是 7 尺寸
+;  （16/24/32/48/64/128/256）、32bpp、**非 PNG 压缩**（BMP 条目）的 ICO，由
+;  assets/branding/ariahost-icon-256.png 经 Pillow 生成（见 docs/dev/build.md）。编译期一律以
+;  ${SRCDIR}\ariahost.ico 引用（CI 会先把 ico 拷进 SRCDIR）；运行期落盘到 $INSTDIR，
+;  开始菜单/桌面快捷方式与 setup.exe 自身图标都指向它。
 ; ============================================================================
 
 Unicode true
@@ -138,6 +144,14 @@ VIAddVersionKey "LegalCopyright"  "Copyright (c) 2026 Alusss"
 
 ; ---- 界面 -----------------------------------------------------------------
 !define MUI_ABORTWARNING
+
+; 安装器/卸载器图标：与 ariahost.exe 用的是**同一份**多尺寸 ICO
+; （16/24/32/48/64/128/256，32bpp，由 assets/branding/ariahost-icon-256.png 生成）。
+; 路径走 ${SRCDIR}（编译期绝对路径，CI 会先把 installer\ariahost.ico 拷进 SRCDIR）：
+; 与下面 File 的载荷路径同一套规则，见文件头「编译期路径规则」。
+!define MUI_ICON   "${SRCDIR}\ariahost.ico"
+!define MUI_UNICON "${SRCDIR}\ariahost.ico"
+
 !define MUI_WELCOMEPAGE_TITLE "${APP_NAME} 安装向导"
 !define MUI_WELCOMEPAGE_TEXT "将安装 ${APP_NAME} ${VERSION}（${ARCH}）。$\r$\n$\r$\n${APP_NAME} 是 aria2 的 Windows 服务管理器：只通过子进程与 RPC 调度 aria2，不修改其源码、不链接其二进制。$\r$\n$\r$\n下一步可确认安装目录与可选组件。"
 
@@ -157,6 +171,11 @@ VIAddVersionKey "LegalCopyright"  "Copyright (c) 2026 Alusss"
 
 !insertmacro MUI_LANGUAGE "SimpChinese"
 !insertmacro MUI_LANGUAGE "English"
+
+; setup.exe / uninst.exe 自身的图标。放在所有 MUI 宏**之后**：NSIS 的 Icon 是「最后一次生效」，
+; 而 MUI2 会按 MUI_ICON 自己发一次 Icon；两处指向同一文件，这里放最后只是为了让结果确定。
+Icon          "${SRCDIR}\ariahost.ico"
+UninstallIcon "${SRCDIR}\ariahost.ico"
 
 ; ---- 通用：先让正在运行的实例退出（A4 / EG-13）----------------------------
 ; 入参：$R9 = 目标 exe 路径。装/卸载共用；无法退出时告警并 Abort，
@@ -251,6 +270,8 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   SetOverwrite on
   ; 编译期路径必须用 "\"，且优先绝对路径（见文件头「编译期路径规则」的实测结论）。
   File "${SRCDIR}\${APP_EXE}"
+  ; 图标：与安装器自己、开始菜单/桌面快捷方式、exe 资源共用同一份 ICO
+  File "${SRCDIR}\ariahost.ico"
 
   ; 可选：dist 中存在 aria2c.exe 时一并安装（默认不随包分发，见 docs/dev/release.md §7）
 !if /FileExists "${SRCDIR}\aria2c.exe"
@@ -278,7 +299,7 @@ SectionEnd
 
 Section "开始菜单快捷方式" SEC_SM
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
-  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+  CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\ariahost.ico" 0
 
   ; A5：CreateShortCut 写不了 System.AppUserModel.ID → Toast 依赖它（R9 裁决一/三）。
   ; 写失败不阻断安装：notify.backend 的降级判定交给运行时（Toast→托盘气泡→条幅）。
@@ -295,7 +316,7 @@ Section "开始菜单快捷方式" SEC_SM
 SectionEnd
 
 Section /o "桌面快捷方式" SEC_DESKTOP
-  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+  CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\ariahost.ico" 0
   ${If} ${FileExists} "$DESKTOP\${APP_NAME}.lnk"
     ExecWait '"$INSTDIR\${APP_EXE}" --write-aumid "$DESKTOP\${APP_NAME}.lnk"' $0
   ${EndIf}
@@ -393,6 +414,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\aria2c.exe"
+  Delete "$INSTDIR\ariahost.ico"
   Delete "$INSTDIR\uninst.exe"
   Delete "$INSTDIR\uninstall.exe"   ; 旧版本（改名前的产物）
   RMDir "$INSTDIR"

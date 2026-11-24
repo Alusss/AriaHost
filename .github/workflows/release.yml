@@ -171,6 +171,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
+      # 同 ci.yml：build.rs 里的 winresource 需要 Windows SDK 的 rc.exe（它按 RC_PATH →
+      # WindowsSdkVerBinPath → 注册表 KitsRoot10 查找，不依赖 PATH），这一步导入 VS x64 开发环境兜底。
+      - name: 导入 MSVC 开发环境（rc.exe，供 build.rs 的 winresource 使用）
+        uses: ilammy/msvc-dev-cmd@v1
       - name: 校验工具链 pin 生效（rustc 1.95.x）
         shell: bash
         run: |
@@ -204,6 +208,10 @@ jobs:
             exit 1
           }
           Copy-Item $exe (Join-Path $dist "ariahost.exe") -Force
+          # 图标一并进 SRCDIR：installer\ariahost.nsi 的 MUI_ICON / Icon / File 都按
+          # "${SRCDIR}\ariahost.ico" 取文件，缺了 makensis 会报 "no files found"。
+          Copy-Item "installer/ariahost.ico" (Join-Path $dist "ariahost.ico") -Force
+          if (-not (Test-Path (Join-Path $dist "ariahost.ico"))) { Write-Error "图标暂存失败（installer/ariahost.ico 缺失）"; exit 1 }
           # 可选：把 aria2c.exe 放进 dist/x64/ 会随安装包一起分发（默认不打，
           # 见 docs/dev/release.md §7「aria2 核心的分发口径」）
           Get-ChildItem $dist | Select-Object Name, Length

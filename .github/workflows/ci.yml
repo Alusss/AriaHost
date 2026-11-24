@@ -249,6 +249,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
+      # crates/ariahost/build.rs 用 winresource 嵌图标与版本资源，MSVC 目标下要 Windows SDK 的
+      # rc.exe。它自己的查找顺序是 RC_PATH → WindowsSdkVerBinPath → 注册表 KitsRoot10（不走 PATH），
+      # 这一步把 VS 的 x64 开发环境导入本 job 的后续步骤作为兜底。
+      - name: 导入 MSVC 开发环境（rc.exe，供 build.rs 的 winresource 使用）
+        uses: ilammy/msvc-dev-cmd@v1
       - name: 校验工具链 pin 与 target（rustc 1.95.x / x86_64-pc-windows-msvc）
         shell: bash
         run: |
@@ -329,6 +334,19 @@ jobs:
             exit 1
           }
           Write-Host "OK：dumpbin 未发现 VCRUNTIME140 / MSVCP140 依赖（#15a 本次通过）。"
+          # ---- 版本资源门禁：证明 crates/ariahost/build.rs（winresource）真的写进了 exe ----
+          # 只打印不足以防回归，所以对 ProductName 做硬断言；其余字段打印出来供人工核对。
+          $vi = (Get-Item $exe).VersionInfo
+          $vi | Format-List ProductName,FileVersion,ProductVersion,FileDescription,CompanyName,LegalCopyright,OriginalFilename,InternalName
+          if ($vi.ProductName -ne 'AriaHost') {
+            Write-Host "::error::exe 的 ProductName=「$($vi.ProductName)」，不是 AriaHost：版本资源未嵌入（检查 crates/ariahost/build.rs 与 rc.exe 是否可用）。"
+            exit 1
+          }
+          if ($vi.LegalCopyright -notlike '*2026 Alusss*') {
+            Write-Host "::error::exe 的 LegalCopyright=「$($vi.LegalCopyright)」，与 build.rs 设定的「Copyright (c) 2026 Alusss」不符。"
+            exit 1
+          }
+          Write-Host "OK：exe 的 VersionInfo 来自 build.rs（ProductName=AriaHost，LegalCopyright 含 2026 Alusss）。"
       # 安装脚本编译门禁（**必须在 Windows 上跑**，2026-11-25 实测结论）。
       # 历史教训：本节曾是一个 ubuntu + stub 的独立 job，它用正斜杠绝对路径编译"通过"了，
       # 于是被当成"安装脚本可编译"的证据；结果首发 tag v0.1.0 的 release build 在
@@ -357,6 +375,10 @@ jobs:
           New-Item -ItemType Directory -Force $src | Out-Null
           Copy-Item "target/x86_64-pc-windows-msvc/release/ariahost.exe" (Join-Path $src "ariahost.exe") -Force
           if (-not (Test-Path (Join-Path $src "ariahost.exe"))) { Write-Error "载荷暂存失败"; exit 1 }
+          # 图标也要进 SRCDIR：ariahost.nsi 的 MUI_ICON / Icon / File 都按 "${SRCDIR}\ariahost.ico"
+          # 取文件，缺了会报 "no files found"（与 exe 载荷同一套编译期路径规则）。
+          Copy-Item "installer/ariahost.ico" (Join-Path $src "ariahost.ico") -Force
+          if (-not (Test-Path (Join-Path $src "ariahost.ico"))) { Write-Error "图标暂存失败（installer/ariahost.ico 缺失）"; exit 1 }
           Write-Host "SRCDIR = $src"
           & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x64 "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi"
           if ($LASTEXITCODE -ne 0) { Write-Error "makensis 失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }

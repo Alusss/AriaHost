@@ -74,6 +74,7 @@ sc query AriaHost
 ```powershell
 New-Item -ItemType Directory -Force dist\x64 | Out-Null
 Copy-Item target\release\ariahost.exe dist\x64\ -Force
+Copy-Item installer\ariahost.ico dist\x64\ -Force   # 图标也进 SRCDIR，否则 makensis 报 no files found
 makensis /DVERSION=0.1.0 /DVI_VERSION=0.1.0.0 /DARCH=x64 /DSRCDIR=..\dist\x64 installer\ariahost.nsi
 ```
 
@@ -81,6 +82,13 @@ makensis /DVERSION=0.1.0 /DVI_VERSION=0.1.0.0 /DARCH=x64 /DSRCDIR=..\dist\x64 in
 全机变体（M4，首版不发布）：加 `/DPER_MACHINE` 重编一次，产物名自动带 `-machine-setup.exe`（A7：两个变体不能同名，否则发布时互相覆盖）。
 
 > **NSIS 脚本未经本地编译验证**（开发机无 `makensis`）。首次编译请预留排错时间，并按 [dev/release.md](release.md) §5 自检清单逐条核对；编译错误以 M3 的 CI 日志为准。
+
+### 5.1 品牌图标管线（exe / 安装器 / 快捷方式共用一份 ICO）
+
+- 源图 `assets/branding/ariahost-icon-256.png`（256×256 ARGB）→ `installer/ariahost.ico`：7 尺寸 16/24/32/48/64/128/256、32bpp；用 Pillow 生成，加 `bitmap_format="bmp"` 输出**未压缩 DIB 条目**（避开 NSIS / `rc.exe` 对 PNG 压缩图标的兼容风险），**不要手改 ICO**。
+- exe 侧：`crates/ariahost/build.rs` 用 `winresource` 把该 ICO 与版本资源（ProductName / FileVersion / LegalCopyright 等）嵌进 `ariahost.exe`；MSVC 目标需要 Windows SDK 的 `rc.exe`（winresource 按 `RC_PATH` → `WindowsSdkVerBinPath` → 注册表 `KitsRoot10` 查找，CI 另有 `ilammy/msvc-dev-cmd` 兜底）。
+- 安装器侧：`installer/ariahost.nsi` 用同一份 ICO 作 `MUI_ICON`/`MUI_UNICON`、`Icon`（setup.exe 自身），并装到 `$INSTDIR` 供开始菜单/桌面快捷方式引用；编译期路径一律 `${SRCDIR}\ariahost.ico`。
+- CI 侧：`ci.yml` 的 makensis 门禁与 `release.yml` 的 `dist\x64` 暂存步骤都会先把 ICO 拷进 SRCDIR；`ci.yml` 还用 `VersionInfo` 断言 `ProductName`/`LegalCopyright`，证明资源真的进了 exe。
 
 ## 6. 版本号与静态链接
 

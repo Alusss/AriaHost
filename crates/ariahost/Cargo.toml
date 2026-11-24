@@ -11,6 +11,10 @@ description = "AriaHost 单二进制入口：面板/服务/短命助手"
 name = "ariahost"
 path = "src/main.rs"
 
+[build-dependencies]
+# 把图标与版本资源写进 ariahost.exe（仅 Windows 目标；见 build.rs）
+winresource = "0.1"
+
 [dependencies]
 ariahost-common = { path = "../ariahost-common" }
 ariahost-svc = { path = "../ariahost-svc" }
