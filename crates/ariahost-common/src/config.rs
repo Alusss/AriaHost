@@ -513,10 +513,9 @@ impl ConfigError {
 
     /// 对应的错误码（E1 配置段）。
     ///
-    /// 末尾的 `_` 分支是**刻意保留的兜底位**：将来新增 `ConfigErrorKind` 变体时，
-    /// 若还没来得及在架构 §4.12 里申请到码，这里返回 `None` 而不是被编译器逼着
-    /// 硬塞进某个既有码（`None` 的调用方会退回「按 kind 给提示」）。
-    #[allow(unreachable_patterns)]
+    /// **穷尽 match，不允许 `_` 兜底**：将来新增 [`ConfigErrorKind`] 变体时编译必须失败，
+    /// 逼作者当批做一次显式决定——要么申请码，要么显式写 `Variant => None` 并说明为什么没码。
+    /// 这样「不硬凑码」仍然可行，但它变成一行看得见的代码，而不是被 `_` 静默吞掉。
     pub fn code(&self) -> Option<ErrorCode> {
         match self.kind {
             ConfigErrorKind::PathUnavailable => Some(ErrorCode::Usage),
@@ -524,7 +523,6 @@ impl ConfigError {
             ConfigErrorKind::Io => Some(ErrorCode::ConfigIoFailed),
             ConfigErrorKind::Secret => Some(ErrorCode::CredentialCryptoFailed),
             ConfigErrorKind::UnsupportedSchemaVersion => Some(ErrorCode::ConfigSchemaTooNew),
-            _ => None,
         }
     }
 }
