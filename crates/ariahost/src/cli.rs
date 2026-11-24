@@ -37,10 +37,12 @@ AriaHost — aria2 Windows 服务管理器
 pub enum Command {
     /// 无参数：启动面板（M2 起真的开窗）。
     Panel,
-    /// `--panel-selftest [--frames N]`：隐藏自测入口，开窗渲染 N 帧后打印机器可读行并退出。
+    /// `--panel-selftest [--frames N] [--size WxH]`：隐藏自测入口，开窗渲染 N 帧后打印机器可读行并退出。
     PanelSelftest {
-        /// 渲染帧数。
+        /// 渲染帧数（尺寸到位后才开始计）。
         frames: u32,
+        /// 目标窗口物理像素尺寸 `(宽, 高)`；用于验证大于 2048 的交换链。
+        size: Option<(u32, u32)>,
     },
     /// `--service`：ServiceHost。
     Service,
@@ -156,26 +158,84 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     Ok(command)
 }
 
-/// 解析 `--panel-selftest` 的尾部参数：`[]` 或 `["--frames", N]`。
+/// 解析 `--panel-selftest` 的尾部参数：`--frames N` 与 `--size WxH`，顺序自由、各至多一次。
 ///
-/// 这是隐藏入口（不进 `--help`），供验收/CI 在无人值守下量内存：
-/// 开窗渲染 N 帧后打印 `SELFTEST adapter=... atlas=... private_kb=...` 再退出。
+/// 这是隐藏入口（不进 `--help`），供验收/CI 在无人值守下量内存与交换链上限：
+/// 开窗渲染 N 帧后打印 `SELFTEST adapter=... atlas=... surface=... window=... ok=1` 再退出。
+/// `--size` 是**物理像素**，窗口允许超出屏幕——这是验证 1440p/4K 交换链的手段。
 fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
-    match rest {
-        [] => Ok(Command::PanelSelftest {
-            frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
-        }),
-        [flag, value] if flag == "--frames" => match value.parse::<u32>() {
-            Ok(frames) if frames > 0 => Ok(Command::PanelSelftest { frames }),
-            Ok(_) => Err(UsageError::new("--frames 必须大于 0")),
-            Err(_) => Err(UsageError::new(format!(
-                "--frames 需要正整数，收到：{value}"
-            ))),
-        },
-        _ => Err(UsageError::new(
-            "--panel-selftest 只接受可选的 --frames <帧数>",
-        )),
+    let mut frames = ariahost_ui::DEFAULT_SELFTEST_FRAMES;
+    let mut frames_seen = false;
+    let mut size = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--frames" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| UsageError::new("--frames 缺少帧数"))?;
+                if frames_seen {
+                    return Err(UsageError::new("--frames 重复"));
+                }
+                frames_seen = true;
+                frames = parse_frames(value)?;
+                index += 2;
+            }
+            "--size" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| UsageError::new("--size 缺少 WxH（如 2560x1440）"))?;
+                if size.is_some() {
+                    return Err(UsageError::new("--size 重复"));
+                }
+                size = Some(parse_size(value)?);
+                index += 2;
+            }
+            other => {
+                return Err(UsageError::new(format!(
+                    "--panel-selftest 不认识的参数：{other}"
+                )));
+            }
+        }
     }
+    Ok(Command::PanelSelftest { frames, size })
+}
+
+/// `--frames` 的取值：正整数。
+fn parse_frames(value: &str) -> Result<u32, UsageError> {
+    match value.parse::<u32>() {
+        Ok(frames) if frames > 0 => Ok(frames),
+        Ok(_) => Err(UsageError::new("--frames 必须大于 0")),
+        Err(_) => Err(UsageError::new(format!(
+            "--frames 需要正整数，收到：{value}"
+        ))),
+    }
+}
+
+/// `--size` 的取值：`WxH`（物理像素），每边 320..=`MAX_SELFTEST_SIDE`。
+fn parse_size(value: &str) -> Result<(u32, u32), UsageError> {
+    let Some((width, height)) = value.split_once(['x', 'X']) else {
+        return Err(UsageError::new(format!(
+            "--size 需要 WxH（如 2560x1440），收到：{value}"
+        )));
+    };
+    Ok((
+        parse_dimension(width, "宽")?,
+        parse_dimension(height, "高")?,
+    ))
+}
+
+/// 单个边长：320..=[`arihost_ui::MAX_SELFTEST_SIDE`]。
+fn parse_dimension(raw: &str, label: &str) -> Result<u32, UsageError> {
+    raw.parse::<u32>()
+        .ok()
+        .filter(|dimension| (320..=ariahost_ui::MAX_SELFTEST_SIDE).contains(dimension))
+        .ok_or_else(|| {
+            UsageError::new(format!(
+                "--size 的{label}必须在 320..={}，收到：{raw}",
+                ariahost_ui::MAX_SELFTEST_SIDE
+            ))
+        })
 }
 
 /// 执行一条命令并返回进程退出码。
@@ -198,7 +258,7 @@ fn execute(command: &Command) -> i32 {
         // 面板：M2 起真的起窗（eframe/egui + wgpu）。这里不再有「等待回车」的占位逻辑——
         // 双击快捷方式时用户看到的是窗口，不是控制台输出。
         Command::Panel => ariahost_ui::run_panel(),
-        Command::PanelSelftest { frames } => ariahost_ui::run_selftest(*frames),
+        Command::PanelSelftest { frames, size } => ariahost_ui::run_selftest(*frames, *size),
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {
@@ -266,22 +326,68 @@ mod tests {
         assert_eq!(
             parse_args(&["--panel-selftest"]),
             Ok(Command::PanelSelftest {
-                frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES
+                frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
+                size: None,
             })
         );
         assert_eq!(
             parse_args(&["--panel-selftest", "--frames", "5"]),
-            Ok(Command::PanelSelftest { frames: 5 })
+            Ok(Command::PanelSelftest {
+                frames: 5,
+                size: None
+            })
         );
     }
 
     #[test]
-    fn panel_selftest_rejects_bad_frames() {
+    fn panel_selftest_parses_size_in_any_order() {
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--size", "2560x1440"]),
+            Ok(Command::PanelSelftest {
+                frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
+                size: Some((2560, 1440)),
+            })
+        );
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--size", "3840x2160", "--frames", "30"]),
+            Ok(Command::PanelSelftest {
+                frames: 30,
+                size: Some((3840, 2160)),
+            })
+        );
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--frames", "30", "--size", "1920x1080"]),
+            Ok(Command::PanelSelftest {
+                frames: 30,
+                size: Some((1920, 1080)),
+            })
+        );
+    }
+
+    #[test]
+    fn panel_selftest_rejects_bad_frames_and_size() {
         assert!(parse_args(&["--panel-selftest", "--frames", "0"]).is_err());
         assert!(parse_args(&["--panel-selftest", "--frames", "abc"]).is_err());
         assert!(parse_args(&["--panel-selftest", "--frames", "-1"]).is_err());
         assert!(parse_args(&["--panel-selftest", "junk"]).is_err());
         assert!(parse_args(&["--panel-selftest", "--frames"]).is_err());
+        // --size 的各种坏值
+        assert!(parse_args(&["--panel-selftest", "--size", "3840"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--size", "3840x"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--size", "0x1080"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--size", "100x1080"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--size", "9999x1080"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--size"]).is_err());
+        // 重复参数
+        assert!(parse_args(&[
+            "--panel-selftest",
+            "--size",
+            "1920x1080",
+            "--size",
+            "1920x1080"
+        ])
+        .is_err());
+        assert!(parse_args(&["--panel-selftest", "--frames", "5", "--frames", "6"]).is_err());
     }
 
     #[test]

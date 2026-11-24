@@ -6,6 +6,10 @@
 //! 设计约束编号 `EG-n` 来自 `docs/requirements-and-design/2026-11-22-wasm-架构设计.md` §4.1.2，
 //! 每条落点都写在对应代码注释里，便于 M2-1 接手时逐条核对。
 //!
+//! **设备上限与字形图集上限是两件事**（M2-0b 拆开，详见 [`DEVICE_MAX_SIDE`] 与
+//! [`ATLAS_MAX_SIDE_DEFAULT`] 的注释）：设备上限管交换链/窗口物理像素，图集上限管显存，
+//! 后者经 `App::raw_input_hook` 每帧压回 egui，不再倒过来把窗口锁死。
+//!
 //! 注意：本机开发环境没有 MSVC 链接器，本 crate 的编译验证**只能靠 CI**
 //! （`.github/workflows/ci.yml` 的 windows job），不要以本地 `cargo build` 为据。
 
@@ -26,19 +30,37 @@ pub use logbuf::LogBuffer;
 /// 面板单实例已被占用时的提示（中文，退出码 [`EXIT_ERR`]）。
 pub const DUPLICATE_INSTANCE_HINT: &str = "AriaHost 面板已在运行，本次不再重复开窗。";
 
-/// 字形图集上限的默认值（EG-7）。
+/// wgpu 设备的 `max_texture_dimension_2d`（交换链/窗口物理像素的上限）。
 ///
-/// 2048 → epaint 的 `GlyphAtlas` 以 `max_texture_side` 作为图集纹理**宽度**、高度从 32 起按需增长，
-/// 最坏 2048×2048×4B ≈ 16.8MB 显存；设备默认值 8192 是它的 16 倍。
+/// **为什么不是 2048**：wgpu-core 30 的 `validate_surface_configuration`
+/// （`wgpu-core-30.0.2/src/device/surface_config.rs:44-58`）用设备上限校验交换链尺寸，
+/// 而 `egui-wgpu` 的 `max_texture_side()`（`egui-wgpu-0.37.0/src/winit.rs:333`）**直接返回**
+/// 同一个值，于是「压图集」会连坐「压窗口」：2048 的窗口在 1440p（2560）/4K（3840）上必然
+/// `Surface::configure` 失败（错误经 `handle_error_nolabel` 进设备错误回调，表现为黑窗）。
+/// 8192 是 wgpu 的 downlevel 保证上限，也是 egui-wgpu 自己的默认请求值
+/// （`egui-wgpu-0.37.0/src/setup.rs:272`），覆盖 4K 与 200% 缩放；
+/// 显存由 [`ATLAS_MAX_SIDE_DEFAULT`] 单独管住，两者不再耦合。
+pub const DEVICE_MAX_SIDE: u32 = 8192;
+
+/// 字形图集上限的默认值（EG-7），经 `RawInput.max_texture_side` 每帧压回 egui。
 ///
-/// 源码事实（M2 门禁时需再确认）：wgpu-core 30 的 `validate_surface_configuration`
-/// （`wgpu-core/src/device/surface_config.rs`）用**同一个** `max_texture_dimension_2d`
-/// 约束交换链尺寸，所以窗口物理像素超过本值时首帧配置会失败（表现为黑窗）。
-/// 若真机是 1440p/4K 或 200% 缩放，设环境变量 [`ATLAS_MAX_SIDE_ENV`]`=4096` 放开上限，
-/// 不需要重新构建；这条逃生口和设计里「必要时 4096，但需记录」的分支一致。
+/// epaint 的分配语义（`epaint-0.37.0/src/text/glyph_atlas.rs:217-224` +
+/// `src/texture_atlas.rs:82-90`、`:270-282`）：图集纹理**宽度 = 上限**、高度从 **32**
+/// 起按需翻倍（上限由 `max_height() = max(height, width)` 夹住，见 `texture_atlas.rs:175-178`），
+/// 所以 2048 的稳态开销是「2048 × 实际用到的高度 × 4B」，最坏 16.8MB；若把上限放到 8192，
+/// 宽度直接 ×4（最坏 268MB），这就是 EG-7 要钉 2048 的原因。
+///
+/// 解耦路径（源码依据）：eframe 在 `EpiIntegration::build_raw_input` 里逐帧调用
+/// `app.raw_input_hook(&ctx, &mut raw_input)`（`eframe-0.37.0/src/native/epi_integration.rs:423`），
+/// `RawInput.max_texture_side: Option<usize>`（`egui-0.37.0/src/data/input/raw_input.rs:45`）
+/// 经 `InputState::begin_pass`（`input_state/mod.rs:485`）落到
+/// `Context::update_fonts_mut` 的 `text_options.max_texture_side`（`context.rs:587`、`:628`）。
+/// 在 hook 里每帧写回 2048 即可让图集按 2048 建，而设备/交换链仍按 [`DEVICE_MAX_SIDE`]。
 pub const ATLAS_MAX_SIDE_DEFAULT: u32 = 2048;
 
 /// 环境变量名：临时放开字形图集上限（默认见 [`ATLAS_MAX_SIDE_DEFAULT`]）。
+///
+/// 现在它**只影响图集**，不再影响窗口尺寸；留下来是给「图集撑爆/需要更大图集」的临时手段。
 pub const ATLAS_MAX_SIDE_ENV: &str = "ARIAHOST_ATLAS_SIDE";
 
 /// EG-11：窗口尺寸硬上限（逻辑点，对应物理像素上限 8191）。
@@ -46,27 +68,31 @@ pub const ATLAS_MAX_SIDE_ENV: &str = "ARIAHOST_ATLAS_SIDE";
 /// 8191 是 winit/wgpu 侧的已知边界（egui #8361），超过会拖出窗口尺寸钳制类问题。
 pub const MAX_WINDOW_SIDE: f32 = 8191.0;
 
+/// `--panel-selftest --size` 允许请求的物理像素上限（受 [`DEVICE_MAX_SIDE`] 约束）。
+pub const MAX_SELFTEST_SIDE: u32 = 8192;
+
 /// `--panel-selftest` 的默认帧数：约 2 秒 @60fps，够走完首帧、字体图集预热与 wgpu 上传。
 pub const DEFAULT_SELFTEST_FRAMES: u32 = 120;
 
 /// 启动面板（无参数入口）；返回进程退出码。
 pub fn run_panel() -> i32 {
-    run(None)
+    run(None, None)
 }
 
-/// `--panel-selftest [--frames N]`：开窗 → 渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
+/// `--panel-selftest [--frames N] [--size WxH]`：开窗 → 渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
 ///
-/// 输出格式（供无人值守量测解析）：`SELFTEST adapter=... atlas=... private_kb=...`
-pub fn run_selftest(frames: u32) -> i32 {
-    run(Some(frames))
+/// `size` 是**物理像素**（窗口客户区，等于交换链 extent）；窗口可以比屏幕大，用来验证
+/// 「超过 2048 的交换链在真机上能不能建起来」。输出格式见 [`report`]。
+pub fn run_selftest(frames: u32, size: Option<(u32, u32)>) -> i32 {
+    run(Some(frames), size)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。
-fn run(selftest_frames: Option<u32>) -> i32 {
+fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>) -> i32 {
     let log = Arc::new(LogBuffer::new());
     log.push(format!(
         "AriaHost {VERSION} 启动（{}）",
-        mode_text(selftest_frames)
+        mode_text(selftest_frames, requested_size)
     ));
 
     let atlas_side = atlas_max_side(&log);
@@ -97,13 +123,14 @@ fn run(selftest_frames: Option<u32>) -> i32 {
     };
 
     log.push(format!(
-        "渲染配置：wgpu + MemoryHints::MemoryUsage（EG-3）；字形图集上限 {atlas_side} px（EG-7）"
+        "渲染配置：wgpu + MemoryHints::MemoryUsage（EG-3）；设备上限 {DEVICE_MAX_SIDE} px（窗口/交换链）、\
+         字形图集上限 {atlas_side} px（EG-7，两者已解耦）"
     ));
 
     // EG-10：panic 也先进内部日志，再交给系统默认行为（不吞异常，但用户能在面板里看到记录）。
     install_panic_hook(&log);
 
-    let options = native_options(atlas_side, &log);
+    let options = native_options(&log);
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
     let app_facts = Arc::clone(&facts);
@@ -112,7 +139,15 @@ fn run(selftest_frames: Option<u32>) -> i32 {
         PRODUCT_NAME,
         options,
         Box::new(move |cc| {
-            let panel = app::PanelApp::new(cc, app_log, app_facts, lock, selftest_frames);
+            let panel = app::PanelApp::new(
+                cc,
+                app_log,
+                app_facts,
+                lock,
+                selftest_frames,
+                requested_size,
+                atlas_side,
+            );
             Ok(Box::new(panel))
         }),
     );
@@ -134,7 +169,15 @@ fn run(selftest_frames: Option<u32>) -> i32 {
     }
 }
 
-/// `--panel-selftest` 的收尾输出：一行机器可读结果（键值对，值内空格替换为 `_`）。
+/// `--panel-selftest` 的收尾输出：一行机器可读结果（键值对，值内空白替换为 `_`）。
+///
+/// 关键字段：
+/// - `surface=` / `window=`：窗口客户区物理像素，eframe 用它作为 `SurfaceConfiguration.extent`
+///   （egui-wgpu 的 `SurfaceState::configure`），因此两者同值；**真正的证据是 `ok=1`**——
+///   交换链尺寸被设备拒绝时，wgpu 会经 `handle_error_nolabel` 走到 `on_uncaptured_error`
+///   （`wgpu-30.0.2/src/backend/wgpu_core.rs:3978-3981`），`wgpu_errors` 会大于 0。
+/// - `atlas=`：字形图集纹理的**实际尺寸**（`FontsView::font_image_size`），`atlas_cap=` 是配置上限。
+/// - `ok=1`：没有 wgpu 未捕获错误，且（若请求了 `--size`）窗口物理尺寸确实到达目标。
 fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
     if selftest_frames.is_none() {
         return;
@@ -144,14 +187,25 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     println!(
-        "SELFTEST adapter={} atlas={} private_kb={} backend={} frames={} font={}",
+        "SELFTEST adapter={} atlas={}x{} atlas_cap={} surface={}x{} window={}x{} backend={} \
+         frames={} ok={} wgpu_errors={} private_kb={}",
         sanitize(&facts.adapter),
+        facts.atlas_size[0],
+        facts.atlas_size[1],
         facts.atlas_side,
-        facts.private_kb,
+        facts.window_physical[0],
+        facts.window_physical[1],
+        facts.window_physical[0],
+        facts.window_physical[1],
         sanitize(&facts.backend),
         facts.frames,
-        sanitize(facts.font_resolved.as_deref().unwrap_or("none")),
+        u8::from(facts.ok),
+        facts.wgpu_errors,
+        facts.private_kb,
     );
+    if let Some(reason) = facts.reason.as_deref() {
+        println!("SELFTEST_NOTE {reason}");
+    }
 }
 
 /// 让 `SELFTEST` 行保持「`key=value` 以空白分隔」可解析：值里的空白换成 `_`。
@@ -160,10 +214,13 @@ fn sanitize(value: &str) -> String {
 }
 
 /// 启动模式的中文描述（写进日志）。
-fn mode_text(selftest_frames: Option<u32>) -> String {
-    match selftest_frames {
-        Some(frames) => format!("自测模式，渲染 {frames} 帧后退出"),
-        None => "交互面板模式".to_owned(),
+fn mode_text(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>) -> String {
+    match (selftest_frames, requested_size) {
+        (Some(frames), Some((width, height))) => {
+            format!("自测模式，目标窗口 {width}×{height} px，渲染 {frames} 帧后退出")
+        }
+        (Some(frames), None) => format!("自测模式，渲染 {frames} 帧后退出"),
+        (None, _) => "交互面板模式".to_owned(),
     }
 }
 
@@ -173,7 +230,7 @@ fn atlas_max_side(log: &LogBuffer) -> u32 {
         return ATLAS_MAX_SIDE_DEFAULT;
     };
     match raw.trim().parse::<u32>() {
-        Ok(value) if (512..=16384).contains(&value) => {
+        Ok(value) if (1024..=DEVICE_MAX_SIDE).contains(&value) => {
             log.push(format!(
                 "{ATLAS_MAX_SIDE_ENV}={value}：覆盖字形图集上限（默认 {ATLAS_MAX_SIDE_DEFAULT}）"
             ));
@@ -181,7 +238,8 @@ fn atlas_max_side(log: &LogBuffer) -> u32 {
         }
         _ => {
             log.push(format!(
-                "{ATLAS_MAX_SIDE_ENV}={raw:?} 不是 512..=16384 的整数，忽略，沿用默认 {ATLAS_MAX_SIDE_DEFAULT}"
+                "{ATLAS_MAX_SIDE_ENV}={raw:?} 不是 1024..={DEVICE_MAX_SIDE} 的整数，忽略，\
+                 沿用默认 {ATLAS_MAX_SIDE_DEFAULT}"
             ));
             ATLAS_MAX_SIDE_DEFAULT
         }
@@ -189,7 +247,7 @@ fn atlas_max_side(log: &LogBuffer) -> u32 {
 }
 
 /// 组装 eframe 原生窗口选项。
-fn native_options(atlas_side: u32, log: &LogBuffer) -> eframe::NativeOptions {
+fn native_options(log: &LogBuffer) -> eframe::NativeOptions {
     let icon = load_icon(log);
     eframe::NativeOptions {
         viewport: ViewportBuilder::default()
@@ -197,20 +255,20 @@ fn native_options(atlas_side: u32, log: &LogBuffer) -> eframe::NativeOptions {
             .with_app_id("AriaHost")
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([760.0, 480.0])
-            // EG-11：窗口尺寸钳制（恢复尺寸/用户拉伸都不得越过上限，egui #8361 未修）。
+            // EG-11：窗口尺寸钳制（用户拉伸也不得越过 8191，egui #8361 未修）。
             .with_max_inner_size([MAX_WINDOW_SIDE, MAX_WINDOW_SIDE])
             .with_icon(icon),
         // EG-5：eframe 的默认 provider 不带 locale（会按系统 locale 选字，中文可能落到日文字形），
         // 所以这里关掉它，改由 `fonts::install` 注册带 `zh-CN` 的 provider（首帧前完成，EG-6）。
         system_font_fallback: false,
         centered: true,
-        wgpu_options: wgpu_configuration(atlas_side),
+        wgpu_options: wgpu_configuration(),
         ..Default::default()
     }
 }
 
-/// wgpu 设备配置：内存策略与图集上限都在 device descriptor 里落实（EG-3 / EG-7）。
-fn wgpu_configuration(atlas_side: u32) -> eframe::WgpuConfiguration {
+/// wgpu 设备配置：内存策略见 EG-3，设备上限见 [`DEVICE_MAX_SIDE`]（与图集上限解耦）。
+fn wgpu_configuration() -> eframe::WgpuConfiguration {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     setup.device_descriptor = Arc::new(move |_adapter: &eframe::wgpu::Adapter| {
         eframe::wgpu::DeviceDescriptor {
@@ -219,8 +277,8 @@ fn wgpu_configuration(atlas_side: u32) -> eframe::WgpuConfiguration {
             // （wgpu #8453 实测）。改成 MemoryUsage 是硬要求，不是可选优化。
             memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
             required_limits: eframe::wgpu::Limits {
-                // EG-7：字形图集上限（同时决定交换链像素尺寸上限，见常量注释）。
-                max_texture_dimension_2d: atlas_side,
+                // 交换链/窗口物理像素上限（不是图集上限——图集另经 raw_input_hook 压回）。
+                max_texture_dimension_2d: DEVICE_MAX_SIDE,
                 ..eframe::wgpu::Limits::default()
             },
             ..Default::default()
@@ -278,18 +336,30 @@ mod tests {
 
     #[test]
     fn window_side_limit_matches_eg11() {
-        assert_eq!(MAX_WINDOW_SIDE, 8191.0, "EG-11 要求窗口尺寸上限 8191 px");
+        // 常量断言放进 const 块：既在编译期就卡住回归，也避开 clippy 的
+        // `assertions_on_constants`（运行期再断言一次纯常量没有意义）。
+        const { assert!(MAX_WINDOW_SIDE == 8191.0, "EG-11 要求窗口尺寸上限 8191 px") };
     }
 
+    /// 解耦的核心约束：设备上限必须覆盖 4K（3840）与 200% 缩放，图集上限必须留在 2048。
     #[test]
-    fn atlas_default_is_the_design_value() {
-        // 设计（EG-7）首选 2048；4096 只在真机窗口尺寸放不下时通过环境变量临时放开。
-        assert_eq!(ATLAS_MAX_SIDE_DEFAULT, 2048);
+    fn device_and_atlas_limits_are_decoupled() {
+        const {
+            assert!(ATLAS_MAX_SIDE_DEFAULT == 2048, "EG-7 首选 2048");
+            assert!(
+                DEVICE_MAX_SIDE >= 4096,
+                "设备上限必须覆盖 4K（3840）窗口，否则 1440p/4K 黑窗"
+            );
+            assert!(DEVICE_MAX_SIDE == 8192);
+            assert!(ATLAS_MAX_SIDE_DEFAULT < DEVICE_MAX_SIDE);
+            assert!(MAX_SELFTEST_SIDE == DEVICE_MAX_SIDE);
+        }
     }
 
     #[test]
     fn mode_text_is_chinese() {
-        assert!(mode_text(None).contains("面板"));
-        assert!(mode_text(Some(3)).contains("3"));
+        assert!(mode_text(None, None).contains("面板"));
+        assert!(mode_text(Some(3), None).contains("3"));
+        assert!(mode_text(Some(3), Some((3840, 2160))).contains("3840×2160"));
     }
 }

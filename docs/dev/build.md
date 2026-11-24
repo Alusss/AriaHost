@@ -60,26 +60,30 @@ sc query AriaHost
 
 ④ 仅以 SCM 方式运行时由系统拉起 `ariahost.exe --service`（安装器不直接调它）。
 
-### 4.1 面板自测入口（隐藏，供 M2 门禁量内存）
+### 4.1 面板自测入口（隐藏，供 M2 门禁量内存与交换链）
 
-`--panel-selftest` 不出现在 `--help` 里，只给验收/自动化用：开窗 → 连续渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
+`--panel-selftest` 不出现在 `--help` 里，只给验收/自动化用：开窗 →（可选）把窗口调到指定物理像素 → 连续渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
 
 ```powershell
-.\target\release\ariahost.exe --panel-selftest              # 默认 120 帧
-.\target\release\ariahost.exe --panel-selftest --frames 300 # 指定帧数（>0）
+.\target\release\ariahost.exe --panel-selftest                        # 默认 120 帧
+.\target\release\ariahost.exe --panel-selftest --frames 300           # 指定帧数（>0）
+.\target\release\ariahost.exe --panel-selftest --size 3840x2160       # 物理像素，窗口可超出屏幕
 # 输出示例：
-# SELFTEST adapter=NVIDIA_GeForce_RTX_4060 atlas=2048 private_kb=48213 backend=Dx12 frames=120 font=system:Microsoft_YaHei:...
+# SELFTEST adapter=NVIDIA_GeForce_RTX_4060 atlas=2048x128 atlas_cap=2048 surface=3840x2160 window=3840x2160 backend=Dx12 frames=120 ok=1 wgpu_errors=0 private_kb=48213
 ```
 
-- `atlas` = 设备实际生效的 `max_texture_dimension_2d`（EG-7 的字形图集上限）。
-- `private_kb` = 结束时 `GetProcessMemoryInfo → PrivateWorkingSetSize`（EG-4 口径的参考值）；**真机 60s 稳态仍要按 §4.2.1 口径单独量**，自测行只是同一口径的快速读数。
+- `atlas=宽x高` / `atlas_cap` = 字形图集纹理的**实际尺寸**与配置上限（EG-7）。
+- `surface=` / `window=` = 窗口客户区物理像素，eframe 用它作为交换链 extent，故两者同值。
+- `ok=1` = 没有 wgpu 未捕获错误，且（若给了 `--size`）窗口尺寸确实到达目标；`ok=0` 时另打一行 `SELFTEST_NOTE` 说明原因。
+- `private_kb` = 结束时 `GetProcessMemoryInfo → PrivateWorkingSetSize`（EG-4 口径的参考值）；**真机 60s 稳态仍要按 §4.2.1 口径单独量**。
 - 面板与自测共用 `%LOCALAPPDATA%\AriaHost\panel.lock` 单实例锁：已有面板在跑时自测会以退出码 1 结束（先关面板）。
-- 窗口物理像素超过 `atlas` 时首帧会失败（wgpu 用同一上限约束交换链），此时用逃生口放开上限，不必重新构建：
 
-```powershell
-$env:ARIAHOST_ATLAS_SIDE = "4096"   # 默认 2048（EG-7 首选值）；1440p/4K 或 200% 缩放机器用 4096
-.\target\release\ariahost.exe
-```
+#### 4.1.1 渲染上限：图集与交换链是两件事（M2-0b 结论）
+
+- `DeviceDescriptor.max_texture_dimension_2d` 同时被 wgpu 用来校验交换链尺寸（`wgpu-core/src/device/surface_config.rs:44-58`）**和**被 egui-wgpu 当作图集上限（`egui-wgpu/src/winit.rs:333` 直接返回 `device.limits().max_texture_dimension_2d`）——压图集就会连坐压窗口，2048 会让 1440p/4K 变成黑窗。
+- 现在的做法：设备上限取 **8192**（覆盖 4K 与 200% 缩放），图集上限另取 **2048**，经 `App::raw_input_hook`（`eframe/src/native/epi_integration.rs:423` 每帧调用）写回 `RawInput.max_texture_side`，落到 `TextOptions.max_texture_side`（`egui/src/context.rs:587`、`:628`）。
+- 图集分配语义：宽度 = 上限，高度从 32 起按需翻倍（`epaint/src/text/glyph_atlas.rs:217-224`、`epaint/src/texture_atlas.rs:270-282`），2048 的稳态开销是「2048 × 实际高度 × 4B」，最坏 16.8MB；上限放 8192 会让宽度 ×4。
+- `ARIAHOST_ATLAS_SIDE` 现在**只影响图集**（不再影响窗口），是临时放大图集的逃生口，默认 2048。
 
 调试顺序：`sc query AriaHost` 看状态 → `%APPDATA%\AriaHost\logs\ariahost.log` 与 `aria2.log` 看原因 → `sc stop AriaHost` 验证停止链是否在 25s 内收尾。
 
