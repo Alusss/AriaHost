@@ -85,6 +85,19 @@ impl RuntimePaths {
         Some(Self::under(&root))
     }
 
+    /// 服务平面（R7）：`%ProgramData%\AriaHost\`，conf/session/logs 直接在其下。
+    ///
+    /// 为什么服务不能用 headless 平面：服务账户（LocalSystem / LocalService）拿到的
+    /// `%APPDATA%` 是 **systemprofile**，不是用户的目录（架构 §4.6 R9）。
+    pub fn service() -> Option<Self> {
+        let root = ariahost_common::paths::service_runtime_dir()?;
+        Some(Self {
+            runtime: root.clone(),
+            session: root.join("session"),
+            logs: root.join("logs"),
+        })
+    }
+
     /// 按给定根目录构造（单测用）。
     pub fn under(root: &Path) -> Self {
         Self {
@@ -202,7 +215,7 @@ impl From<ConfigError> for RuntimeError {
 // 定位核心
 // ---------------------------------------------------------------------------
 
-/// 按 `aria2.source` 定位 aria2c 可执行文件。
+/// 按 `aria2.source` 在**用户平面**（`%LOCALAPPDATA%`）定位 aria2c。\n///\n/// 服务模式必须改用 [`resolve_core_exe_in`] 传 [`Plane::Service`]：服务账户读不到用户目录（R7/R9）。
 ///
 /// - `managed`：版本库 `active.json` 指向的 `versions/<ver>/aria2c.exe`；
 /// - `external`：`aria2.external_path`（支持 `~` 展开）。
@@ -210,10 +223,18 @@ impl From<ConfigError> for RuntimeError {
 /// 顺带做**悬空回滚指针修复**：若 `active.json` 的 `previous` 指向已删除的版本目录，
 /// 清掉该字段并原子写回（否则「回滚」按钮会指向空气）。
 pub fn resolve_core_exe(config: &Config) -> Result<PathBuf, RuntimeError> {
+    resolve_core_exe_in(config, Plane::User)
+}
+
+/// 按 `aria2.source` 在**指定平面**定位 aria2c 可执行文件。
+///
+/// 服务模式传 [`Plane::Service`]（`%ProgramData%\AriaHost\aria2\versions`）：
+/// 服务账户读不到用户的 `%LOCALAPPDATA%`（架构 §4.6 R7/R9）。
+pub fn resolve_core_exe_in(config: &Config, plane: Plane) -> Result<PathBuf, RuntimeError> {
     match config.aria2.source {
         ariahost_common::Aria2Source::Managed => {
-            let dir = versions_dir(Plane::User).ok_or_else(|| RuntimeError::CoreNotFound {
-                detail: "拿不到 %LOCALAPPDATA%（版本库根目录不可用）".to_owned(),
+            let dir = versions_dir(plane).ok_or_else(|| RuntimeError::CoreNotFound {
+                detail: format!("拿不到{:?}平面的版本库根目录", plane),
             })?;
             let store = VersionStore::new(&dir);
             let pointer = store.active().map_err(|error| RuntimeError::CoreNotFound {

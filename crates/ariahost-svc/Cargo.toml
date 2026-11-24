@@ -5,10 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AriaHost ServiceHost 骨架：SCM 接入占位"
+description = "AriaHost ServiceHost：SCM 托管 + aria2c 子进程生命周期"
 
 [dependencies]
 ariahost-common = { path = "../ariahost-common" }
+# M1-2B 唯一新增依赖：服务模式复用 ariahost-core 的 aria2c 托管（runtime）。
+ariahost-core = { path = "../ariahost-core" }
 
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true

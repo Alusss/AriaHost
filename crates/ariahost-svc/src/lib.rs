@@ -1,16 +1,36 @@
-//! ServiceHost 骨架（架构 §3.2/§4.2.3）。
+//! ServiceHost：SCM 托管 + aria2c 子进程托管（架构 §3.2 / §4.2.3 / §5）。
 //!
-//! 本批（M1-2A）只新增**只读**能力：[`query_state`] / [`query_state_of`] 打开本机 SCM、
-//! 读一次服务状态、关句柄。**不安装、不卸载、不启停、不改配置**——那些属 M1-2B。
-//! 读状态不需要管理员权限（`SC_MANAGER_CONNECT` + `SERVICE_QUERY_STATUS`）。
+//! ## 分工
 //!
-//! [`run`] 仍是 M1 占位：只返回 [`ServiceError::Unsupported`]，由 `ariahost --service`
-//! 打印 `AH-E5001` 并以退出码 1 结束。M2 在此接入 `windows-service` 的 `service_dispatcher`、
-//! 控制处理器与 Job Object。
+//! - [`plan`]：控制命令 → 状态上报序列的状态机、[`plan::drive_service`] 驱动骨架、
+//!   超时预算、服务特定退出码。**纯逻辑，Linux 单测全覆盖**。
+//! - [`install`]：`binPath` 引号、失败动作、Win32 错误 → 结果分类。**纯逻辑，单测全覆盖**。
+//! - `scm`（仅 Windows）：dispatcher、控制处理器、`CreateServiceW`/`DeleteServiceW`/启停的哑胶水。
+//!
+//! ## 非阻塞纪律（架构 §4.2.4）
+//!
+//! SCM 回调线程里**只许登记命令**：`service_control_handler` 的闭包只做 `send`，
+//! 所有阻塞动作（起 aria2、等停止）都在 `service_main` 的工作线程里由 [`plan::drive_service`] 完成。
+//! 回调里阻塞会让 SCM 判服务失去响应（1053）。
+//!
+//! ## 平面（R7/R9）
+//!
+//! 服务账户的 `%APPDATA%` 是 **systemprofile**，所以服务模式的一切落盘走
+//! `%ProgramData%\AriaHost\`（`RuntimePaths::service()`、`Plane::Service` 版本库）。
 
 use std::fmt;
+use std::path::Path;
 
 use ariahost_common::ErrorCode;
+
+pub mod install;
+pub mod plan;
+
+#[cfg(windows)]
+mod scm;
+#[cfg(not(windows))]
+#[path = "scm_stub.rs"]
+mod scm;
 
 /// SCM 服务名（架构 §3.3：服务名与显示名同名 `AriaHost`）。
 pub const SERVICE_NAME: &str = "AriaHost";
@@ -63,6 +83,44 @@ impl ServiceState {
     }
 }
 
+/// 安装结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// 本次新建。
+    Created,
+    /// 同名服务已存在（安装器重跑必须安全，不算错误）。
+    AlreadyExisted,
+}
+
+impl InstallOutcome {
+    /// 稳定文本。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::AlreadyExisted => "already-existed",
+        }
+    }
+}
+
+/// 卸载结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninstallOutcome {
+    /// 本次删除。
+    Removed,
+    /// 本来就没装（幂等成功，不算错误）。
+    NotInstalled,
+}
+
+impl UninstallOutcome {
+    /// 稳定文本。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::NotInstalled => "not-installed",
+        }
+    }
+}
+
 /// 服务状态查询失败（[`ServiceState::NotInstalled`] 不是错误，不走这个类型）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceQueryError {
@@ -90,6 +148,100 @@ impl fmt::Display for ServiceQueryError {
 
 impl std::error::Error for ServiceQueryError {}
 
+/// 服务操作的失败。
+///
+/// 每个变体都带**可执行建议所需的分类**：`NeedsAdmin` 要求提权，`NotInstalled` 要先装，
+/// `RegisterPrereq` 是注册前置失败（ProgramData 权限/版本库准备）。裸 Win32 码只出现在
+/// `detail` 里，不上屏（架构 §4.12：禁止把 Windows 错误原样丢给用户）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceError {
+    /// 非 Windows 平台：本产品只发 Windows。
+    Unsupported,
+    /// 手工在非服务上下文跑 `--service`（Win32 1063）。
+    NotFromScm {
+        /// 可读原因。
+        detail: String,
+    },
+    /// 需要管理员权限（Win32 5）。
+    NeedsAdmin {
+        /// 可读原因。
+        detail: String,
+    },
+    /// 服务未安装（Win32 1060）。
+    NotInstalled {
+        /// 可读原因。
+        detail: String,
+    },
+    /// 通用失败（SCM 打不开、控制被拒、超时等）。
+    Unavailable {
+        /// 可读原因。
+        detail: String,
+    },
+    /// 注册前置失败（ProgramData 权限、服务创建被拒）。
+    RegisterPrereq {
+        /// 可读原因。
+        detail: String,
+    },
+    /// aria2 核心启动失败（透传上游码，如 `AH-E2001`/`AH-E2002`）。
+    StartupFailed {
+        /// 上游错误码。
+        code: ErrorCode,
+        /// 可读原因。
+        detail: String,
+    },
+}
+
+impl ServiceError {
+    /// 对应错误码（`StartupFailed` 透传上游码，其余落在 E5 段）。
+    pub const fn code(&self) -> ErrorCode {
+        match self {
+            Self::Unsupported | Self::NotFromScm { .. } | Self::NotInstalled { .. } => {
+                ErrorCode::ServiceUnavailable
+            }
+            Self::NeedsAdmin { .. } => ErrorCode::ServiceNeedsAdmin,
+            Self::Unavailable { .. } => ErrorCode::ServiceUnavailable,
+            Self::RegisterPrereq { .. } => ErrorCode::ServiceRegisterPrereq,
+            Self::StartupFailed { code, .. } => *code,
+        }
+    }
+
+    /// 诊断细节（没有时为空串）。
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Unsupported => "",
+            Self::NotFromScm { detail }
+            | Self::NeedsAdmin { detail }
+            | Self::NotInstalled { detail }
+            | Self::Unavailable { detail }
+            | Self::RegisterPrereq { detail }
+            | Self::StartupFailed { detail, .. } => detail,
+        }
+    }
+}
+
+impl fmt::Display for ServiceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.code().code();
+        match self {
+            Self::Unsupported => write!(formatter, "{code} 非 Windows 平台不支持服务模式"),
+            Self::NotFromScm { detail } => write!(formatter, "{code} {detail}"),
+            Self::NeedsAdmin { detail } => {
+                write!(formatter, "{code} 需要管理员权限（UAC）：{detail}")
+            }
+            Self::NotInstalled { detail } => {
+                write!(formatter, "{code} AriaHost 服务未安装：{detail}")
+            }
+            Self::Unavailable { detail } => write!(formatter, "{code} {detail}"),
+            Self::RegisterPrereq { detail } => {
+                write!(formatter, "{code} 服务注册前置失败：{detail}")
+            }
+            Self::StartupFailed { code, detail } => write!(formatter, "{} {detail}", code.code()),
+        }
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
 #[cfg(windows)]
 mod state {
     //! Windows 实现：`windows-service` 0.8.1（API 以依赖源码为准，见各调用的签名说明）。
@@ -102,13 +254,7 @@ mod state {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     use super::{ServiceQueryError, ServiceState};
-
-    /// `ERROR_SERVICE_DOES_NOT_EXIST`（Win32 1060）：SCM 里没有这个名字的服务。
-    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-
-    /// `ERROR_ACCESS_DENIED`（Win32 5）：没有查询权限（正常用户读状态不需要管理员，
-    /// 但被策略收紧的机器/AACL 改动会走到这里）。
-    const ERROR_ACCESS_DENIED: i32 = 5;
+    use crate::install::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST};
 
     /// 查询指定服务名的状态。
     ///
@@ -221,63 +367,9 @@ pub fn query_state_of(name: &str) -> Result<ServiceState, ServiceQueryError> {
     state::query_state_of(name)
 }
 
-/// ServiceHost 启动错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceError {
-    /// M1 占位：ServiceHost 尚未实现。
-    Unsupported,
-}
+pub use scm::{install, run, start, stop, uninstall};
 
-impl ServiceError {
-    /// 对应错误码（M1 占位复用 `AH-E5001`：SCM 启动失败/服务不可用）。
-    pub const fn code(self) -> ErrorCode {
-        ErrorCode::ServiceUnavailable
-    }
-}
-
-impl fmt::Display for ServiceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported => write!(
-                formatter,
-                "{} 服务宿主尚未实现（M1 骨架，M2 接入 SCM）",
-                self.code().code()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ServiceError {}
-
-#[cfg(windows)]
-mod platform {
-    use super::ServiceError;
-
-    /// 服务入口（M1 桩）：不调用 `service_dispatcher::start`，直接返回 Unsupported。
-    ///
-    /// 原因：本批不接管 SCM；在非服务上下文调用 `start` 会得到 1063（服务未连接），
-    /// 既不是本批要验证的行为，也会让本地 `--service` 冒烟测试出现误导性错误。
-    pub fn run() -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported)
-    }
-}
-
-#[cfg(not(windows))]
-mod platform {
-    use super::ServiceError;
-
-    /// 非 Windows 平台占位：保证 workspace 在非 Windows 上也能编译（CI 只编译 Windows）。
-    pub fn run() -> Result<(), ServiceError> {
-        Err(ServiceError::Unsupported)
-    }
-}
-
-pub use platform::run;
-
-/// 构造「已停止」的 SCM 服务状态，M2 的控制循环直接复用。
-///
-/// 本批只作为 `windows-service` 依赖的骨架锚点：**不调用任何 SCM API**，
-/// 真正的 `service_dispatcher::start` 与控制处理器在 M2 接入。
+/// 构造「已停止」的 SCM 服务状态（M1 骨架锚点，保留给后续控制循环复用）。
 #[cfg(windows)]
 pub fn stopped_status() -> windows_service::service::ServiceStatus {
     use windows_service::service::{
@@ -296,13 +388,26 @@ pub fn stopped_status() -> windows_service::service::ServiceStatus {
     }
 }
 
+/// 供 CLI/安装器判断平台能力（非 Windows 恒 `false`）。
+pub const fn is_supported_platform() -> bool {
+    cfg!(windows)
+}
+
+/// 服务二进制路径的期望命令行（见 [`install::service_binary_path`]）。
+///
+/// 单独暴露一个入口是为了让面板/M3 安装器不用知道 `--service` 这个字面量。
+pub fn expected_binary_path(exe: &Path) -> String {
+    install::service_binary_path(exe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
     #[test]
-    fn run_returns_unsupported_with_service_code() {
-        let error = run().expect_err("M1 的服务入口必须是 Unsupported 桩");
+    fn run_returns_unsupported_on_non_windows() {
+        let error = run().expect_err("非 Windows 平台不可能跑起来");
         assert_eq!(error, ServiceError::Unsupported);
         assert_eq!(error.code().code(), "AH-E5001");
         assert!(error.to_string().starts_with("AH-E5001"));
@@ -321,8 +426,6 @@ mod tests {
 
         assert_eq!(stopped_status().current_state, WinServiceState::Stopped);
     }
-
-    // ---- M1-2A：只读状态查询 ----
 
     #[test]
     fn service_state_strings_are_pinned() {
@@ -359,6 +462,67 @@ mod tests {
             "AH-E5001 打开本机 SCM 失败",
             "诊断文本必须以错误码开头"
         );
+    }
+
+    #[test]
+    fn outcomes_have_stable_strings() {
+        assert_eq!(InstallOutcome::Created.as_str(), "created");
+        assert_eq!(InstallOutcome::AlreadyExisted.as_str(), "already-existed");
+        assert_eq!(UninstallOutcome::Removed.as_str(), "removed");
+        assert_eq!(UninstallOutcome::NotInstalled.as_str(), "not-installed");
+    }
+
+    #[test]
+    fn error_codes_follow_the_documented_mapping() {
+        let needs_admin = ServiceError::NeedsAdmin {
+            detail: "拒绝访问".to_owned(),
+        };
+        assert_eq!(needs_admin.code(), ErrorCode::ServiceNeedsAdmin);
+        assert!(needs_admin.to_string().starts_with("AH-E5002"));
+        assert!(
+            needs_admin.to_string().contains("管理员"),
+            "必须给可执行建议"
+        );
+
+        assert_eq!(
+            ServiceError::RegisterPrereq {
+                detail: "建 ProgramData 失败".to_owned()
+            }
+            .code(),
+            ErrorCode::ServiceRegisterPrereq
+        );
+        assert_eq!(
+            ServiceError::NotFromScm {
+                detail: "手工运行".to_owned()
+            }
+            .code(),
+            ErrorCode::ServiceUnavailable
+        );
+        assert_eq!(
+            ServiceError::NotInstalled {
+                detail: "没装".to_owned()
+            }
+            .code(),
+            ErrorCode::ServiceUnavailable
+        );
+        // 启动失败透传上游码（真值优先，不硬塞 E5）。
+        let startup = ServiceError::StartupFailed {
+            code: ErrorCode::Aria2StartTimeout,
+            detail: "15s 未就绪".to_owned(),
+        };
+        assert_eq!(startup.code(), ErrorCode::Aria2StartTimeout);
+        assert!(startup.to_string().starts_with("AH-E2002"));
+        assert_eq!(startup.detail(), "15s 未就绪");
+    }
+
+    #[test]
+    fn expected_binary_path_matches_the_registration_form() {
+        // M3 安装器会调这个函数拼期望值；和 install.rs 的单测保持一致。
+        assert_eq!(
+            expected_binary_path(Path::new(r"C:\Program Files\AriaHost\ariahost.exe")),
+            r#""C:\Program Files\AriaHost\ariahost.exe" --service"#
+        );
+        assert_eq!(is_supported_platform(), cfg!(windows));
     }
 
     #[cfg(windows)]
@@ -407,7 +571,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pinned_service_name_reports_not_installed_on_clean_machine() {
-        // 前提：CI runner 上未安装 AriaHost 服务（M1-2B 之前不存在任何安装路径）。
+        // 前提：CI runner 上未安装 AriaHost 服务（M1-2B 不会在 CI 里安装）。
         // 这条用例就是「只读查询能跑通」的最小证据：读状态不需要管理员。
         let state = query_state().expect("查询 AriaHost 服务状态不应报错");
         assert_eq!(
@@ -420,7 +584,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "手工用：需本机已安装 AriaHost 服务（M1-2B 之后才能造出这种环境）"]
+    #[ignore = "手工用：需管理员 + 本机已安装 AriaHost 服务"]
     fn query_state_reports_installed_service_manually() {
         let state = query_state().expect("查询 AriaHost 服务状态不应报错");
         assert!(

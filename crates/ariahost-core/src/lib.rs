@@ -53,10 +53,10 @@ pub use release::{
 #[cfg(windows)]
 pub use runtime::JobGuard;
 pub use runtime::{
-    launch_spec, prepare_conf, render_conf, resolve_core_exe, Child, CoreRuntime, CoreState,
-    CoreStatus, LaunchSpec, ProcessSpawner, Readiness, RpcProbe, RuntimeError, RuntimeEvent,
-    RuntimePaths, Spawner, Timeouts, CONF_FILE_NAME, CREATE_NO_WINDOW, FILE_ALLOCATION,
-    LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
+    launch_spec, prepare_conf, render_conf, resolve_core_exe, resolve_core_exe_in, Child,
+    CoreRuntime, CoreState, CoreStatus, LaunchSpec, ProcessSpawner, Readiness, RpcProbe,
+    RuntimeError, RuntimeEvent, RuntimePaths, Spawner, Timeouts, CONF_FILE_NAME, CREATE_NO_WINDOW,
+    FILE_ALLOCATION, LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
 };
 pub use store::{ActivePointer, ExeProbe, VersionStore, ACTIVE_FILE};
 pub use zip_extract::{extract_core, ExtractedCore};
