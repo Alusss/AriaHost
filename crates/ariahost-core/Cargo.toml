@@ -16,3 +16,8 @@ sha2.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
 zip.workspace = true
+
+# 运行时托管（runtime.rs）：Job Object 孤儿守卫（KILL_ON_JOB_CLOSE）。
+# 非 Windows 目标不编译这块代码（WSL 单测走无 job 的分支）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

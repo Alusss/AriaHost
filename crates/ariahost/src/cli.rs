@@ -68,6 +68,12 @@ pub enum Command {
         /// 目标版本：`None`/`latest` 取最新，`1.37.0` 取指定版本。
         version: Option<String>,
     },
+    /// `--aria2-runtime-selftest [--seconds N]`：隐藏自检入口（不出现在 `--help` 里），
+    /// 真拉起 aria2c、打印状态序列、优雅停止（M2-2a 的可跑入口）。
+    RuntimeSelftest {
+        /// 就绪后停留多少秒再停（默认 5）。
+        seconds: u64,
+    },
     /// `--quit`：请求已有实例退出（短命助手）。
     Quit,
     /// `--version` / `-V`。
@@ -168,6 +174,11 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         };
     }
 
+    // `--aria2-runtime-selftest [--seconds N]`：隐藏自检入口。
+    if first == "--aria2-runtime-selftest" {
+        return parse_runtime_selftest(rest);
+    }
+
     if first == "--write-aumid" {
         return match rest {
             [] => Err(UsageError::new("--write-aumid 缺少 <lnk 路径> 参数")),
@@ -198,6 +209,42 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         )));
     }
     Ok(command)
+}
+
+/// 解析 `--aria2-runtime-selftest` 的尾部参数：`--seconds N`（默认 5，上限 3600）。
+///
+/// 隐藏入口，**不进 [`USAGE`]**（与 `--panel-selftest` 同处理）。
+fn parse_runtime_selftest(rest: &[String]) -> Result<Command, UsageError> {
+    const MAX_SECONDS: u64 = 3600;
+    let mut seconds: u64 = 5;
+    let mut index = 0usize;
+    while index < rest.len() {
+        let argument = &rest[index];
+        let raw = if argument == "--seconds" {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| UsageError::new("--seconds 缺少数值（秒）"))?;
+            index += 2;
+            value.as_str()
+        } else if let Some(value) = argument.strip_prefix("--seconds=") {
+            index += 1;
+            value
+        } else {
+            return Err(UsageError::new(format!(
+                "--aria2-runtime-selftest 不认识的参数：{argument}"
+            )));
+        };
+        let parsed = raw
+            .parse::<u64>()
+            .map_err(|_| UsageError::new(format!("--seconds 需要非负整数，收到：{raw}")))?;
+        if parsed > MAX_SECONDS {
+            return Err(UsageError::new(format!(
+                "--seconds 上限 {MAX_SECONDS}，收到：{parsed}"
+            )));
+        }
+        seconds = parsed;
+    }
+    Ok(Command::RuntimeSelftest { seconds })
 }
 
 /// 解析 `--backend <name>`：`args[index]` 必须是 `--backend`，返回后端与消耗到的下标。
@@ -359,6 +406,7 @@ fn execute(command: &Command) -> i32 {
             EXIT_OK
         }
         Command::Aria2Fetch { version } => run_aria2_fetch(version.as_deref()),
+        Command::RuntimeSelftest { seconds } => run_runtime_selftest(*seconds),
         Command::Quit => {
             // M1 无控制管道，固定按「无实例」处理；M2 换成真实握手结果。
             let outcome = QuitOutcome::NoInstance;
@@ -419,6 +467,150 @@ fn run_aria2_fetch(version: Option<&str>) -> i32 {
             eprintln!("{error}");
             EXIT_ERR
         }
+    }
+}
+
+/// `--aria2-runtime-selftest [--seconds N]`：真拉起 aria2c → 等就绪 → 停留 N 秒 → 优雅停止。
+///
+/// 输出格式**逐行稳定**（供 CI/人工核对）：
+/// ```text
+/// CONFIG exe=<路径> dir=<下载目录> port=<端口>
+/// CONF <aria2.conf 路径>
+/// STATE starting
+/// STATE running rpc=1.37.0
+/// INFO pid=12345
+/// STATE stopping
+/// STATE stopped exit=0
+/// INFO forced=false
+/// ```
+/// 失败时打印 `ERROR <错误码|none> <可读原因>` 并以非 0 退出。
+fn run_runtime_selftest(seconds: u64) -> i32 {
+    use std::time::Duration;
+
+    use ariahost_common::config as config_layer;
+    use ariahost_core::{
+        CoreRuntime, ProcessSpawner, RpcProbe, RuntimeEvent, RuntimePaths, Timeouts,
+    };
+
+    let mut config = match config_layer::load() {
+        Ok(config) => config,
+        Err(error) => {
+            report_error(error.code(), &error.to_string());
+            return EXIT_ERR;
+        }
+    };
+    let Some(paths) = RuntimePaths::from_env() else {
+        report_error(None, "拿不到 %APPDATA%（运行时目录不可用）");
+        return EXIT_ERR;
+    };
+    let Some(secret_path) = config_layer::default_secret_path() else {
+        report_error(None, "拿不到 %APPDATA%（secret.bin 路径不可用）");
+        return EXIT_ERR;
+    };
+    let secret = match config_layer::resolve_secret(&mut config, &secret_path) {
+        Ok(secret) => secret,
+        Err(error) => {
+            report_error(error.code(), &error.to_string());
+            return EXIT_ERR;
+        }
+    };
+    let download_dir = match config_layer::download_dir_absolute(&config) {
+        Ok(dir) => dir,
+        Err(error) => {
+            report_error(error.code(), &error.to_string());
+            return EXIT_ERR;
+        }
+    };
+    let exe = match ariahost_core::resolve_core_exe(&config) {
+        Ok(exe) => exe,
+        Err(error) => {
+            report_error(error.code(), &error.to_string());
+            return EXIT_ERR;
+        }
+    };
+    println!(
+        "CONFIG exe={} dir={} port={}",
+        exe.display(),
+        download_dir.display(),
+        config.aria2.rpc.port
+    );
+
+    let conf = match ariahost_core::prepare_conf(&config, &paths, &secret, &download_dir) {
+        Ok(conf) => conf,
+        Err(error) => {
+            report_error(error.code(), &error.to_string());
+            return EXIT_ERR;
+        }
+    };
+    println!("CONF {}", conf.display());
+
+    let spec = ariahost_core::launch_spec(&config, &paths, exe, &secret);
+    let probe = RpcProbe::new(config.aria2.rpc.port, &secret);
+    let mut runtime = CoreRuntime::new(
+        Box::new(ProcessSpawner),
+        Box::new(probe),
+        Timeouts::default(),
+    );
+
+    let mut print_event = |event: RuntimeEvent| print_runtime_event(&event);
+
+    if let Err(error) = runtime.start(&spec, &mut print_event) {
+        report_error(error.code(), &error.to_string());
+        return EXIT_ERR;
+    }
+
+    std::thread::sleep(Duration::from_secs(seconds));
+
+    match runtime.stop(&mut print_event) {
+        Ok(status) => {
+            println!("INFO forced={}", status.forced);
+            EXIT_OK
+        }
+        Err(error) => {
+            report_error(error.code(), &error.to_string());
+            EXIT_ERR
+        }
+    }
+}
+
+/// 把一次状态转换打成稳定的若干行（格式见 [`run_runtime_selftest`] 文档）。
+///
+/// 单独抽成纯函数是为了可单测：CLI 的输出格式是验收项（Lead 会照它抓行），
+/// 不能只靠「跑一次看看」。
+fn format_runtime_event(event: &ariahost_core::RuntimeEvent) -> String {
+    use ariahost_core::RuntimeEvent;
+    match event {
+        RuntimeEvent::Starting => "STATE starting".to_owned(),
+        RuntimeEvent::Running { version, pid } => {
+            format!("STATE running rpc={version}\nINFO pid={pid}")
+        }
+        RuntimeEvent::Stopping => "STATE stopping".to_owned(),
+        RuntimeEvent::Stopped { exit_code, .. } => match exit_code {
+            Some(code) => format!("STATE stopped exit={code}"),
+            None => "STATE stopped exit=none".to_owned(),
+        },
+        RuntimeEvent::Failed { code, hint } => {
+            format!("STATE failed code={} hint={hint}", describe_code(*code))
+        }
+        RuntimeEvent::Warning { detail } => format!("WARN {detail}"),
+    }
+}
+
+/// 打印一行（或多行）状态转换。
+fn print_runtime_event(event: &ariahost_core::RuntimeEvent) {
+    println!("{}", format_runtime_event(event));
+}
+
+/// 错误输出：`ERROR <码|none> <原因>`。
+fn report_error(code: Option<ariahost_common::ErrorCode>, detail: &str) {
+    eprintln!("ERROR {} {detail}", describe_code(code));
+}
+
+/// 错误码文本（没有合适码时统一 `none`，不编造 `AH-E####`）。
+fn describe_code(code: Option<ariahost_common::ErrorCode>) -> &'static str {
+    match code {
+        Some(code) => code.code(),
+        None => "none",
     }
 }
 
@@ -592,6 +784,67 @@ mod tests {
         );
         // 只允许一个可选尾参。
         assert!(parse_args(&["--aria2-fetch", "1.37.0", "extra"]).is_err());
+    }
+
+    #[test]
+    fn runtime_selftest_parses_seconds() {
+        assert_eq!(
+            parse_args(&["--aria2-runtime-selftest"]),
+            Ok(Command::RuntimeSelftest { seconds: 5 })
+        );
+        assert_eq!(
+            parse_args(&["--aria2-runtime-selftest", "--seconds", "8"]),
+            Ok(Command::RuntimeSelftest { seconds: 8 })
+        );
+        assert_eq!(
+            parse_args(&["--aria2-runtime-selftest", "--seconds=0"]),
+            Ok(Command::RuntimeSelftest { seconds: 0 })
+        );
+        assert!(parse_args(&["--aria2-runtime-selftest", "--seconds"]).is_err());
+        assert!(parse_args(&["--aria2-runtime-selftest", "--seconds", "abc"]).is_err());
+        assert!(parse_args(&["--aria2-runtime-selftest", "--seconds", "3601"]).is_err());
+        assert!(parse_args(&["--aria2-runtime-selftest", "junk"]).is_err());
+    }
+
+    #[test]
+    fn runtime_selftest_output_format_is_stable() {
+        use ariahost_core::RuntimeEvent;
+        assert_eq!(
+            format_runtime_event(&RuntimeEvent::Starting),
+            "STATE starting"
+        );
+        assert_eq!(
+            format_runtime_event(&RuntimeEvent::Running {
+                version: "1.37.0".to_owned(),
+                pid: 4242,
+            }),
+            "STATE running rpc=1.37.0\nINFO pid=4242"
+        );
+        assert_eq!(
+            format_runtime_event(&RuntimeEvent::Stopping),
+            "STATE stopping"
+        );
+        assert_eq!(
+            format_runtime_event(&RuntimeEvent::Stopped {
+                exit_code: Some(0),
+                forced: false,
+            }),
+            "STATE stopped exit=0"
+        );
+        assert_eq!(
+            format_runtime_event(&RuntimeEvent::Stopped {
+                exit_code: None,
+                forced: true,
+            }),
+            "STATE stopped exit=none"
+        );
+        assert_eq!(
+            format_runtime_event(&RuntimeEvent::Failed {
+                code: Some(ariahost_common::ErrorCode::Aria2StartTimeout),
+                hint: "超时".to_owned(),
+            }),
+            "STATE failed code=AH-E2002 hint=超时"
+        );
     }
 
     #[test]

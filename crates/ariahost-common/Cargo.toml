@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AriaHost 公共基础：产品常量、错误码注册表、路径约定"
+description = "AriaHost 公共基础：产品常量、错误码注册表、路径约定、配置层"
 
 [dependencies]
+# 配置层：schema 定版 TOML 的读写（架构 §4.11）。
+serde = { workspace = true }
+toml = { workspace = true }
+
+# 配置层：密码学随机（BCryptGenRandom）与 DPAPI（secret.bin）。
+# feature 清单与理由见 src/config.rs 模块文档；非 Windows 目标不编译这些代码。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

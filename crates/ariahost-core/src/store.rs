@@ -208,6 +208,26 @@ impl VersionStore {
         Ok(Some(pointer))
     }
 
+    /// 修掉悬空的 `previous` 指针（指向已被删除的版本目录）。
+    ///
+    /// 为什么需要：用户/清理策略删掉旧版本目录后，`active.json` 里的 `previous` 仍指着它，
+    /// 「回滚」就会指向不存在的目录（Lead 已复现）。这里在读取时校验并原子写回，
+    /// 返回修好的指针；无需修时返回 `Ok(None)`。
+    pub fn repair_dangling_previous(&self) -> Result<Option<ActivePointer>, CoreError> {
+        let Some(mut pointer) = self.active()? else {
+            return Ok(None);
+        };
+        let Some(previous) = pointer.previous.clone() else {
+            return Ok(None);
+        };
+        if self.is_installed(&previous) {
+            return Ok(None);
+        }
+        pointer.previous = None;
+        self.write_pointer(&pointer)?;
+        Ok(Some(pointer))
+    }
+
     /// 激活某个已安装版本。
     ///
     /// 目标 exe 取不到写权限（Windows 上=正在运行）→ [`CoreError::ExeInUse`]（`AH-E6005`），
@@ -546,5 +566,43 @@ mod tests {
         fs::create_dir_all(store.root().join("not-a-version")).expect("造怪目录");
         fs::write(store.root().join("not-a-version").join(CORE_EXE), b"x").expect("写假 exe");
         assert_eq!(store.list().expect("列"), vec!["1.37.0"]);
+    }
+
+    /// Lead 复现的真实缺陷：删掉旧版本目录后 `previous` 仍指着它 → 回滚指向空气。
+    #[test]
+    fn dangling_previous_is_repaired_on_demand() {
+        let (_dir, store) = store("dangling");
+        store.install_core("1.30.0", &core(b"old")).expect("装旧");
+        store.install_core("1.37.0", &core(b"new")).expect("装新");
+        store.activate("1.30.0").expect("激活旧");
+        store.activate("1.37.0").expect("激活新");
+        assert_eq!(
+            store.active().expect("读").expect("有").previous.as_deref(),
+            Some("1.30.0")
+        );
+
+        // 用户/清理把 1.30.0 目录删了。
+        fs::remove_dir_all(store.version_dir("1.30.0")).expect("删旧版本");
+
+        // 修复前：回滚会失败（指向不存在的目录）。
+        let error = store.rollback().expect_err("回滚到已删除版本必须失败");
+        assert!(matches!(error, CoreError::RollbackFailed { .. }), "{error}");
+
+        // 修复后：previous 被清掉并原子写回。
+        let repaired = store
+            .repair_dangling_previous()
+            .expect("修复")
+            .expect("应修");
+        assert_eq!(repaired.active, "1.37.0");
+        assert_eq!(repaired.previous, None, "悬空的回滚目标必须清掉");
+        assert_eq!(
+            store.active().expect("读").expect("有").previous,
+            None,
+            "修复必须落盘"
+        );
+        assert!(
+            store.repair_dangling_previous().expect("幂等").is_none(),
+            "再修一次应无事可做"
+        );
     }
 }

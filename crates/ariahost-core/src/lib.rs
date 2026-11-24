@@ -6,7 +6,7 @@
 //! - [`download`]：下载线路模板与「逐线路失败可见」的聚合（不静默降级）；
 //! - [`zip_extract`]：只取 `aria2c.exe`（含随包 DLL），带 zip slip / 炸弹防护；
 //! - [`store`]：版本库布局、`active.json` 原子写、切换与单代回滚；
-//! - [`fetch`]：把上面这些串起来的编排，以及哈希口径（[`KNOWN_SHA256`] / [`HashState`]）。
+//! - [`fetch`]：把上面这些串起来的编排，以及哈希口径（[`KNOWN_SHA256`] / [`HashState`]）；\n//! - [`runtime`]：aria2c 子进程托管（M2-2a）——定位、受控 conf、无窗口启动、RPC 就绪探测、\n//!   三段式优雅停止、Job Object 孤儿守卫。
 //!
 //! ## TLS 依赖决策（本批唯一新增的 HTTP/TLS 栈）
 //!
@@ -22,7 +22,7 @@
 //!
 //! ## 边界
 //!
-//! 不碰面板、不装服务、不做命名管道；只提供库 API 与一个隐藏 CLI 入口
+//! 不碰面板、不装服务、不做命名管道；只提供库 API 与隐藏 CLI 入口
 //! （`ariahost --aria2-fetch <latest|版本号>`）。
 
 pub mod download;
@@ -30,6 +30,7 @@ pub mod error;
 pub mod fetch;
 pub mod http;
 pub mod release;
+pub mod runtime;
 pub mod store;
 pub mod zip_extract;
 
@@ -48,6 +49,14 @@ pub use http::{
 pub use release::{
     check_update, host_bits, match_win_asset, release_version, GitHubRelease, ReleaseAsset,
     ReleaseCatalog, ReleaseEntry, UpdateState, MIN_SUPPORTED, RELEASES_API,
+};
+#[cfg(windows)]
+pub use runtime::JobGuard;
+pub use runtime::{
+    launch_spec, prepare_conf, render_conf, resolve_core_exe, Child, CoreRuntime, CoreState,
+    CoreStatus, LaunchSpec, ProcessSpawner, Readiness, RpcProbe, RuntimeError, RuntimeEvent,
+    RuntimePaths, Spawner, Timeouts, CONF_FILE_NAME, CREATE_NO_WINDOW, FILE_ALLOCATION,
+    LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
 };
 pub use store::{ActivePointer, ExeProbe, VersionStore, ACTIVE_FILE};
 pub use zip_extract::{extract_core, ExtractedCore};

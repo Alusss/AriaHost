@@ -41,6 +41,18 @@ ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # 不引 bzip2/zstd/aes 等无关解码器。
 zip = { version = "9.8", default-features = false, features = ["deflate"] }
 
+# ---- M2-2a（配置层 + aria2c 运行时托管）新增依赖 ----
+# 配置：定版 schema 是 TOML（架构 §4.11）。只用默认 features（std/serde/parse/display）。
+toml = "1.2"
+# Win32 直调：Job Object 防孤儿（KILL_ON_JOB_CLOSE）+ 密码学随机 + DPAPI（secret.bin）。
+# **只开这四个 feature**，理由逐条见 crates/ariahost-core/src/runtime.rs 与 worklog。
+windows-sys = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Security_Cryptography",
+] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -1,11 +1,13 @@
-//! AriaHost 公共基础（架构 §3.2）：产品常量、错误码注册表、路径约定。
+//! AriaHost 公共基础（架构 §3.2）：产品常量、错误码注册表、路径约定、配置层。
 //!
-//! 本批只提供纯函数与常量：不读文件、不建目录、不做配置迁移。
-//! 配置 schema、MSG/ST 文案表、Win32 胶水在后续批次落地。
+//! 配置层（[`config`]）自 M2-2a 起落地：schema 定版 TOML 的读写、原子写 + `.bak`、
+//! 未知键保留、`rpc.secret` 的生成与 DPAPI 保护。MSG/ST 文案表与更大的 Win32 胶水仍留后续批次。
 
+pub mod config;
 pub mod error;
 pub mod paths;
 
+pub use config::{Aria2Source, Config, ConfigError, ConfigErrorKind, RpcListen, ServiceMode};
 pub use error::{ErrorCategory, ErrorCode};
 pub use paths::Plane;
 
