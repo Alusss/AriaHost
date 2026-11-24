@@ -147,4 +147,4 @@ Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知
 - **两处口头契约未经验证，首次实测后必须回写本文与 `.nsi`**：
   1. `--quit` 的退出码（脚本假设 0=已退出、1=无实例、2=超时，其余非 0 即中止）——由 M1 的 `ariahost-cli` 实现，实际返回以代码为准；
   2. per-user 卸载时服务注销只能 `runas` 发起，**拿不到提权进程退出码**（`nsExec` 不能提权），所以改用「轮询 `HKLM\SYSTEM\CurrentControlSet\Services\AriaHost` 是否消失 ≤30s」判成败。
-- 静态 CRT（验收 #15a）的落点是 `.cargo/config.toml` 的 `[target.x86_64-pc-windows-msvc] rustflags = ["-C","target-feature=+crt-static"]`（文件已建）。是否真的无 `VCRUNTIME140*.dll` / `MSVCP140*.dll`，**以 `ci.yml` 的 `dumpbin /dependents` 门禁日志为准**——本文不单独声明该项已通过；「proc-macro 不受 target rustflags 影响」仍属【推断】。
+- 静态 CRT（验收 #15a）的落点是 `.cargo/config.toml` 的 `[target.x86_64-pc-windows-msvc] rustflags = ["-C","target-feature=+crt-static"]`（文件已建）。**已在 CI 证实**：run **45453817683** 的 `windows` job 里 `dumpbin /dependents`（`…\VC\Tools\MSVC\14.52.37025\bin\Hostx64\x64\dumpbin.exe`）输出 `OK：dumpbin 未发现 VCRUNTIME140 / MSVCP140 依赖（#15a 本次通过）`。注意这是**每次构建都会重跑**的门禁，不是一次性结论；「proc-macro 不受 target rustflags 影响」仍属【推断】。
