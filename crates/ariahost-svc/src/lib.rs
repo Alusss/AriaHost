@@ -24,6 +24,7 @@ use std::path::Path;
 use ariahost_common::ErrorCode;
 
 pub mod install;
+pub mod log;
 pub mod plan;
 
 #[cfg(windows)]

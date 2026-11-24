@@ -38,6 +38,7 @@ use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use crate::install::{self, classify_control, classify_install, classify_uninstall};
+use crate::log::ServiceLog;
 use crate::plan::{
     drive_service, exit_code_for, ControlCommand, ServiceReport, StatusSink, Supervisor,
     SupervisorFailure,
@@ -76,14 +77,33 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 /// 会触发 `unused_must_use`（CI 的 `-D warnings` 直接红）。
 /// 启动失败已经通过 `drive_service` → [`ScmStatusSink`] 上报成
 /// `Stopped` + 服务特定退出码（事件查看器可见），这里只把文本写 stderr 兜底。
+///
+/// 日志：**不能**在控制处理器里写（那是 SCM 的回调线程，任何阻塞都会让 SCM 判服务无响应），
+/// 所以命令只在工作线程被取出时记一行。
 fn service_main(_arguments: Vec<OsString>) {
-    if let Err(error) = establish_and_drive() {
-        eprintln!("{} {}", error.code().code(), error.detail());
+    // Windows 服务没有控制台：stdout/stderr 没有接收者，日志必须自己写文件。
+    let log = ServiceLog::open_service_plane();
+    log.info(&format!(
+        "service_main 进入（pid {}）：服务无控制台，日志写 {}",
+        std::process::id(),
+        log.path().display()
+    ));
+    match establish_and_drive(&log) {
+        Ok(()) => log.info("service_main 正常退出"),
+        Err(error) => {
+            log.error(&format!(
+                "service_main 异常退出：{} {}",
+                error.code().code(),
+                error.detail()
+            ));
+            // 兜底：日志文件都写不了时，至少让 stderr（调试器/前台运行时）看到。
+            eprintln!("{} {}", error.code().code(), error.detail());
+        }
     }
 }
 
 /// 注册控制处理器 → 组装 supervisor → 跑状态机。
-fn establish_and_drive() -> Result<(), ServiceError> {
+fn establish_and_drive(log: &ServiceLog) -> Result<(), ServiceError> {
     let (command_sender, command_receiver) = mpsc::channel::<ControlCommand>();
     let status_handle = service_control_handler::register(SERVICE_NAME, move |control| {
         // 关键：这里只 send，不做任何阻塞动作（回调里阻塞会让 SCM 判服务无响应）。
@@ -98,12 +118,13 @@ fn establish_and_drive() -> Result<(), ServiceError> {
     .map_err(|error| ServiceError::Unavailable {
         detail: format!("注册控制处理器失败：{}", describe(&error)),
     })?;
+    log.info("控制处理器已注册（回调只登记命令，不阻塞 SCM 线程）");
 
-    let supervisor = Aria2Supervisor::from_env()?;
+    let supervisor = Aria2Supervisor::from_env(log)?;
     let sink = ScmStatusSink {
         handle: status_handle,
     };
-    drive_service(supervisor, &sink, &command_receiver)
+    drive_service(supervisor, &sink, &command_receiver, log)
 }
 
 /// 送一条命令进工作线程；通道断了（进程正在退出）如实回服务不可用，不 panic。
@@ -197,7 +218,7 @@ struct Aria2Supervisor {
 
 impl Aria2Supervisor {
     /// 从环境组装：ProgramData 平面 + 服务平面版本库 + machine-scope secret。
-    fn from_env() -> Result<Self, ServiceError> {
+    fn from_env(log: &ServiceLog) -> Result<Self, ServiceError> {
         let mut config = config_layer::load().map_err(unavailable)?;
         let paths = RuntimePaths::service().ok_or_else(|| ServiceError::Unavailable {
             detail: "拿不到 %ProgramData%（服务平面运行时目录不可用）".to_owned(),
@@ -215,6 +236,12 @@ impl Aria2Supervisor {
         runtime::prepare_conf(&config, &paths, &secret, &download_dir).map_err(unavailable)?;
 
         let port = config.aria2.rpc.port;
+        log.info(&format!(
+            "托管目标：核心 {}、RPC 端口 {port}、服务平面运行目录 {}、下载目录 {}",
+            exe.display(),
+            paths.runtime.display(),
+            download_dir.display()
+        ));
         let probe = RpcProbe::new(port, &secret);
         Ok(Self {
             spec: runtime::launch_spec(&config, &paths, exe, &secret),

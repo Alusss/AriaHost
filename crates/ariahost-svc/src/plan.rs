@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use ariahost_common::ErrorCode;
 
+use crate::log::{Level, LogSink};
 use crate::ServiceError;
 
 /// `StartPending` / `StopPending` 的 `wait_hint`：SCM 启动预算 30s（架构 §5 ST-01）。
@@ -234,6 +235,26 @@ pub trait StatusSink {
     fn report(&self, report: &ServiceReport) -> Result<(), String>;
 }
 
+/// 一条上报的可读描述（进日志；用户贴 issue 时能直接看懂，不必翻译 SCM 术语）。
+pub fn describe_report(report: &ServiceReport) -> String {
+    match report {
+        ServiceReport::StartPending { wait_hint } => {
+            format!("StartPending（wait_hint {}s）", wait_hint.as_secs())
+        }
+        ServiceReport::Running { aria2_version } => {
+            format!("Running（aria2c {aria2_version} 就绪）")
+        }
+        ServiceReport::StopPending { wait_hint } => {
+            format!("StopPending（wait_hint {}s）", wait_hint.as_secs())
+        }
+        ServiceReport::Stopped { exit_code: None } => "Stopped".to_owned(),
+        ServiceReport::Stopped {
+            exit_code: Some(code),
+        } => format!("Stopped（服务特定退出码 {code}）"),
+        ServiceReport::Failed { code, hint } => format!("Failed（{}：{hint}）", code.code()),
+    }
+}
+
 /// 服务主循环的**驱动骨架**：启动一次，然后等停止命令。
 ///
 /// 为什么放在这一层（而不是 Windows 胶水里）：这部分逻辑决定了「失败会不会卡住 SCM」，
@@ -244,21 +265,29 @@ pub trait StatusSink {
 /// 2. 启动失败 → 上报 `Failed` 并返回错误（SCM 会把服务标成已停止 + 特定退出码）；
 /// 3. 启动成功 → 阻塞等 `Stop`/`Shutdown`，收到后按状态机上报并返回；
 /// 4. 通道断掉（理论上只会发生在进程要退出时）→ 当作停止处理，绝不悬挂。
+///
+/// `log` 的写入**永不失败**（[`LogSink`] 的实现自己吞错误），所以它不参与错误传播。
 pub fn drive_service<S: Supervisor>(
     supervisor: S,
     sink: &dyn StatusSink,
     commands: &Receiver<ControlCommand>,
+    log: &dyn LogSink,
 ) -> Result<(), ServiceError> {
     let mut state = ServiceLoop::new(supervisor);
 
+    log.record(
+        Level::Info,
+        "服务主循环启动：先自启一次 aria2c（SCM 不为「启动」发控制事件，service_main 被调用本身就是启动）",
+    );
     let startup = state.handle(ControlCommand::Start);
-    for report in &startup {
-        sink.report(report)
-            .map_err(|detail| ServiceError::Unavailable {
-                detail: format!("上报启动状态失败：{detail}"),
-            })?;
-    }
+    report_all(sink, &startup, log).map_err(|detail| ServiceError::Unavailable {
+        detail: format!("上报启动状态失败：{detail}"),
+    })?;
     if let Some(ServiceReport::Failed { code, hint }) = startup.last() {
+        log.record(
+            Level::Error,
+            &format!("aria2c 起不来，服务以 {} 失败退出：{hint}", code.code()),
+        );
         return Err(ServiceError::StartupFailed {
             code: *code,
             detail: hint.clone(),
@@ -268,19 +297,49 @@ pub fn drive_service<S: Supervisor>(
     loop {
         let command = match commands.recv() {
             Ok(command) => command,
-            Err(_) => ControlCommand::Stop,
+            Err(_) => {
+                log.record(
+                    Level::Warn,
+                    "控制通道已断开（进程正在退出）：按 stop 处理，不留悬挂状态",
+                );
+                ControlCommand::Stop
+            }
         };
+        log.record(Level::Info, &format!("收到控制命令 {}", command.as_str()));
         let stopping = matches!(command, ControlCommand::Stop | ControlCommand::Shutdown);
-        for report in &state.handle(command) {
-            sink.report(report)
-                .map_err(|detail| ServiceError::Unavailable {
-                    detail: format!("上报停止状态失败：{detail}"),
-                })?;
-        }
+        let reports = state.handle(command);
+        report_all(sink, &reports, log).map_err(|detail| ServiceError::Unavailable {
+            detail: format!("上报停止状态失败：{detail}"),
+        })?;
         if stopping {
+            log.record(Level::Info, "服务主循环退出（已上报 Stopped）");
             return Ok(());
         }
     }
+}
+
+/// 按顺序上报一串状态，逐条记日志（成功与失败都记，失败即中断）。
+fn report_all(
+    sink: &dyn StatusSink,
+    reports: &[ServiceReport],
+    log: &dyn LogSink,
+) -> Result<(), String> {
+    for report in reports {
+        match sink.report(report) {
+            Ok(()) => log.record(
+                Level::Info,
+                &format!("上报 {} 成功", describe_report(report)),
+            ),
+            Err(detail) => {
+                log.record(
+                    Level::Error,
+                    &format!("上报 {} 失败：{detail}", describe_report(report)),
+                );
+                return Err(detail);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -514,7 +573,8 @@ mod tests {
         sender.send(ControlCommand::Stop).expect("发停止");
         let sink = FakeSink::new();
 
-        drive_service(FakeSupervisor::ok(), &sink, &receiver).expect("应正常结束");
+        drive_service(FakeSupervisor::ok(), &sink, &receiver, &crate::log::NOOP)
+            .expect("应正常结束");
         assert_eq!(
             sink.names(),
             vec!["start-pending", "running", "stop-pending", "stopped"]
@@ -528,7 +588,8 @@ mod tests {
         sender.send(ControlCommand::Stop).expect("停止");
         let sink = FakeSink::new();
 
-        drive_service(FakeSupervisor::ok(), &sink, &receiver).expect("应正常结束");
+        drive_service(FakeSupervisor::ok(), &sink, &receiver, &crate::log::NOOP)
+            .expect("应正常结束");
         assert_eq!(
             sink.names(),
             vec!["start-pending", "running", "stop-pending", "stopped"],
@@ -545,6 +606,7 @@ mod tests {
             FakeSupervisor::failing(ErrorCode::Aria2NotFound, "没有核心"),
             &sink,
             &receiver,
+            &crate::log::NOOP,
         )
         .expect_err("启动失败必须返回错误");
         assert!(
@@ -561,7 +623,8 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel::<ControlCommand>();
         drop(sender);
         let sink = FakeSink::new();
-        drive_service(FakeSupervisor::ok(), &sink, &receiver).expect("通道关闭当停止");
+        drive_service(FakeSupervisor::ok(), &sink, &receiver, &crate::log::NOOP)
+            .expect("通道关闭当停止");
         assert_eq!(
             sink.names(),
             vec!["start-pending", "running", "stop-pending", "stopped"]
@@ -576,11 +639,133 @@ mod tests {
             seen: std::sync::Mutex::new(Vec::new()),
             fail_on: Some("running"),
         };
-        let error =
-            drive_service(FakeSupervisor::ok(), &sink, &receiver).expect_err("上报失败必须冒泡");
+        let error = drive_service(FakeSupervisor::ok(), &sink, &receiver, &crate::log::NOOP)
+            .expect_err("上报失败必须冒泡");
         assert!(
             matches!(error, ServiceError::Unavailable { .. }),
             "{error:?}"
+        );
+    }
+
+    /// 录音机：把日志按 "级别 文本" 记下来，供断言。
+    struct RecordingLog {
+        lines: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingLog {
+        fn new() -> Self {
+            Self {
+                lines: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().expect("锁").clone()
+        }
+    }
+
+    impl LogSink for RecordingLog {
+        fn record(&self, level: Level, message: &str) {
+            self.lines
+                .lock()
+                .expect("锁")
+                .push(format!("{} {message}", level.as_str()));
+        }
+    }
+
+    #[test]
+    fn drive_service_logs_commands_reports_and_exit() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(ControlCommand::Stop).expect("停止");
+        let sink = FakeSink::new();
+        let log = RecordingLog::new();
+
+        drive_service(FakeSupervisor::ok(), &sink, &receiver, &log).expect("应正常结束");
+
+        let lines = log.lines();
+        let joined = lines.join("\n");
+        for expected in [
+            "INFO 服务主循环启动",
+            "INFO 上报 StartPending（wait_hint 30s） 成功",
+            "INFO 上报 Running（aria2c 1.37.0 就绪） 成功",
+            "INFO 收到控制命令 stop",
+            "INFO 上报 StopPending（wait_hint 25s） 成功",
+            "INFO 上报 Stopped 成功",
+            "INFO 服务主循环退出（已上报 Stopped）",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "日志缺「{expected}」，实际：\n{joined}"
+            );
+        }
+        // 顺序：启动 → 就绪 → 收到 stop → 停止 → 退出。
+        let index_of = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("缺 {needle}"))
+        };
+        assert!(index_of("上报 Running") < index_of("收到控制命令 stop"));
+        assert!(index_of("收到控制命令 stop") < index_of("服务主循环退出"));
+    }
+
+    #[test]
+    fn drive_service_logs_startup_failure_at_error_level() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let log = RecordingLog::new();
+        let _ = drive_service(
+            FakeSupervisor::failing(ErrorCode::Aria2NotFound, "没有核心"),
+            &FakeSink::new(),
+            &receiver,
+            &log,
+        );
+        let joined = log.lines().join("\n");
+        assert!(
+            joined.contains("ERROR aria2c 起不来，服务以 AH-E2001 失败退出：没有核心"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn drive_service_logs_closed_channel_as_warning() {
+        let (sender, receiver) = std::sync::mpsc::channel::<ControlCommand>();
+        drop(sender);
+        let log = RecordingLog::new();
+        drive_service(FakeSupervisor::ok(), &FakeSink::new(), &receiver, &log).expect("当停止");
+        let joined = log.lines().join("\n");
+        assert!(joined.contains("WARN 控制通道已断开"), "{joined}");
+    }
+
+    #[test]
+    fn describe_report_spells_out_status_and_codes() {
+        assert_eq!(
+            describe_report(&ServiceReport::StartPending {
+                wait_hint: Duration::from_secs(30)
+            }),
+            "StartPending（wait_hint 30s）"
+        );
+        assert_eq!(
+            describe_report(&ServiceReport::Running {
+                aria2_version: "1.37.0".to_owned()
+            }),
+            "Running（aria2c 1.37.0 就绪）"
+        );
+        assert_eq!(
+            describe_report(&ServiceReport::Stopped { exit_code: None }),
+            "Stopped"
+        );
+        assert_eq!(
+            describe_report(&ServiceReport::Stopped {
+                exit_code: Some(5001)
+            }),
+            "Stopped（服务特定退出码 5001）"
+        );
+        assert_eq!(
+            describe_report(&ServiceReport::Failed {
+                code: ErrorCode::ServiceUnavailable,
+                hint: "起不来".to_owned()
+            }),
+            "Failed（AH-E5001：起不来）"
         );
     }
 }
