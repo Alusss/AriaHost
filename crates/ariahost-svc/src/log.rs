@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 日志级别。只留三档：服务日志是给排障看的，不需要 TRACE/DEBUG 的花活。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,15 +98,50 @@ impl Default for Limits {
 pub struct ServiceLog {
     path: PathBuf,
     limits: Limits,
+    retry: Retry,
     state: RefCell<State>,
 }
 
-/// 可变部分：当前句柄、已写字节数、是否已经告警过。
+/// 降级后的重试节奏。
+///
+/// 为什么不是「每行都重试」：目录权限被拒这类**持久**故障会让每一行都撞一次失败 syscall。
+/// 而完全不重试也不对——服务跑在 SYSTEM 下，`%ProgramData%` 的权限可能因组策略变化中途恢复。
+/// 所以取「到点或攒够行数才重试一次」，成功后立刻恢复写盘且不再重复告警。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retry {
+    /// 距上次失败至少隔多久才重试。
+    pub min_interval: Duration,
+    /// 或者：距上次失败至少又写了多少行才重试。
+    pub min_lines: u32,
+}
+
+/// 5 秒（服务日志量很小，这个节奏足够快又不烧 syscall）。
+pub const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 100 行（突发日志时不必干等 5 秒）。
+pub const DEFAULT_RETRY_LINES: u32 = 100;
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            min_interval: DEFAULT_RETRY_INTERVAL,
+            min_lines: DEFAULT_RETRY_LINES,
+        }
+    }
+}
+
+/// 可变部分：当前句柄、已写字节数、告警与退避状态。
 struct State {
     file: Option<File>,
     size: u64,
     warned: bool,
     warnings: u32,
+    /// 下次允许重试打开的时刻（`None` = 没在退避中，立刻可以试）。
+    retry_at: Option<Instant>,
+    /// 退避期间又跳过了多少行。
+    lines_since_failure: u32,
+    /// 打开尝试次数（单测用来断言「没有每行都试」）。
+    open_attempts: u32,
 }
 
 impl ServiceLog {
@@ -121,16 +156,25 @@ impl ServiceLog {
         }
     }
 
-    /// 指定目录与阈值（单测用）。
+    /// 指定目录与轮转阈值（生产默认退避节奏）。
     pub fn open(dir: impl Into<PathBuf>, limits: Limits) -> Self {
+        Self::open_with_retry(dir, limits, Retry::default())
+    }
+
+    /// 指定目录、轮转阈值与退避节奏（单测用，好把 5 秒压成 0）。
+    pub fn open_with_retry(dir: impl Into<PathBuf>, limits: Limits, retry: Retry) -> Self {
         Self {
             path: dir.into().join("service.log"),
             limits,
+            retry,
             state: RefCell::new(State {
                 file: None,
                 size: 0,
                 warned: false,
                 warnings: 0,
+                retry_at: None,
+                lines_since_failure: 0,
+                open_attempts: 0,
             }),
         }
     }
@@ -160,6 +204,11 @@ impl ServiceLog {
     /// 累计告警次数——单测用它断言「只告警一次，不刷屏」。
     pub fn warnings(&self) -> u32 {
         self.state.borrow().warnings
+    }
+
+    /// 打开尝试次数——单测用它断言「退避期间没有每行都试」。
+    pub fn open_attempts(&self) -> u32 {
+        self.state.borrow().open_attempts
     }
 
     /// INFO 一行。
@@ -196,10 +245,16 @@ impl ServiceLog {
         let bytes = line.as_bytes();
 
         if state.file.is_none() {
-            if let Err(error) = self.ensure_open(&mut state) {
-                self.note_degraded_with(&mut state, &error);
+            if !self.due_for_retry(&mut state) {
                 return false;
             }
+            if let Err(error) = self.ensure_open(&mut state) {
+                self.note_degraded_with(&mut state, &error);
+                self.schedule_retry(&mut state);
+                return false;
+            }
+            state.retry_at = None;
+            state.lines_since_failure = 0;
         }
 
         // 轮转判定：`size > 0` 保证「一行就超限」时也能写进去（否则小阈值会死循环）。
@@ -220,17 +275,43 @@ impl ServiceLog {
                 true
             }
             Err(error) => {
-                // 句柄坏了：丢掉它，下一行重新打开（那里若还是失败，会走告警）。
+                // 句柄坏了：丢掉它，按退避节奏重新打开（那里若还是失败，会走告警）。
                 state.file = None;
                 state.size = 0;
                 self.note_degraded_with(&mut state, &error);
+                self.schedule_retry(&mut state);
                 false
             }
         }
     }
 
+    /// 现在该不该再试一次打开？（退避期间直接跳过，不产生 syscall）
+    ///
+    /// 「到点」与「攒够行数」任一满足即可 —— 前者防持久故障被高频重试，
+    /// 后者让突发日志不必干等（日志量小的时候等到点更省）。
+    fn due_for_retry(&self, state: &mut State) -> bool {
+        let due_by_time = match state.retry_at {
+            None => true,
+            Some(at) => Instant::now() >= at,
+        };
+        let due_by_lines = state.lines_since_failure >= self.retry.min_lines;
+        if due_by_time || due_by_lines {
+            state.lines_since_failure = 0;
+            true
+        } else {
+            state.lines_since_failure = state.lines_since_failure.saturating_add(1);
+            false
+        }
+    }
+
+    /// 记下「下一次允许重试」的时刻。
+    fn schedule_retry(&self, state: &mut State) {
+        state.retry_at = Instant::now().checked_add(self.retry.min_interval);
+    }
+
     /// 打开（或重开）`service.log`，目录不存在就建。
     fn ensure_open(&self, state: &mut State) -> io::Result<()> {
+        state.open_attempts = state.open_attempts.saturating_add(1);
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -714,6 +795,92 @@ mod tests {
             assert!(!log.write(Level::Warn, "还是不行"));
         }
         assert_eq!(log.warnings(), 1, "只告警一次");
+        // 默认退避是 5s / 100 行：这 5 行全在退避窗口里，只该有第一次那 1 次打开尝试。
+        assert_eq!(log.open_attempts(), 1, "退避期间不许每行都撞一次 syscall");
+    }
+
+    #[test]
+    fn degrade_skips_retry_inside_backoff_window() {
+        let dir = temp_dir("backoff-skip");
+        fs::create_dir_all(&dir).expect("建目录");
+        let blocked = dir.join("logs");
+        fs::write(&blocked, b"not a directory").expect("占位");
+
+        // 1 小时 / 100 行：窗口内一行都不该重试。
+        let log = ServiceLog::open_with_retry(
+            &blocked,
+            Limits::default(),
+            Retry {
+                min_interval: Duration::from_secs(3600),
+                min_lines: 100,
+            },
+        );
+        assert!(!log.write(Level::Info, "第一次"));
+        assert_eq!(log.open_attempts(), 1);
+        for index in 0..20 {
+            assert!(!log.write(Level::Info, &format!("退避期第 {index} 行")));
+        }
+        assert_eq!(log.open_attempts(), 1, "20 行都不该触发重试");
+        assert_eq!(log.warnings(), 1);
+    }
+
+    #[test]
+    fn degrade_retries_after_enough_lines() {
+        let dir = temp_dir("backoff-lines");
+        fs::create_dir_all(&dir).expect("建目录");
+        let blocked = dir.join("logs");
+        fs::write(&blocked, b"not a directory").expect("占位");
+
+        // 行数阈值 3、时间阈值 1 小时 → 靠行数触发重试。
+        let log = ServiceLog::open_with_retry(
+            &blocked,
+            Limits::default(),
+            Retry {
+                min_interval: Duration::from_secs(3600),
+                min_lines: 3,
+            },
+        );
+        assert!(!log.write(Level::Info, "第一次失败"));
+        assert_eq!(log.open_attempts(), 1);
+        for index in 0..3 {
+            assert!(!log.write(Level::Info, &format!("第 {index} 行")));
+        }
+        assert_eq!(log.open_attempts(), 1, "攒够 3 行之前不许试");
+        // 第 5 行时行数达标 → 再试一次（还是失败，所以只是一次尝试，不告警）。
+        assert!(!log.write(Level::Info, "第 5 行"));
+        assert_eq!(log.open_attempts(), 2, "攒够行数要重试一次");
+        assert_eq!(log.warnings(), 1, "重试失败也不许再告警");
+    }
+
+    #[test]
+    fn degrade_recovers_when_the_failure_clears() {
+        let dir = temp_dir("backoff-recover");
+        fs::create_dir_all(&dir).expect("建目录");
+        let blocked = dir.join("logs");
+        fs::write(&blocked, b"not a directory").expect("占位");
+
+        // 0 秒退避：允许下一次写入立刻重试。
+        let log = ServiceLog::open_with_retry(
+            &blocked,
+            Limits::default(),
+            Retry {
+                min_interval: Duration::ZERO,
+                min_lines: u32::MAX,
+            },
+        );
+        assert!(!log.write_at(at(0), Level::Info, "故障期间"));
+        assert_eq!(log.warnings(), 1);
+
+        // 故障消失（占位文件删掉）→ 下一行应自愈。
+        fs::remove_file(&blocked).expect("删占位");
+        assert!(log.write_at(at(1), Level::Info, "恢复后第一行"));
+        assert!(!log.is_degraded(), "权限恢复后必须自动恢复写盘");
+        assert_eq!(log.warnings(), 1, "恢复本身不必再告警");
+        assert_eq!(
+            read(&blocked.join("service.log")),
+            "1970-01-01T00:00:01.000Z INFO 恢复后第一行\n",
+            "恢复后只该有恢复后的行（故障期间那行本来就丢了）"
+        );
     }
 
     #[test]
