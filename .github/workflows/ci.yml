@@ -236,9 +236,10 @@ jobs:
     needs: [changes, preflight]
     if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
-    # 首版压到 30 分钟：挂住时最坏计费从 120 分钟（≈月配额 12%）降到 60。首次跑若确实不够，
-    # 再按日志基线调大（egui 栈首次全量编译预计 8–15 分钟）。
-    timeout-minutes: 30
+    # M2 起面板引入 egui/eframe + wgpu 整条栈（wgpu-core/naga/winit/fontique/skrifa…），
+    # 首次全量编译预计 12–20 分钟（缓存命中后 3–5 分钟），原 30 分钟余量不够；
+    # 提到 45 分钟，避免首次跑因超时被判红（超时同样按 2× 计费，白烧两次）。其它 job 不动。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # 必须显式传 toolchain（同 fmt job）：不传时该 action 默认装 stable，再由 rustup 补装

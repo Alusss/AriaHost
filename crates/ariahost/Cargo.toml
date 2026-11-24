@@ -18,3 +18,5 @@ winresource = "0.1"
 [dependencies]
 ariahost-common = { path = "../ariahost-common" }
 ariahost-svc = { path = "../ariahost-svc" }
+# 面板入口：M2 起「无参数启动」真的开窗（含 --panel-selftest 隐藏自测入口）。
+ariahost-ui = { path = "../ariahost-ui" }

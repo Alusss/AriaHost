@@ -1,11 +1,12 @@
 //! 命令行契约（架构 §4.1.4）。
 //!
-//! 本批全部是桩，但**分支、错误码、退出码必须精确**：安装器、面板与 CI 都依赖这张表。
+//! 分支、错误码、退出码必须精确：安装器、面板与 CI 都依赖这张表。
 //!
-//! 分派顺序硬约束：先解析 `argv[1..]`，再决定是否创建/检查单实例 mutex；
-//! 短命助手（安装/卸载/AUMID/`--quit`）一律不参与 mutex。
-//! 本批尚未实现 mutex 与控制管道，因此 `--quit` 固定按「无实例」返回；
-//! M2 接入管道后按真实握手结果返回 0/1/2。
+//! 分派顺序硬约束：先解析 `argv[1..]`，再决定是否创建/检查单实例锁；
+//! 短命助手（安装/卸载/AUMID/`--quit`）一律不参与单实例。
+//!
+//! M2 起「无参数」真的起窗（`crates/ariahost-ui`）；`--service` 与三个短命助手仍是桩。
+//! `--panel-selftest` 是隐藏自测入口（不出现在 `--help` 里），供无人值守量测内存用。
 
 use std::path::PathBuf;
 
@@ -16,7 +17,7 @@ pub const USAGE: &str = "\
 AriaHost — aria2 Windows 服务管理器
 
 用法：
-  ariahost                         启动面板（M2 实现）
+  ariahost                         启动面板
   ariahost --service               以 Windows 服务方式运行（ServiceHost）
   ariahost --install-service       注册 Windows 服务（需管理员）
   ariahost --uninstall-service     注销 Windows 服务（需管理员）
@@ -34,8 +35,13 @@ AriaHost — aria2 Windows 服务管理器
 /// 解析后的子命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// 无参数：面板（M2 才建窗口）。
+    /// 无参数：启动面板（M2 起真的开窗）。
     Panel,
+    /// `--panel-selftest [--frames N]`：隐藏自测入口，开窗渲染 N 帧后打印机器可读行并退出。
+    PanelSelftest {
+        /// 渲染帧数。
+        frames: u32,
+    },
     /// `--service`：ServiceHost。
     Service,
     /// `--install-service`：注册 Windows 服务（短命助手）。
@@ -114,6 +120,10 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     };
     let rest = &args[1..];
 
+    if first == "--panel-selftest" {
+        return parse_selftest(rest);
+    }
+
     if first == "--write-aumid" {
         return match rest {
             [] => Err(UsageError::new("--write-aumid 缺少 <lnk 路径> 参数")),
@@ -146,9 +156,31 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     Ok(command)
 }
 
+/// 解析 `--panel-selftest` 的尾部参数：`[]` 或 `["--frames", N]`。
+///
+/// 这是隐藏入口（不进 `--help`），供验收/CI 在无人值守下量内存：
+/// 开窗渲染 N 帧后打印 `SELFTEST adapter=... atlas=... private_kb=...` 再退出。
+fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
+    match rest {
+        [] => Ok(Command::PanelSelftest {
+            frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
+        }),
+        [flag, value] if flag == "--frames" => match value.parse::<u32>() {
+            Ok(frames) if frames > 0 => Ok(Command::PanelSelftest { frames }),
+            Ok(_) => Err(UsageError::new("--frames 必须大于 0")),
+            Err(_) => Err(UsageError::new(format!(
+                "--frames 需要正整数，收到：{value}"
+            ))),
+        },
+        _ => Err(UsageError::new(
+            "--panel-selftest 只接受可选的 --frames <帧数>",
+        )),
+    }
+}
+
 /// 执行一条命令并返回进程退出码。
 ///
-/// 本批所有业务分支都是桩：只打印契约要求的占位信息，不做真实动作。
+/// 面板分支自 M2 起真的起窗（阻塞到窗口关闭）；`--service` 与三个短命助手仍是占位实现。
 pub fn run(args: &[String]) -> i32 {
     match parse(args) {
         Ok(command) => execute(&command),
@@ -160,26 +192,13 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// 分派到具体子命令（全部为桩实现）。
+/// 分派到具体子命令。
 fn execute(command: &Command) -> i32 {
     match command {
-        Command::Panel => {
-            // M1 桩：图形面板在 M2 实现。双击快捷方式时这是用户唯一能看到的输出，所以：
-            //   ① 必须是中文、可读、说明「下一步该看什么」；
-            //   ② 不能一闪而过（v0.1.0 只 println 一行英文就 exit 0，用户报的是「启动闪退」，
-            //      见 docs/dev/release.md §9 记录）。M2 面板落地后删掉本分支与等待逻辑。
-            println!("AriaHost {VERSION}（预览版：命令行内核）");
-            println!();
-            println!("图形面板尚未实现（计划在 M2 提供）。当前版本可用的命令：");
-            println!("  ariahost --help             查看全部命令与用法");
-            println!("  ariahost --version          显示版本");
-            println!("  ariahost --service          以 Windows 服务方式运行（ServiceHost）");
-            println!();
-            println!("说明：本程序是 aria2 的服务管理器，不是下载器本身；");
-            println!("      面板、托盘、任务列表在 M2 交付，届时双击即开窗口。");
-            wait_for_enter_if_console();
-            EXIT_OK
-        }
+        // 面板：M2 起真的起窗（eframe/egui + wgpu）。这里不再有「等待回车」的占位逻辑——
+        // 双击快捷方式时用户看到的是窗口，不是控制台输出。
+        Command::Panel => ariahost_ui::run_panel(),
+        Command::PanelSelftest { frames } => ariahost_ui::run_selftest(*frames),
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {
@@ -219,20 +238,6 @@ fn execute(command: &Command) -> i32 {
     }
 }
 
-/// 双击快捷方式时控制台是新建的，进程一退出窗口立刻消失——用户看到的就是「启动闪退」。
-/// 只在 stdin 是终端时等待，避免 CI / 管道 / 服务场景（stdin 被重定向或为空）被阻塞。
-fn wait_for_enter_if_console() {
-    use std::io::{IsTerminal, Write};
-
-    if !std::io::stdin().is_terminal() {
-        return;
-    }
-    print!("按回车键退出…");
-    let _ = std::io::stdout().flush();
-    let mut discard = String::new();
-    let _ = std::io::stdin().read_line(&mut discard);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,10 +254,34 @@ mod tests {
         run(&owned(args))
     }
 
+    /// 无参数仍是面板分支。**注意**：这里只断言解析结果——`run(&[])` 会真的开窗，
+    /// 在 CI / 无人值守环境调用它会阻塞或失败（M2 起面板是真的 GUI）。
     #[test]
     fn no_args_is_panel() {
         assert_eq!(parse_args(&[]), Ok(Command::Panel));
-        assert_eq!(run_args(&[]), EXIT_OK);
+    }
+
+    #[test]
+    fn panel_selftest_parses_with_optional_frames() {
+        assert_eq!(
+            parse_args(&["--panel-selftest"]),
+            Ok(Command::PanelSelftest {
+                frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES
+            })
+        );
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--frames", "5"]),
+            Ok(Command::PanelSelftest { frames: 5 })
+        );
+    }
+
+    #[test]
+    fn panel_selftest_rejects_bad_frames() {
+        assert!(parse_args(&["--panel-selftest", "--frames", "0"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--frames", "abc"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--frames", "-1"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "junk"]).is_err());
+        assert!(parse_args(&["--panel-selftest", "--frames"]).is_err());
     }
 
     #[test]

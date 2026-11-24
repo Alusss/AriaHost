@@ -1,7 +1,9 @@
 # 构建与运行
 
-> 适用：M1 起。**当前仓库没有 `Cargo.toml`**，以下命令在 M1 落地前均会失败——本文描述的是目标形态，落地后逐条复核。
-> 本文命令**未在本仓库实测**（开发机无 Rust 工具链），首次真跑以 CI 日志（`.github/workflows/ci.yml`）为准。
+> 适用：M2 起（面板已经真的起窗）。
+> **开发机没有 MSVC 链接器**：本地 `cargo build / check / test` 都会停在依赖的 build script 上，
+> 编译验证只能靠 CI（`.github/workflows/ci.yml`）。本文命令以 CI 日志为准，本地跑不通不算缺陷。
+> 能用本地跑的是 `cargo fmt --all -- --check`、`cargo metadata`、`cargo fetch` 这类不需要链接器的动作。
 
 ## 1. 常用命令
 
@@ -14,7 +16,7 @@ cargo clippy --workspace --all-targets -- -D warnings    # 与 CI 一致
 cargo fmt --all                                          # 格式化（CI 用 --check 只校验）
 ```
 
-只编主程序：`cargo build --release -p ariahost-ui`。
+只编主程序：`cargo build --release -p ariahost`。
 
 ## 2. 产物路径
 
@@ -43,7 +45,7 @@ x86 包在 M4 之前**不进 CI**：`release.yml` 里整段 `build-x86` job 被�
 CLI 契约见架构 §7.1（R9），落地时若有微调，必须同步本节与 `installer/ariahost.nsi`。
 
 ```powershell
-# ① 面板（默认）：托盘常驻，启动后按配置最小化
+# ① 面板（默认）：M2 起真的开窗（eframe/egui + wgpu，技术闸门切片；托盘属 M2-1）
 .\target\release\ariahost.exe
 
 # ② headless：面板进程直接托管 aria2，关闭面板即停止（无 SCM）
@@ -57,6 +59,27 @@ sc query AriaHost
 ```
 
 ④ 仅以 SCM 方式运行时由系统拉起 `ariahost.exe --service`（安装器不直接调它）。
+
+### 4.1 面板自测入口（隐藏，供 M2 门禁量内存）
+
+`--panel-selftest` 不出现在 `--help` 里，只给验收/自动化用：开窗 → 连续渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
+
+```powershell
+.\target\release\ariahost.exe --panel-selftest              # 默认 120 帧
+.\target\release\ariahost.exe --panel-selftest --frames 300 # 指定帧数（>0）
+# 输出示例：
+# SELFTEST adapter=NVIDIA_GeForce_RTX_4060 atlas=2048 private_kb=48213 backend=Dx12 frames=120 font=system:Microsoft_YaHei:...
+```
+
+- `atlas` = 设备实际生效的 `max_texture_dimension_2d`（EG-7 的字形图集上限）。
+- `private_kb` = 结束时 `GetProcessMemoryInfo → PrivateWorkingSetSize`（EG-4 口径的参考值）；**真机 60s 稳态仍要按 §4.2.1 口径单独量**，自测行只是同一口径的快速读数。
+- 面板与自测共用 `%LOCALAPPDATA%\AriaHost\panel.lock` 单实例锁：已有面板在跑时自测会以退出码 1 结束（先关面板）。
+- 窗口物理像素超过 `atlas` 时首帧会失败（wgpu 用同一上限约束交换链），此时用逃生口放开上限，不必重新构建：
+
+```powershell
+$env:ARIAHOST_ATLAS_SIDE = "4096"   # 默认 2048（EG-7 首选值）；1440p/4K 或 200% 缩放机器用 4096
+.\target\release\ariahost.exe
+```
 
 调试顺序：`sc query AriaHost` 看状态 → `%APPDATA%\AriaHost\logs\ariahost.log` 与 `aria2.log` 看原因 → `sc stop AriaHost` 验证停止链是否在 25s 内收尾。
 

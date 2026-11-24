@@ -1,10 +1,10 @@
 //! AriaHost 入口（架构 §4.1.4）。
 //!
-//! **面板入口待 M2**：本批只做 argv 解析与子命令分派。
-//! 不建窗口、不初始化 wgpu、不连 RPC、不注册服务、不创建单实例 mutex。
+//! **面板入口自 M2 起真的起窗**（`crates/ariahost-ui`：eframe/egui + wgpu，只做技术闸门切片，
+//! 不接服务/RPC/任务列表）。`--service` 与三个短命助手仍是桩。
 //!
-//! 分派顺序硬约束：先解析 argv，再决定是否进入单实例互斥；短命助手不参与 mutex。
-//! 本批所有业务分支都是桩，只保证分支、错误码、退出码与 CLI 契约一致。
+//! 分派顺序硬约束：先解析 argv，再决定是否进入单实例锁；短命助手不参与单实例。
+//! 面板的单实例锁在 `ariahost_ui::run_panel` 内部获取（`%LOCALAPPDATA%\AriaHost\panel.lock`）。
 
 mod cli;
 

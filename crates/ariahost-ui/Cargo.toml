@@ -1,0 +1,25 @@
+[package]
+name = "ariahost-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost 面板（eframe/egui）：M2 技术闸门切片，不含服务控制与任务列表"
+
+[dependencies]
+ariahost-common = { path = "../ariahost-common" }
+# EG-1：egui 整条栈 pin 0.37（防版本漂移）；eframe 默认 features 已含 wgpu 与 system_fonts。
+eframe.workspace = true
+egui.workspace = true
+egui_system_font_provider.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# EG-4 内存口径：K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize
+# （≈任务管理器「内存」列）。只用官方轻量绑定 windows-sys（已在依赖树内：winit/wgpu 间接依赖），
+# 不引入 windows crate，也不新增供应链面。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
