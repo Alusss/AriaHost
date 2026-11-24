@@ -69,7 +69,15 @@ pub fn parse_version_line(line: &str) -> Result<Aria2Version, VersionParseError>
             .ok_or_else(|| VersionParseError::MissingPrefix {
                 line: line.to_owned(),
             })?;
+    parse_version_number(value)
+}
 
+/// 解析纯版本号（不带 `aria2 version ` 前缀），例如 `1.37.0`。
+///
+/// 供「GitHub release tag」「配置里的版本值」等复用同一套数字规则：M1-3 的
+/// release tag `release-1.37.0` 去掉前缀后走这里，避免第二套版本解析。
+pub fn parse_version_number(value: &str) -> Result<Aria2Version, VersionParseError> {
+    let value = value.trim();
     let mut parts = value.split('.');
     let major = parse_component(&mut parts, value)?;
     let minor = parse_component(&mut parts, value)?;
@@ -151,5 +159,27 @@ mod tests {
     fn version_ordering_is_numeric() {
         assert!(Aria2Version::new(1, 36, 0) < Aria2Version::new(1, 37, 0));
         assert!(Aria2Version::new(1, 37, 0) < Aria2Version::new(2, 0, 0));
+    }
+
+    #[test]
+    fn parses_bare_version_numbers() {
+        // M1-3 的 GitHub tag `release-1.37.0` 去掉前缀后走这条路径。
+        assert_eq!(
+            parse_version_number("1.37.0").expect("应能解析纯版本号"),
+            Aria2Version::new(1, 37, 0)
+        );
+        assert_eq!(
+            parse_version_number(" 1.19.1 ").expect("应容忍空白"),
+            Aria2Version::new(1, 19, 1)
+        );
+        for value in ["", "1", "1.37", "1.37.0.1", "1.37.0-rc1", "v1.37.0"] {
+            assert!(
+                matches!(
+                    parse_version_number(value),
+                    Err(VersionParseError::Malformed { .. })
+                ),
+                "{value:?} 应归为 Malformed"
+            );
+        }
     }
 }

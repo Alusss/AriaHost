@@ -30,6 +30,17 @@ thiserror = "2.0"
 tokio = { version = "1.0", features = ["net"] }
 windows-service = "0.8"
 
+# ---- M1-3（aria2 核心获取与版本管理）新增依赖 ----
+# 哈希：只用于下载包 SHA-256 校验（1.37.0 有已知交叉参考值；其它版本必须标注未校验）。
+sha2 = "0.10"
+# HTTP/TLS：**全仓只允许这一条栈**（不要再引 reqwest/native-tls/第二个 HTTP 客户端）。
+# 为什么是 ureq 而不是 WinHTTP：见 crates/ariahost-core/src/lib.rs 的模块文档
+# （WinHTTP 是 cfg(windows) 代码，Linux 侧的本地 clippy/test 覆盖不到，验证成本更高）。
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+# zip：只做「读出 aria2c.exe」，只开 deflate（aria2 官方 win 包用 deflate）；
+# 不引 bzip2/zstd/aes 等无关解码器。
+zip = { version = "9.8", default-features = false, features = ["deflate"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

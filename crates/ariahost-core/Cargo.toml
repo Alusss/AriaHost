@@ -1,0 +1,18 @@
+[package]
+name = "ariahost-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost 的 aria2 核心获取与版本管理：GitHub 渠道解析、双线路下载、校验、版本库与激活指针"
+
+[dependencies]
+ariahost-aria2 = { path = "../ariahost-aria2" }
+ariahost-common = { path = "../ariahost-common" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+zip.workspace = true

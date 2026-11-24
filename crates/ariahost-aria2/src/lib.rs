@@ -19,7 +19,7 @@ pub use client::{
     GlobalStat, RpcCallError, RpcClient, VersionInfo, DEFAULT_PORT, DEFAULT_TIMEOUT, RPC_PATH,
 };
 pub use rpc::{RpcError, RpcRequest, RpcResponse};
-pub use version::{parse_version_line, Aria2Version, VersionParseError};
+pub use version::{parse_version_line, parse_version_number, Aria2Version, VersionParseError};
 
 /// aria2 核心来源（配置键 `aria2.source`，默认 `managed`，见架构 §4.11/R1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

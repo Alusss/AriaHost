@@ -23,6 +23,7 @@ AriaHost — aria2 Windows 服务管理器
   ariahost --install-service       注册 Windows 服务（需管理员）
   ariahost --uninstall-service     注销 Windows 服务（需管理员）
   ariahost --write-aumid <lnk>     给 .lnk 快捷方式写入 AUMID
+  ariahost --aria2-fetch [版本]    下载并安装 aria2 核心（省略版本 = 最新，如 1.37.0）
   ariahost --quit                  请求运行中的面板实例退出
   ariahost --version | -V          显示版本
   ariahost --help | -h             显示本帮助
@@ -61,6 +62,11 @@ pub enum Command {
     WriteAumid {
         /// 目标 `.lnk` 路径。
         lnk: PathBuf,
+    },
+    /// `--aria2-fetch [版本|latest]`：取核心 → 校验 → 装库 → 激活（M1-3 的可跑入口）。
+    Aria2Fetch {
+        /// 目标版本：`None`/`latest` 取最新，`1.37.0` 取指定版本。
+        version: Option<String>,
     },
     /// `--quit`：请求已有实例退出（短命助手）。
     Quit,
@@ -146,6 +152,20 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
             )));
         }
         return Ok(Command::Panel { backend });
+    }
+
+    // `--aria2-fetch [版本|latest]`：唯一的可选尾参就是版本号。
+    if first == "--aria2-fetch" {
+        return match rest {
+            [] => Ok(Command::Aria2Fetch { version: None }),
+            [version] => Ok(Command::Aria2Fetch {
+                version: Some(version.clone()),
+            }),
+            _ => Err(UsageError::new(format!(
+                "--aria2-fetch 只接受一个可选版本号参数：{}",
+                rest.join(" ")
+            ))),
+        };
     }
 
     if first == "--write-aumid" {
@@ -338,6 +358,7 @@ fn execute(command: &Command) -> i32 {
             );
             EXIT_OK
         }
+        Command::Aria2Fetch { version } => run_aria2_fetch(version.as_deref()),
         Command::Quit => {
             // M1 无控制管道，固定按「无实例」处理；M2 换成真实握手结果。
             let outcome = QuitOutcome::NoInstance;
@@ -351,6 +372,52 @@ fn execute(command: &Command) -> i32 {
         Command::Help => {
             println!("{USAGE}");
             EXIT_OK
+        }
+    }
+}
+
+/// `--aria2-fetch [版本|latest]`：把「取核心 → 校验 → 装库 → 激活」真跑一遍。
+///
+/// 这是 M1-3 库代码的可跑入口（面板尚未接）。输出刻意机器可读：
+/// 成功打印 `已安装 aria2 <ver>（线路：<线路名>）`，失败按既有错误码打印到 stderr。
+fn run_aria2_fetch(version: Option<&str>) -> i32 {
+    use ariahost_common::paths::{versions_dir, Plane};
+
+    let Some(dir) = versions_dir(Plane::User) else {
+        eprintln!(
+            "{} 配置路径不可用：拿不到 %LOCALAPPDATA%",
+            ariahost_common::ErrorCode::Usage.code()
+        );
+        return EXIT_ERR;
+    };
+
+    let requested = match version {
+        None => None,
+        Some(raw) => match ariahost_core::parse_version_arg(raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("{error}");
+                return EXIT_ERR;
+            }
+        },
+    };
+
+    let store = ariahost_core::VersionStore::new(&dir);
+    let fetcher = ariahost_core::Fetcher::new();
+    match fetcher.fetch(&store, requested) {
+        Ok(outcome) => {
+            println!("已安装 aria2 {}（线路：{}）", outcome.version, outcome.line);
+            println!("exe：{}", outcome.exe_path.display());
+            println!("版本库：{}", dir.display());
+            for warning in &outcome.warnings {
+                eprintln!("警告：{warning}");
+            }
+            EXIT_OK
+        }
+        Err(error) => {
+            // Display 已带 `AH-Exxxx` 前缀。
+            eprintln!("{error}");
+            EXIT_ERR
         }
     }
 }
@@ -503,6 +570,28 @@ mod tests {
             "vulkan"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn aria2_fetch_takes_zero_or_one_version() {
+        assert_eq!(
+            parse_args(&["--aria2-fetch"]),
+            Ok(Command::Aria2Fetch { version: None })
+        );
+        assert_eq!(
+            parse_args(&["--aria2-fetch", "latest"]),
+            Ok(Command::Aria2Fetch {
+                version: Some("latest".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_args(&["--aria2-fetch", "1.37.0"]),
+            Ok(Command::Aria2Fetch {
+                version: Some("1.37.0".to_owned()),
+            })
+        );
+        // 只允许一个可选尾参。
+        assert!(parse_args(&["--aria2-fetch", "1.37.0", "extra"]).is_err());
     }
 
     #[test]
