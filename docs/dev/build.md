@@ -108,6 +108,37 @@ sc query AriaHost
 .\target\release\ariahost.exe --write-aumid "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\AriaHost\AriaHost.lnk"
 ```
 
+### 4.2 渲染后端与内存闸门（M2 门禁口径）
+
+**闸门 = 100 MB 私用工作集，两种后端都要过**（`auto`/Vulkan 与显式 `dx12` 各跑一遍）。窗口必须真实打开；数字一律取**外部采样**。
+
+```powershell
+# 60 秒、每 6s 一次，私用工作集（不是 Private Bytes，也不是程序自报）
+$s = Get-Counter '\Process(ariahost)\Working Set - Private' -SampleInterval 6 -MaxSamples 10
+$s.CounterSamples | Measure-Object -Property CookedValue -Minimum -Maximum
+```
+
+**本机实测**（Intel Iris Xe / 1920×1080、100% 缩放 / release / windows-latest 产物 / 均含开窗）：
+
+| 场景 | 外部采样 60s（每 6s） | 余量 |
+|---|---|---|
+| M2-0b 默认路径 | 67.7–67.8 MB（零增长） | 32 MB |
+| M2-1 `auto`（本机选中 Vulkan） | 72.1–72.7 MB | 28 MB |
+| M2-1 显式 `--backend dx12` | **89.0–89.6 MB** | **10 MB** |
+| M2-1 `--backend dx12 --size 3840x2160` | selftest `private_kb=90920`（与 1080p 基本持平，自报值仅参考） | — |
+
+- **DX12 是当前最大值 89.6 MB，余量只剩 10 MB，这笔账计入 M2-2 预算。** 后续批次若把 DX12 推到 **>95 MB**，先做归因（图集 / 字体 / 交换链 / 后端自身）再谈放宽——不要「压到 99 MB 就算达标」。
+- **自报值不能当闸门**：同一进程同一状态下，`--panel-selftest` 的 `private_kb`（自报 75.5 MB）与外部计数器（72.3 MB）差 3 MB 量级。程序内外采样点不同（`GetProcessMemoryInfo → PrivateWorkingSetSize` 是结束瞬间的单点）。**闸门一律用进程外 `Get-Counter` 的 60s 采样**，自报值只用于快速自查。
+- 交换链三档（M2-0b，captain 复现）：`1920x1080`、`2560x1440`、`3840x2160` 均 `ok=1`、`wgpu_errors=0`、`atlas=2048x64`、`atlas_cap=2048`。
+- **DX12 首次被机器验证**（2026-11-25）：本机 `--backend dx12` 起窗成功。此前 `auto` 一直选 Vulkan，DX12 路径从未真正跑过——`--backend dx12` 现在是产品主路径的强制验证入口。
+- **待归因（未验证）**：显式 `vulkan` 自测 `private_kb≈55064` 与 `auto≈75504` 差 17–20 MB（怀疑 `auto` 同时初始化两套后端）；DX12 相对 Vulkan 多出的 ~20 MB 同样未归因。
+
+### 4.3 无人值守取证（锁屏 / 无头机）
+
+- **不要指望截图**：锁屏时截出来是锁屏界面，无头环境根本没有桌面。改用 **UI Automation 读 egui（accesskit）暴露的文本节点**——M2-1 实测读到 **46 个可见文本节点**，覆盖服务状态、aria2 版本 / 速率 / 任务计数与四个按钮文案。这足以证明「文案与结构对」，也是 #16 面板形态的取证手段。
+- **反面教训**：假 aria2 把 JSON-RPC `id` 回成数字时，客户端每轮 `getVersion` 失败并按 2s 退避重试。这**恰恰证明退避与失败归类在工作**——取证时要记录调用间隔（实测 **2.1s** = 2s 节流 + 30ms 往返），别把「一直失败」直接当缺陷。
+- **能力边界**：UI Automation 证明不了**字形正确、中文渲染正常、输入法能上屏**。`selftest` 里 `font=Microsoft_YaHei_UI` 只说明字体解析成功 ≠ 字形正确 ≠ 能输入——这三件事必须人眼 + 真机输入法，见验收 #13（**仍未通过**）。
+
 ## 5. 本地打安装包
 
 前置：`dist\<arch>\ariahost.exe` 已存在，且 `makensis` 在 PATH（安装见 [setup.md](setup.md)）。
@@ -152,3 +183,5 @@ Remove-Item -Recurse -Force dist  # 清暂存产物
 | `makensis: command not found` | 装 NSIS 或把 `C:\Program Files (x86)\NSIS` 加进 PATH |
 | 安装包能装但启动即退 | 先在终端直接跑 `ariahost.exe` 看 stderr；托盘程序无控制台时用 `RUST_LOG=debug` + 日志文件 |
 | `link.exe not found` | 缺 VS Build Tools 的「使用 C++ 的桌面开发」工作负载，见 [setup.md](setup.md) |
+| 自报 `private_kb` 与外部计数器差 3 MB 左右 | 正常：采样点不同（自报 = 结束瞬间单点，外部 = 60s 序列）。**结算一律用外部 `Get-Counter`**，见 §4.2 |
+| 想截图取证却截到锁屏 / 黑屏 | 机器锁屏或无桌面，截图没有意义。改用 UI Automation 读文本节点，见 §4.3 |
