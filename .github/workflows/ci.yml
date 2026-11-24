@@ -17,12 +17,11 @@
 # 现状：仓库尚无 Cargo.toml / crates/，`preflight` 在 M1 之前会明确失败（红色，属预期，
 # 不是流水线故障）——避免「绿色空跑」制造已经验证过的假象。
 #
-# 另有一个不依赖 Rust 的 `nsi-syntax` job（ubuntu）：用 1 字节 stub 冒充 ariahost.exe，
-# 只跑 makensis，约 1 分钟 / 1× 计费，专门挡安装脚本的**编译期**错误。理由：真实
-# makensis 排在 release 的整条 cargo build 之后，语法错会让第一次打 tag 先烧
-# 10–25 Windows 分钟再失败；NSIS 能在 Linux 上编译，这笔钱不必花。
+# 安装脚本的**编译期**闸门在 `windows` job 里（用 cargo 真实产出的 ariahost.exe 跑一次
+# makensis）。**不要**再用 ubuntu + stub 版本：2026-11-25 实证 Linux 版 makensis 接受
+# 正斜杠路径、Windows 版不接受，Linux 绿灯对 Windows 没有一点证明力（首发 tag 因此失败）。
 #
-# 本 workflow 从未在 GitHub 上运行过，一切以首次 push 的 Actions 日志为准。
+# 本 workflow 已真实运行（2026-11-24 首次），一切以 Actions 日志为准。
 name: CI
 
 on:
@@ -330,6 +329,41 @@ jobs:
             exit 1
           }
           Write-Host "OK：dumpbin 未发现 VCRUNTIME140 / MSVCP140 依赖（#15a 本次通过）。"
+      # 安装脚本编译门禁（**必须在 Windows 上跑**，2026-11-25 实测结论）。
+      # 历史教训：本节曾是一个 ubuntu + stub 的独立 job，它用正斜杠绝对路径编译"通过"了，
+      # 于是被当成"安装脚本可编译"的证据；结果首发 tag v0.1.0 的 release build 在
+      # makensis 上因 `File: ... -> no files found` 直接失败（run 45451494558）。
+      # 实测（run 45452855606）：Windows 版 makensis 的 File 只接受**全反斜杠绝对路径**，
+      # 正斜杠会被当作字面字符 → 在 Linux 上绿不能推出在 Windows 上绿。
+      # 所以：① 平台必须是 Windows；② 载荷必须是 cargo 真实产出的 ariahost.exe；
+      # ③ 与 release.yml 传同一套 /D 参数（含反斜杠绝对路径）。
+      - name: 安装脚本编译门禁（makensis，真实载荷）
+        shell: pwsh
+        run: |
+          function Find-Makensis {
+            $c = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe")
+            return $c | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          $mk = Find-Makensis
+          if (-not $mk) {
+            Write-Host "镜像未预装 NSIS，改用 choco 安装"
+            choco install nsis --no-progress -y
+            $mk = Find-Makensis
+          }
+          if (-not $mk) { Write-Error "makensis 未找到（镜像未预装且 choco 安装失败）"; exit 1 }
+          Write-Host "makensis = $mk"
+          $src = Join-Path $PWD "dist\x64"
+          $out = Join-Path $PWD "dist\AriaHost-0.0.0-ci-x64-setup.exe"
+          New-Item -ItemType Directory -Force $src | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/ariahost.exe" (Join-Path $src "ariahost.exe") -Force
+          if (-not (Test-Path (Join-Path $src "ariahost.exe"))) { Write-Error "载荷暂存失败"; exit 1 }
+          Write-Host "SRCDIR = $src"
+          & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x64 "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi"
+          if ($LASTEXITCODE -ne 0) { Write-Error "makensis 失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
+          $item = Get-Item $out
+          # 下限守卫：空包/极小包通常说明 File 没把载荷打进去（正是本次事故的形态）。
+          if ($item.Length -lt 100000) { Write-Error "安装包异常小（$($item.Length) B），载荷疑似未打入"; exit 1 }
+          Write-Host "OK：安装脚本编译通过，安装包 $($item.Name) / $($item.Length) 字节"
       - name: 上传调试产物（7 天）
         uses: actions/upload-artifact@v4
         with:
@@ -338,61 +372,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # 安装脚本的编译期闸门（ubuntu，约 1 分钟 / 1× 计费；不烧 Windows 分钟）。
-  # 动机：installer/ariahost.nsi **从未被编译过一次**，而真实 makensis 排在 release 的整条
-  # cargo build 之后 —— 语法/常量错误会让第一次打 tag 先烧 10–25 Windows 分钟再失败、0 产物。
-  # NSIS 可以在 Linux 编译，所以用一个 stub 在这里把编译期错误挡在 Windows 之前。
-  #
-  # stub 方案的坑与对策（都在 .nsi 侧处理，见脚本内注释）：
-  #   1. `File` 读的是编译期真实文件 → 用 1 个字节的文件冒充 ariahost.exe（内容不参与编译）。
-  #   2. 路径分隔符：Linux 上 `"${SRCDIR}\ariahost.exe"` 会被当成「文件名里含反斜杠」→ 必然
-  #      找不到文件（假红）。所以 .nsi 里两处**编译期**路径改用 `/` 分隔；Windows 的 makensis
-  #      接受 `/`，因此同一份脚本两边都能编。
-  #   3. `!if /FileExists "${SRCDIR}/aria2c.exe"` 判空 → 可选分支被跳过。这正是发布包的默认形态
-  #      （aria2c.exe 不随包分发），所以跳过不影响本 job 的证明力。
-  #   4. `-WX`（warning 当错误）：F1 那类错误在部分 NSIS 版本上只是 warning，不加 -WX 会假绿。
-  #      若因良性 warning 变红，修 warning，不要摘掉 -WX。
-  # 仍然证明不了的：真机安装/卸载行为、per-user 与 /DPER_MACHINE 两种变体的运行时差异、
-  # Windows 版 makensis（choco 3.11）与 Ubuntu 版（3.08/3.09）之间的差异。
-  nsi-syntax:
-    name: nsi-syntax / 安装脚本编译（stub）
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: 安装 NSIS
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends nsis
-          # Linux 的 makensis 用 - 前缀选项（Debian man page 的 SYNOPSIS），/VERSION 那是 Windows 的写法
-          makensis -VERSION
-      - name: 用 stub 编译并断言成功
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist/x64 out
-          printf 'stub' > dist/x64/ariahost.exe   # 只需存在且可读，内容不参与编译
-          makensis -WX -INPUTCHARSET UTF8 \
-            -DVERSION=0.0.0-stub \
-            -DVI_VERSION=0.0.0.0 \
-            -DARCH=x64 \
-            -DSRCDIR="$PWD/dist/x64" \
-            -DOUTFILE="$PWD/out/ariahost-stub-setup.exe" \
-            installer/ariahost.nsi
-          test -s out/ariahost-stub-setup.exe
-          echo "OK：.nsi 编译通过（stub 产物仅供参考，不可发布）"
-          ls -l out/
+  # 安装脚本的编译期闸门已从 ubuntu（stub）**迁到上面的 windows job**（用真实载荷）。
+  # 原因见该步骤上方注释：Linux 绿灯对 Windows 没有证明力（2026-11-25 首发 tag 实证）。
+  # 这里不再保留独立 job —— 少一个 job 也少一份"看起来验证过"的错觉。
 
   # 分支保护只需勾选这一个 job；任一上游 failure / timed_out / cancelled 即红。
   # skipped（文档改动跳过编译）视为通过——否则纯文档 PR 永远无法合并。
   gate:
     name: ci-gate
     if: always()
-    needs: [changes, meta, preflight, fmt, windows, nsi-syntax]
+    needs: [changes, meta, preflight, fmt, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

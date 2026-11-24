@@ -1,35 +1,39 @@
 ; ============================================================================
 ;  AriaHost 安装脚本（NSIS 3.x / Unicode）
 ;
-;  编译（CI 与本地一致；路径建议传绝对路径，避免依赖 makensis 的工作目录）：
-;    Windows 版 makensis（选项用 / 前缀）：
+;  编译（**只在 Windows 上编译**；CI 与本地一致）：
 ;      makensis /DVERSION=0.1.0 /DVI_VERSION=0.1.0.0 /DARCH=x64 ^
 ;               /DSRCDIR=<repo>\dist\x64 /DOUTFILE=<repo>\installer\AriaHost-0.1.0-x64-setup.exe ^
 ;               installer\ariahost.nsi
-;    Linux 版 makensis（选项用 - 前缀，见 ci.yml 的 nsi-syntax job）：
-;      makensis -DVERSION=0.1.0 -DVI_VERSION=0.1.0.0 -DARCH=x64 \
-;               -DSRCDIR=<repo>/dist/x64 -DOUTFILE=<repo>/installer/AriaHost-0.1.0-x64-setup.exe \
-;               installer/ariahost.nsi
 ;  产物（per-user，首版唯一发布形态）：installer\AriaHost-<ver>-x64-setup.exe
-;  ---- 跨平台编译的前提（改动前必读）--------------------------------------
-;  本脚本要能被 Linux 的 makensis 编译（CI 用它做 1 分钟的编译期闸门），所以：
-;    * **编译期路径一律用 / 分隔**（${SRCDIR} 相关：File、!if /FileExists、SRCDIR 默认值）。
-;      Linux 上 "\" 不是分隔符，会被当成文件名的一部分；Windows 的 makensis 接受 "/"。
+;
+;  ---- 编译期路径规则（改动前必读；2026-11-25 实测结论）---------------------
+;  Windows 版 makensis 的 `File` **只接受全反斜杠的绝对路径**。实测探针
+;  （windows-latest，run 45452855606）：
+;    File "D:\a\w\dist\x64\ariahost.exe"   → ✅ 出包
+;    File "D:/a/w/dist/x64/ariahost.exe"   → ❌ File: ... -> no files found
+;    File "dist\x64\ariahost.exe"（相对）   → ❌ 找不到（相对路径按**脚本所在目录**解析）
+;  因此：
+;    * **编译期路径（File、!if /FileExists）一律用 "\"，且优先用绝对路径**（来自 ${SRCDIR}）。
+;    * 早期版本写的「用 / 分隔以便 Linux 也能编」是**已被证伪的错误结论**：Linux 版 makensis
+;      接受 "/"，Windows 版不接受 → 造成「Linux stub 编译绿、Windows 真实打包红」的假绿。
+;      本脚本现在只在 Windows 上编译（ci.yml 的 windows job、release.yml 的 build job），
+;      ubuntu 的 nsi-syntax stub job 已于 2026-11-25 删除。
 ;    * 运行期字符串（$INSTDIR\…、$APPDATA\…）保持 "\"，它们只在 Windows 上执行。
-;    * 不要用 Windows 专有插件或 / 前缀选项写死在脚本里。
 ;
-;  !! 验证状态（务必保留）：本机没有 makensis，本脚本**从未被编译过一次**，
-;     也从未在真机上装/卸过。首次真实编译发生在 CI：
-;     - ubuntu 的 `nsi-syntax` job（ci.yml，用 1 字节 stub 冒充 ariahost.exe 只跑
-;       makensis，约 1 分钟 1× 计费）—— 挡编译期错误；
-;     - windows 的 release build job（release.yml，打 tag 时）。
-;     报错以那两次日志为准；人工自检清单见 docs/dev/release.md §5。
+;  !! 验证状态：**已在 Windows 上真实编译通过**（windows-latest + 预装 NSIS 3.x，
+;     见 ci.yml 的 windows job「安装脚本编译门禁」与 release.yml 的 build job）。
+;     已验证：语法/宏/MUI2 页面、Section ID 前向引用、UTF-8 无 BOM + /INPUTCHARSET UTF8
+;     的中文文案、${SRCDIR} 载荷路径。**未验证**：真机装/卸行为、per-user 与
+;     /DPER_MACHINE 的运行时差异、/S 静默、AUMID 写入、服务注册助手（M3 门禁项）。
+;     人工自检清单见 docs/dev/release.md §5。
 ;
-;     2026-11-23 按独立审计（.scratch/wasm-design/review-exec-v2.md）静态修复了
-;     两处**编译期**错误：① ${SEC_SERVICE} 曾在 .onInit（Section 之前）被引用；
-;     ② 卸载段曾 Call 无 un. 前缀的普通函数。另把 WinVer 下限从 ${AtLeastWin10}
-;     （10.0.10240）改成 ${AtLeastBuild} 17763（Server 2016 必须拒装，AH-E1001）。
-;     这些修复**同样未经 makensis 验证**。
+;     历史修复（2026-11-23 独立审计 .scratch/wasm-design/review-exec-v2.md，静态）：
+;     ① ${SEC_SERVICE} 曾在 .onInit（Section 之前）被引用；② 卸载段曾 Call 无 un.
+;     前缀的普通函数；③ WinVer 下限从 ${AtLeastWin10}（10.0.10240）改为
+;     ${AtLeastBuild} 17763（Server 2016 必须拒装，AH-E1001）。
+;     2026-11-25 实测修复：File 的正斜杠路径在 Windows makensis 下必然失败 → 改回 "\"
+;     （首发 tag v0.1.0 的 release run 45451494558 就是死在这里）。
 ;
 ;  ---- 两种编译变体（架构 §4.10）------------------------------------------
 ;  默认 per-user：RequestExecutionLevel user、装到 %LOCALAPPDATA%\Programs\AriaHost、
@@ -78,9 +82,9 @@ SetCompressorDictSize 32
   !define ARCH "x64"
 !endif
 !ifndef SRCDIR
-  ; 用 / 而不是 \：编期路径在 Windows 与 Linux 的 makensis 上都可用（Windows API 接受 /），
-  ; 而 Linux 上 "\" 不是分隔符（会被当成文件名的一部分）→ ubuntu 的 nsi-syntax job 会假红。
-  !define SRCDIR "../dist/x64"
+  ; 默认值仅供本地手工编译：相对路径按**本脚本所在目录**解析，故用 "..\dist\x64"。
+  ; CI 一律用 /DSRCDIR 传绝对路径（见文件头「编译期路径规则」）。
+  !define SRCDIR "..\dist\x64"
 !endif
 
 ; ---- 产品常量（改名/改路径只需改这一段）----------------------------------
@@ -245,12 +249,12 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   SectionIn RO
   SetOutPath "$INSTDIR"
   SetOverwrite on
-  ; 编译期路径用 / 分隔（见上面 SRCDIR 处的说明）：Windows 与 Linux 的 makensis 都接受。
-  File "${SRCDIR}/${APP_EXE}"
+  ; 编译期路径必须用 "\"，且优先绝对路径（见文件头「编译期路径规则」的实测结论）。
+  File "${SRCDIR}\${APP_EXE}"
 
   ; 可选：dist 中存在 aria2c.exe 时一并安装（默认不随包分发，见 docs/dev/release.md §7）
-!if /FileExists "${SRCDIR}/aria2c.exe"
-  File "${SRCDIR}/aria2c.exe"
+!if /FileExists "${SRCDIR}\aria2c.exe"
+  File "${SRCDIR}\aria2c.exe"
 !endif
 
   ; 文件名与架构 §4.10 安装包清单一致（uninst.exe）
