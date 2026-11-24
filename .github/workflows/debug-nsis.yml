@@ -1,0 +1,103 @@
+# 一次性诊断：定位 makensis 在 Windows runner 上「File 找不到 dist\x64/ariahost.exe」的真因。
+# 用法：gh workflow run debug-nsis.yml（workflow_dispatch），看完日志后**删除本文件**。
+# 不是发布流水线的一部分，不参与 tag。
+name: debug-nsis
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: makensis 路径传递三变体
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 造桩文件并打印环境
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/x64, out | Out-Null
+          Set-Content -Path dist/x64/ariahost.exe -Value 'stub-payload' -NoNewline
+          "PWD        = $PWD"
+          "TestPath   = " + (Test-Path "dist/x64/ariahost.exe")
+          Get-Item dist/x64/ariahost.exe | Format-List FullName, Length
+          cmd /c dir dist\x64
+
+      - name: 定位 makensis
+        shell: pwsh
+        run: |
+          $c = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe")
+          $nsis = $c | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $nsis) {
+            Write-Host "预装未找到，改用 choco"
+            choco install nsis --no-progress -y
+            $nsis = $c | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $nsis) { Write-Error "makensis 未找到"; exit 1 }
+          $vi = (Get-Item $nsis).VersionInfo
+          "MAKENSIS = $nsis"
+          "FileVersion = $($vi.FileVersion) / ProductVersion = $($vi.ProductVersion)"
+          "MAKENSIS=$nsis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 变体 A —— SRCDIR 带反斜杠（当前 release.yml 的写法）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $src = Join-Path $PWD "dist/x64"
+          $out = Join-Path $PWD "out/a-setup.exe"
+          "SRCDIR(raw) = $src"
+          "TestPath    = " + (Test-Path "$src/ariahost.exe")
+          & $env:MAKENSIS /V3 /INPUTCHARSET UTF8 "/DVERSION=0.0.0-a" "/DVI_VERSION=0.0.0.0" "/DARCH=x64" "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi" 2>&1 |
+            Select-String -Pattern 'File:|Installer pages|Processing|warning|error|aborting' | Select-Object -Last 12
+          "exit = $LASTEXITCODE"
+
+      - name: 变体 B —— SRCDIR 全部正斜杠
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $src = (Join-Path $PWD "dist/x64") -replace '\\','/'
+          $out = (Join-Path $PWD "out/b-setup.exe") -replace '\\','/'
+          "SRCDIR(fwd) = $src"
+          "TestPath    = " + (Test-Path "$src/ariahost.exe")
+          & $env:MAKENSIS /V3 /INPUTCHARSET UTF8 "/DVERSION=0.0.0-b" "/DVI_VERSION=0.0.0.0" "/DARCH=x64" "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi" 2>&1 |
+            Select-String -Pattern 'File:|Installer pages|Processing|warning|error|aborting' | Select-Object -Last 12
+          "exit = $LASTEXITCODE"
+
+      - name: 变体 C —— 不用命令行 /D，改用 !define 前置头文件
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $src = (Join-Path $PWD "dist/x64") -replace '\\','/'
+          $hdr = Join-Path $PWD "out/defs.nsh"
+          @(
+            "!define VERSION `"0.0.0-c`""
+            "!define VI_VERSION `"0.0.0.0`""
+            "!define ARCH `"x64`""
+            "!define SRCDIR `"$src`""
+            "!define OUTFILE `"$((Join-Path $PWD 'out/c-setup.exe') -replace '\\','/')`""
+          ) | Set-Content -Encoding utf8 $hdr
+          "--- defs.nsh ---"; Get-Content $hdr
+          # 用 !insertmacro 无法前置；改用 -D 传文件不可行，因此这里用 /HDRINFO 之外的官方方式：
+          # makensis 支持在脚本路径之后追加 -- 不行。所以本变体用 copy+prepend 组装临时脚本。
+          $tmp = Join-Path $PWD "out/c.nsi"
+          $body = Get-Content -Raw "installer\ariahost.nsi"
+          ("; 诊断用临时前置\n" + (@(
+            "!define VERSION `"0.0.0-c`""
+            "!define VI_VERSION `"0.0.0.0`""
+            "!define ARCH `"x64`""
+            "!define SRCDIR `"$src`""
+            "!define OUTFILE `"$((Join-Path $PWD 'out/c-setup.exe') -replace '\\','/')`""
+          ) -join "`n") + "`n" + $body) | Set-Content -Encoding utf8 $tmp
+          Push-Location $PWD
+          try {
+            & $env:MAKENSIS /V3 /INPUTCHARSET UTF8 "/DOUTFILE=$((Join-Path $PWD 'out/c-setup.exe') -replace '\\','/')" "out/c.nsi" 2>&1 |
+              Select-String -Pattern 'File:|Installer pages|Processing|warning|error|aborting' | Select-Object -Last 12
+            "exit = $LASTEXITCODE"
+          } finally { Pop-Location }
+
+      - name: 结果汇总
+        if: always()
+        shell: pwsh
+        run: |
+          "=== out 目录 ==="
+          if (Test-Path out) { Get-ChildItem out | Format-Table Name, Length -AutoSize | Out-String } else { "(空)" }
