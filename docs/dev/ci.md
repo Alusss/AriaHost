@@ -2,7 +2,7 @@
 
 文件：`.github/workflows/ci.yml`（质量门禁）、`.github/workflows/release.yml`（发布，见 [release.md](release.md)）。
 
-**状态：M0 骨架，从未在 GitHub 上跑过。** 两个 YAML 只做过**本地结构自检**（`.scratch/wasm-design/yamlcheck-builder-docs.mjs`：顶层键/缩进/行尾空格/同层重复键/`${{ }}` 配平/作业结构断言；本机无 Python/`yaml` 库，**不是真解析**）。首次真跑结果以仓库第一次 push 的 Actions 日志为准。
+**状态：已真跑（2026-11-24 起有 Actions 记录），以日志为准。** 本文件早期是 M0 骨架，当时只靠本地结构自检（`.scratch/wasm-design/yamlcheck-builder-docs.mjs`：顶层键/缩进/行尾空格/同层重复键/`${{ }}` 配平/作业结构断言；**不是真解析**）把关——那种自检查不出「编译期路径在 Windows 上失效」这类语义错误，所以下面的结论一律以 run 日志为准。
 
 **工具链版本的事实源 = `rust-toolchain.toml`**（`channel = "1.95"` + `rustfmt`/`clippy` + `x86_64-pc-windows-msvc`）。但**「不传输入 action 就按文件装」是错的**：`dtolnay/rust-toolchain` 的 `toolchain` 输入默认值就是 **`stable`**（分支名），不传时它先装一份 stable，随后 rustup 又按 `rust-toolchain.toml` 补装 1.95 → 每个含工具链的 job 白下一次完整工具链（≈1.5–3 分钟 ×2 计费），且 `steps.toolchain.outputs.cachekey` 是 **stable** 的哈希（pin 升级不换缓存 key）。所以三处 action 都**显式**传 `toolchain: "1.95"`，另有 `meta` 的检查 4 与 release `version` job 的自检断言「toml 的 `channel` == workflow 里的值」，两处不会漂。`components`/`targets` 不传，由 `rust-toolchain.toml` 声明、rustup 首次调用时按需补装（日志里会看到 `installing component ...`）。
 
@@ -15,9 +15,11 @@
 | 单 arch 单包 | `ci.yml` 只跑 x64；`release.yml` 只编 x64 per-user 一个包；x86 job 整段注释在 `release.yml` 里（M4 恢复，见 Q3/Q15） | 直接砍掉一半 Windows 分钟与一次 `makensis` |
 | Windows 只留 1 个 job | `ci.yml` 的 `windows` job 内串行 clippy → test → build，共用一次 checkout / 工具链安装 / `actions/cache` | 省掉每个 job 约 1.5–3 分钟的安装与缓存传输（这些也按 2× 计费） |
 | `concurrency` | 两个 workflow 都用 `group: ${{ github.workflow }}-${{ github.ref }}` + `cancel-in-progress: true` | 同一 ref 连续 push 只留最新一次，旧 run 立刻取消 |
-| 路径判定 | `ci.yml` 的 `changes` job：纯 `docs/**`、`*.md`、`.scratch/**`、`LICENSE*`、`.gitignore`、`.editorconfig` 改动 → `code=false` → `preflight`/`fmt`/`windows`/`nsi-syntax` 全部 skip，只剩 `changes` + `meta` + `gate` 三个 ubuntu job（合计约 1–2 分钟） | 文档 PR 从「3 个 Windows job」降到「3 个共约 1–2 分钟的 ubuntu job」 |
+| 路径判定 | `ci.yml` 的 `changes` job：纯 `docs/**`、`*.md`、`.scratch/**`、`LICENSE*`、`.gitignore`、`.editorconfig` 改动 → `code=false` → `preflight`/`fmt`/`windows` 全部 skip，只剩 `changes` + `meta` + `gate` 三个 ubuntu job（合计约 1–2 分钟） | 文档 PR 从「1 个 Windows job」降到「3 个共约 1–2 分钟的 ubuntu job」 |
 | artifact 保留 | 所有 `upload-artifact` 都是 `retention-days: 7` | 存储配额，不占分钟但占配额 |
-| NSIS 预检挪到 Linux | `ci.yml` 的 `nsi-syntax` job：ubuntu + `apt-get install nsis` + 1 字节 stub 冒充 `ariahost.exe` 只跑 `makensis`（1× 计费，约 1 分钟） | 把安装脚本的**编译期**错误挡在 Windows 之前（真实 `makensis` 排在 release 的整条 `cargo build` 之后，语法错会让第一次打 tag 先烧 10–25 Windows 分钟再失败） |
+| 安装脚本编译门禁在 Windows 内 | `ci.yml` 的 `windows` job 内一步：`choco install nsis` → 用 **cargo 真实产出**的 `target\x86_64-pc-windows-msvc\release\ariahost.exe` 当载荷 → 与 `release.yml` 同一参数集调 `makensis`（同 job，无额外 runner，约 20–40s） | 让 `.nsi` 的**编译期**错误在每次 PR 就暴露，而不是等打 tag、烧掉 10–25 Windows 分钟后才失败；**不再另起 ubuntu stub job**（那是假绿，见下）。已实证：run 45453817683 打印 `OK：安装脚本编译通过，安装包 AriaHost-0.0.0-ci-x64-setup.exe / 196162 字节` |
+
+> **已删除的假绿方案（2026-11-25 实证，不要恢复）**：这里曾经有一个 ubuntu job `nsi-syntax`——`apt-get install nsis` + 1 字节 stub 冒充 `ariahost.exe`，只跑 `makensis`，长期是绿的。但首发 tag `v0.1.0` 的 Release 仍然失败（run **45451494558**）：`File: "D:\a\wasm\wasm\dist\x64/ariahost.exe" -> no files found` + `Error in script "installer\ariahost.nsi" on line 249`，而当时 `dist/x64/ariahost.exe` **确实存在**（暂存步骤日志：`ariahost.exe 240640`）。探针 run **45452855606** 用 5 个用例定位：Windows 版 `makensis` 的 `File` **只接受全反斜杠的绝对路径**——`D:\a\...\x64\ariahost.exe` exit 0；`D:/a/.../x64/ariahost.exe` exit 1；相对 `dist\x64\ariahost.exe` exit 1（相对路径按**脚本所在目录**解析）；`C:\ariahost-probe.exe` exit 0；正斜杠的 `D:/a/_temp/...` exit 1。Linux 版接受 `/`，所以「Linux 编译通过」对 Windows **零证明力**——方向本身就错，已删除。
 
 **为什么不用 `on.push.paths-ignore`**：`paths-ignore` 命中时整个 workflow 根本不触发，PR 上连一个 CI 状态都没有 → 分支保护的 `ci-gate` 永远 pending，PR 卡死。现在的做法是「workflow 总是触发，编译 job 按判定 skip」，语义等价但状态始终存在。加新顶层目录（如 `vendor/`）时，记得同步 `changes` job 里的白名单正则。
 
@@ -30,8 +32,7 @@
 ```text
 changes ─┬─ meta                       (ubuntu，永远跑)
          ├─ preflight ─┬─ fmt         (ubuntu)
-         │             ├─ windows     (windows，clippy + test + build 串行)
-         │             └─ nsi-syntax  (ubuntu，stub + makensis)
+         │             └─ windows     (windows，clippy + test + build + makensis 编译门禁)
          └────────────────────────────→ gate (always, 汇总红/绿)
 ```
 
@@ -41,15 +42,16 @@ changes ─┬─ meta                       (ubuntu，永远跑)
 | `meta` | ubuntu | ①扫 `U+FFFD`（错误编码读写留下的替换字符）②扫 YAML 里的制表符 ③ruby `Psych.parse_file` 解析两个 workflow ④断言 workflow 的 `toolchain:` 输入 == `rust-toolchain.toml` 的 `channel` | 文件被以错误编码写过（典型：`pwsh Set-Content/Out-File` 写 UTF-8 中文）、YAML 结构坏了，或工具链 pin 漂了 |
 | `preflight` | ubuntu | 检查 `Cargo.toml` 存在、`Cargo.lock` 存在（缺则 warning） | **M1 前必然红，这是设计意图**：没有代码就不发绿灯 |
 | `fmt` | ubuntu | `cargo fmt --all -- --check` | 有未格式化代码，本地 `cargo fmt --all` 即可 |
-| `windows` | windows | `rustc -V` 校验 1.95.x → 断言 `x86_64-pc-windows-msvc` target 已装 → `cargo clippy --workspace --all-targets --locked -- -D warnings` → `cargo test --workspace --locked` → `cargo build --workspace --release --locked --target x86_64-pc-windows-msvc` → 产物存在性 + `dumpbin /dependents` **门禁** | 工具链 pin 没生效 / target 缺失 / 有 warning / 测试失败 / `Cargo.lock` 过期 / 没产出 `ariahost.exe` / 产物仍依赖动态 CRT |
-| `nsi-syntax` | ubuntu | `apt-get install nsis` → 造 1 字节 `dist/x64/ariahost.exe` → `makensis -WX -INPUTCHARSET UTF8 -D…` | 安装脚本有**编译期**错误（未定义常量、卸载段调普通函数、路径拼错、字符集问题） |
+| `windows` | windows | `rustc -V` 校验 1.95.x → 断言 `x86_64-pc-windows-msvc` target 已装 → `cargo clippy --workspace --all-targets --locked -- -D warnings` → `cargo test --workspace --locked` → `cargo build --workspace --release --locked --target x86_64-pc-windows-msvc` → 产物存在性 + `dumpbin /dependents` **门禁** → **安装脚本编译门禁**：`choco install nsis` + 真实 `ariahost.exe` 作载荷 + 与 release 同参数集跑 `makensis`（产物 <100000 字节即失败） | 工具链 pin 没生效 / target 缺失 / 有 warning / 测试失败 / `Cargo.lock` 过期 / 没产出 `ariahost.exe` / 产物仍依赖动态 CRT / 安装脚本编译期错误 |
 | `gate` | ubuntu | `if: always()`，`needs` 结果里出现 `failure`/`timed_out`/`cancelled` 即 `exit 1`；`skipped` 视为通过 | 分支保护只看这一个 job |
 
 **分支保护配置**：`main` 的 required status check 只勾 `ci-gate`。新增 job 时记得同步加进 `gate.needs`，否则它红了也不会拦合并。
 
 `dumpbin` 检查已经是**门禁**（不是提示）：用 `vswhere -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64` 定位 VS 安装路径，再找 `VC\Tools\MSVC\<ver>\bin\Hostx64\x64\dumpbin.exe`；**找不到 dumpbin 或命中 `VCRUNTIME140`/`MSVCP140` 都 `exit 1`**。以前只打 `::warning::` 时，`ci-gate` 绿并不等于验收 #15a 过——那是最实在的一处假绿。权威判定仍是 #15a 的整项验收（含 Server Core 启动），见 §5。
 
-**`nsi-syntax` 的代价与边界**：约 1 分钟 / 1× 计费。它证明的只是「`.nsi` 在 NSIS 3.x 下能编译」；**证明不了**真机安装/卸载行为、per-user 与 `/DPER_MACHINE` 的运行时差异，也不等于 Windows 版 `makensis`（choco 装的 3.11）与 Ubuntu 版（3.08/3.09）行为完全一致。stub 方案的两个坑已在 `.nsi` 侧处理：① `File` 读编译期真实文件，所以用 stub 顶上；② 路径分隔符——`"${SRCDIR}\ariahost.exe"` 在 Linux 上会被当成「文件名含反斜杠」而必然找不到，因此 `.nsi` 的**编译期**路径统一用 `/`（Windows 的 makensis 同样接受 `/`）。
+**安装脚本编译门禁的代价与边界**：约 20–40 秒，寄生在 `windows` job 内（不额外开 runner、不多一次 checkout 与工具链安装）。它证明的是「`.nsi` 在 choco 装的 NSIS 3.11（Windows 版）下、以**真实** `ariahost.exe` 为载荷能编译出非空安装包」；**证明不了**真机安装/卸载行为、per-user 与 `/DPER_MACHINE` 的运行时差异、`/S` 静默安装、AUMID 写入是否成功。
+
+**编译期路径是硬约束**：Windows 版 `makensis` 的 `File` **只接受全反斜杠的绝对路径**（run 45452855606：正斜杠 `D:/a/...` 与相对路径 `dist\x64\...` 都是 `no files found`）。所以 `.nsi` 里的 `File "${SRCDIR}\${APP_EXE}"`、ci/release 传的 `/DSRCDIR` 一律用 `\` 拼绝对路径；**不要为了「让 Linux 也能编」把它们改回 `/`**——那正是已经删掉的假绿方案，见 §1 的引用块。
 
 ## 3. `release.yml` 的 job
 
@@ -98,16 +100,23 @@ cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
 dumpbin /dependents target\x86_64-pc-windows-msvc\release\ariahost.exe   # 静态 CRT 自检
 ```
 
-四条全绿再推。`--locked` 必须带：它在本地就能暴露 `Cargo.lock` 未提交/过期的问题，而不是等 CI 红。`rustc -V` 应打印 `1.95.x`（在仓库目录内 rustup 按 `rust-toolchain.toml` 生效；本地首次会自动下载 1.95，且 rustfmt/clippy/target 会按需补装）。`dumpbin` 不在 PATH 时的找法见 §2 的 `nsi-syntax`/`dumpbin` 说明，或直接开「x64 Native Tools Command Prompt」。
+四条全绿再推。`--locked` 必须带：它在本地就能暴露 `Cargo.lock` 未提交/过期的问题，而不是等 CI 红。`rustc -V` 应打印 `1.95.x`（在仓库目录内 rustup 按 `rust-toolchain.toml` 生效；本地首次会自动下载 1.95，且 rustfmt/clippy/target 会按需补装）。`dumpbin` 不在 PATH 时的找法见 §2 的 `dumpbin` 说明，或直接开「x64 Native Tools Command Prompt」。
 
-## 7. 已知限制（本节内容全部没在 GitHub 上跑过）
+安装脚本可以本地单独验一次（需要自己装 NSIS 3.11，**路径必须全反斜杠的绝对路径**）：
 
-- **从未在 GitHub 上执行过**：仓库 remote 上没有任何 Actions 运行记录。已有的只是本地结构自检——它证明「不明显写错」，**不等于** GitHub 的解析器会接受，也不等于任何 job 曾跑通。
+```powershell
+makensis /INPUTCHARSET UTF8 /DVERSION=0.0.0 /DVI_VERSION=0.0.0.0 /DARCH=x64 `
+  "/DSRCDIR=$PWD\target\x86_64-pc-windows-msvc\release" "/DOUTFILE=$PWD\out\test-setup.exe" installer\ariahost.nsi
+```
+
+## 7. 已知限制
+
+- **workflow 已真跑，出包与发布链路已验证**：CI 门禁在跑；安装脚本编译门禁已实证（run 45453817683）；Release 全绿并发布（run **45454312274**，2.4 分钟，产物见 [release.md](release.md) §3）。仍未验证的是运行时行为：有人在真机上点安装向导、`/S` 静默、AUMID、服务注册助手。
 - 单 arch 策略意味着 CI 覆盖不到 x86：i686 的编译问题会在 M4 恢复时才暴露（`rust-toolchain.toml` 只声明了 x64 target，本地交叉编译需自己 `rustup target add`）。
 - target 三元组 `x86_64-pc-windows-msvc` 在 `ci.yml` 与 `release.yml` 各以**字面量**出现（不再有矩阵变量）：工具链装的 target 来自 `rust-toolchain.toml`，`cargo build --target` 来自 workflow。两边改一处漏一处 → 编译到未安装的 target 会报 `can't find crate for 'std'`，所以 M4 加 i686 时两处都要动。
-- 验收 #12（CI 出包 + `SHA256SUMS`）只能由 `release.yml` 在 GitHub 上证明；首次达成时点 = M3。
+- 验收 #12（CI 出包 + `SHA256SUMS`）**已达成**：run 45454312274 产出 `AriaHost-0.1.0-x64-setup.exe` + `SHA256SUMS.txt` 并发布到 tag `v0.1.0`；`manifest.json` 与校验和的独立复核见 [release.md](release.md) §3。
 - 不跑覆盖率、不跑 `cargo audit`、不做二进制体积回归（首版口径，后续按需加）。
-- **`nsi-syntax` 同样从未跑过**：它假设 ①ubuntu 镜像自带 Ruby（`Psych.parse_file` 做 YAML 语法解析）②`apt-get install nsis` 装的 3.08/3.09 版 `makensis` 支持 `-WX`/`-INPUTCHARSET`/`-D` 与 `WinVer.nsh` 里的 `${AtLeastBuild}`。这些在 NSIS 3.x 上应当成立，但**没有实测**；若首次 run 就红，先看日志属于「脚本真错」还是「工具版本差异」，别急着摘 `-WX`。
+- **安装脚本编译门禁只挡编译期**：它不校验安装包内容、不运行安装器、不检查 `/DSRCDIR` 指向的目录是否含 `aria2c.exe`（那属可选分支）。历史上这里曾用 ubuntu stub 冒充载荷，结果长期假绿（run 45451494558 打脸），已删除，**不要恢复**。
 
 ## 8. 排障
 
@@ -117,8 +126,10 @@ dumpbin /dependents target\x86_64-pc-windows-msvc\release\ariahost.exe   # 静�
 | `fmt`/`windows` 红，报「rustc 版本与 rust-toolchain.toml 不符」 | 三处 action 的 `toolchain:` 输入与 toml 的 `channel` 漂了，或本地规则没生效（`meta` 检查 4 会先一步报出这类漂移） |
 | `meta` 红，列出若干文件含 `U+FFFD` | 有文件被以错误编码写过（几乎都是 `pwsh Set-Content/Out-File`）。用编辑器/`write` 工具重写该文件，别再对着乱码改 |
 | `meta` 红，报「runner 上没有 ruby」 | 镜像变了：YAML 解析检查依赖 runner 自带的 Ruby/Psych。**不要退回 `pip install pyyaml`**——ubuntu 24.04 的 PEP 668 会让它直接失败，`meta` 一红整条 gate 就红 |
-| `nsi-syntax` 红 | 安装脚本编译期错误（未定义常量、卸载段调了普通函数、路径拼错、中文被读成 ANSI）。注意 `-WX` 把 warning 也当错误——修 warning，不要摘 `-WX` |
-| 纯文档 PR 的编译 job 全是 skipped | 正常：`changes` 判定为 `code=false`。`meta`、`nsi-syntax` 与 `gate` 仍是绿的 |
+| 在 Windows PowerShell 5.1 里 `Get-Content` 产物（如 `manifest.json`）显示乱码 | **显示假象，文件本身有效**：PS 5.1 默认按 ANSI/GBK 解码，而产物是 UTF-8 **无 BOM**。核对用 `[IO.File]::ReadAllBytes($p)` + `[Text.Encoding]::UTF8.GetString($b)`，再断言 `U+FFFD` 计数为 0、`ConvertFrom-Json` 能解析（v0.1.0 的 manifest 就是这样确认为 503 字节、无 BOM、内容有效）。**不要**为了"看起来正常"给文件加 BOM——BOM 会进 `SHA256SUMS` 与 `manifest` 的内容比对 |
+| `windows` job 的「安装脚本编译门禁」红 | `.nsi` 编译期错误（未定义常量、卸载段调了普通函数、中文被读成 ANSI），或 `File` 的载荷路径不是**全反斜杠的绝对路径**。先看日志里 `File: "…" -> no files found` 的路径形态：正斜杠/相对路径必然失败，改 `\`；**不要退回去建 ubuntu stub job** |
+| 安装脚本编译门禁报「产物 <100000 字节」 | 载荷是 stub 或空的 `ariahost.exe`（真 cargo 产物 240KB 量级）。检查是不是 cargo build 步骤被 skip 了 |
+| 纯文档 PR 的编译 job 全是 skipped | 正常：`changes` 判定为 `code=false`。`changes`、`meta` 与 `gate` 仍是绿的 |
 | 文档 PR 一直没有 `ci-gate` 状态 | 只有两种可能：workflow 根本没触发（`on:` 配置/权限），或 workflow 文件被 GitHub 判定解析失败（此时 Actions 页会显示 workflow 错误、连 job 都不会有）。`gate` 是 `if: always()`，上游失败它照样会跑并判红——所以「pending」不是 `changes` 挂了造成的 |
 | 本地 clippy 绿、CI 红 | 版本不同。比对 `rustc -V`；本地在仓库内会自动切到 1.95，去掉 `cd` 到仓库外就回到系统默认 |
 | `--locked` 报 lock file needs update | 本地 `cargo build`（不带 `--locked`）后提交 `Cargo.lock` |

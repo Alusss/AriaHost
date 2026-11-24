@@ -1,7 +1,9 @@
 # 发布流程
 
 文件：`.github/workflows/release.yml` + `installer/ariahost.nsi`。
-**状态：从未执行过。** 本机没有 Rust 工具链，也没有 `makensis`，所以「CI 能出包」没有被验证；`installer/ariahost.nsi` **从未被编译过一次**。首次真跑以 M3 的 CI 日志为准（另有一条便宜的预检：`ci.yml` 的 `nsi-syntax` job 在 ubuntu 上用 stub 只跑 `makensis`，能在 Windows 之前挡掉编译期错误，但它同样**从未跑过**）。
+**状态：发布链路已验证（2026-11-25）。** tag `v0.1.0` 移到修复后的 commit `0ebed31`，Release run **45454312274** 全绿（wall clock 2.4 分钟：`version` 8s / `build` ≈100s / `publish` ≈30s），产物已发布到 <https://github.com/doaio/wasm/releases/tag/v0.1.0>：`AriaHost-0.1.0-x64-setup.exe` **196078 字节**、`AriaHost-0.1.0-x64-manifest.json` **503 字节**、`SHA256SUMS.txt` **95 字节**；下载回来重算 SHA-256 与 `SHA256SUMS.txt` 完全一致（见 §3）。首次尝试（run **45451494558**）曾失败在 `File` 载荷路径，根因与修复见 §5.1。
+
+> **已验证的边界**：编译 → 打包 → 校验和 → 发布这条路走通了。**没有验证的**：没有任何人在真机上点过这个安装向导（`/S` 静默、AUMID 写入、服务注册助手都还没有实测记录）。
 
 ## 1. 触发与输入
 
@@ -25,7 +27,7 @@ version（解析版本 + 元数据自检，ubuntu）
 | job | 关键动作 |
 |---|---|
 | `version` | 解析 `version` 与 `vi_version`（四段数字 `x.y.z.0`，pre-release 后缀被截断，供 `VIProductVersion` 用）；校验发布号 == `Cargo.toml` 版本；自检 `rust-toolchain.toml` 的 `channel`、workflow 里 `toolchain:` 输入与之相等、`.cargo/config.toml` 的 `crt-static`、`.nsi` 的 `LegalCopyright` 不是 TODO |
-| `build` | `cargo build --release --locked --target x86_64-pc-windows-msvc` → 暂存 `dist/x64/ariahost.exe` → 签名占位①（签 exe）→ `choco install nsis` → `makensis` 出安装包 → 签名占位②（签 setup）→ `SHA256SUMS.txt` + `manifest.json` → `upload-artifact`（7 天）。`timeout-minutes: 30`（首版压过，挂住时最坏计费 60 分钟而非 120） |
+| `build` | `cargo build --release --locked --target x86_64-pc-windows-msvc` → 暂存 `dist/x64/ariahost.exe`（**给 makensis 的路径必须绝对 + 全反斜杠**）→ 签名占位①（签 exe）→ `choco install nsis` → `makensis` 出安装包 → 签名占位②（签 setup）→ `SHA256SUMS.txt` + `manifest.json` → `upload-artifact`（7 天）。`timeout-minutes: 30`（首版压过，挂住时最坏计费 60 分钟而非 120） |
 | `publish` | 下载 artifact（**不** merge，避免同名 `SHA256SUMS.txt` 互相覆盖）→ 只捞 `*-x64-setup.exe` 与 `*manifest.json` 到 `out/` → **校验 x64 安装包必须存在**（缺则失败、不发 Release）→ 重算校验和 → 生成 notes → `gh release create` |
 
 **为什么只有一个构建 job**：仓库是 private，Windows runner 按 2× 分钟计费（2000 分钟/月 ≈ 1000 分钟实际构建）。x86 在 M4 之前整段注释掉、**不留 `continue-on-error`**——失败 job 一样烧分钟，且失败被静默吞掉比不跑更坏。恢复步骤写在 `release.yml` 的注释块里（四处要一起改）。
@@ -39,6 +41,17 @@ AriaHost-<ver>-x64-setup.exe         安装包（x64，per-user，首版唯一�
 AriaHost-<ver>-x64-manifest.json     版本清单（product/version/arch/target/variant/commit/built_at/files）
 SHA256SUMS.txt                       校验和；build 与 publish 各生成一次，覆盖范围不同（见下）
 ```
+
+**v0.1.0 的实测产物（run 45454312274，已发布）**：
+
+| 附件 | 字节 | SHA-256（下载回来重算，与 `SHA256SUMS.txt` 一致） |
+|---|---|---|
+| `AriaHost-0.1.0-x64-setup.exe` | 196078 | `7e4a3c13b1bb6b28d3e5c6f7ee3f99483fab71c35776b99ee3ac65207816749a` |
+| `ariahost.exe`（包内载荷） | 240640 | `be509a71bbc97654b3c657b293ea8ea25e2a7f53407612f8ae1418023a6c1bd1` |
+| `AriaHost-0.1.0-x64-manifest.json` | 503 | —（`files` 字段带上两行的校验和） |
+| `SHA256SUMS.txt` | 95 | —（`publish` 版只含 setup 一行） |
+
+安装包 PE 版本资源实测正确：`FileVersion`/`ProductVersion` = `0.1.0`，`ProductName`/`CompanyName` = `AriaHost`，`LegalCopyright` = `Copyright (c) 2026 Alusss`，`FileDescription` = `AriaHost 安装程序`（中文正常，说明 `/INPUTCHARSET UTF8` 生效）。
 
 **两份 `SHA256SUMS.txt` 覆盖范围不同（别当成一致）**：
 
@@ -58,21 +71,21 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 3. **工具链 pin 生效**：`rustc -V` 打印 `1.95.x`（CI 日志里 `build` job 的「校验工具链 pin 生效」步骤也必须过）。不是 1.95.x 就别发——先看三处 action 的 `toolchain:` 输入与 `rust-toolchain.toml` 的 `channel` 是否漂了（`version` job 的元数据自检与 `ci.yml` 的 `meta` 检查 4 都会断言这一点）。
 4. **安装器元数据**：`installer/ariahost.nsi` 的 `VIAddVersionKey "LegalCopyright"` 是 `Copyright (c) 2026 Alusss`（不是 TODO），且安装向导**没有许可页/EULA**（双许可不需要接受条款，Q13/S3 已定——不要自行加 `MUI_LICENSEPAGE`）。`version` job 的元数据自检会挡住 TODO 回归。
 5. `git tag -a v0.1.0 -m "AriaHost 0.1.0"` → `git push origin v0.1.0`。
-6. 盯 `build` job：`makensis` 步骤是首次编译 `.nsi`，**大概率需要修几轮**（语法/宏/路径/中文字符集）。更省的做法是先在 PR 上让 `ci.yml` 的 `nsi-syntax` job 把编译期错误清干净，再打 tag。
+6. 盯 `build` job：`makensis` 步骤现在**不再是首次编译**——`ci.yml` 的 `windows` job 每次 PR 都会用真实 `ariahost.exe` 跑一遍安装脚本编译门禁，能编译通过不等于能打 tag，但编译期错误会在合并前暴露。首次真跑时仍可能踩运行期问题（载荷路径、`choco` 装的 NSIS 版本、中文代码页），修的时候先看日志里 `File: "…"` 的路径形态。
 7. 下载 x64 安装包在干净虚拟机里跑一遍[手工验收](../dev/test.md) §3 的 #1/#2。
-8. 校验 `SHA256SUMS.txt` 与 Release 附件一致；notes 里的 commit 对得上；`manifest.json` 的 `variant` 是 `per-user`。
+8. 校验 `SHA256SUMS.txt` 与 Release 附件一致（v0.1.0 实测一致，哈希见 §3）；notes 里的 commit 对得上；`manifest.json` 的 `variant` 是 `per-user`、`U+FFFD`=0 且 `ConvertFrom-Json` 可解析。**坑**：Windows PowerShell 5.1 直接 `Get-Content` UTF-8 **无 BOM** 的 `manifest.json` 会按 GBK 解码显示乱码——那是**显示假象**，文件本身有效；核对请用 `[IO.File]::ReadAllBytes()` + `[Text.Encoding]::UTF8.GetString()`。
 
 ## 5. NSIS 自检清单
 
-`installer/ariahost.nsi` 未编译过，首次编译按此逐条核对（顺序即排错顺序；#11–#18 是改对齐架构 v2.0 时新增的 A1–A7 项）：
+`installer/ariahost.nsi` 的**编译期**已在 windows-latest 通过（2026-11-25），本清单转为**改脚本后回归**与**真机安装**时的逐条核对（顺序即排错顺序；#11–#18 是改对齐架构 v2.0 时新增的 A1–A7 项）：
 
 | # | 检查点 | 失败症状 |
 |---|---|---|
-| 1 | `makensis /INPUTCHARSET UTF8 /DVERSION=x /DVI_VERSION=x.y.z.0 /DARCH=x64 /DSRCDIR=<绝对路径>/dist/x64 /DOUTFILE=<绝对路径>/installer/AriaHost-x-x64-setup.exe installer/ariahost.nsi` 参数齐全（Windows 版用 `/` 前缀选项；**Linux 版 makensis 用 `-` 前缀**，见 §5.1） | `!define` 缺省值生效，装出 `0.0.0-dev` 版本包；或产物落在意外目录 |
+| 1 | `makensis /INPUTCHARSET UTF8 /DVERSION=x /DVI_VERSION=x.y.z.0 /DARCH=x64 /DSRCDIR=<绝对路径>\dist\x64 /DOUTFILE=<绝对路径>\installer\AriaHost-x-x64-setup.exe installer\ariahost.nsi` 参数齐全（Windows 版用 `/` 前缀选项，路径用 `\`） | `!define` 缺省值生效，装出 `0.0.0-dev` 版本包；或产物落在意外目录 |
 | 1a | **`/INPUTCHARSET UTF8` 必须带**：`installer/ariahost.nsi` 是 UTF-8 **无 BOM**、含大量中文字面量（MUI 文案、VersionKey、按钮文案）。en-US runner 的 ANSI 代码页会把它们读成乱码 | 安装向导中文变问号/乱码，或 `!define` 里的中文串编译报错 |
 | 2 | `!include` 路径存在：`MUI2.nsh`、`LogicLib.nsh`、`FileFunc.nsh`、`x64.nsh`、`WinVer.nsh` | `!include: could not find` |
 | 3 | `VIProductVersion` 为四段数字（`${VI_VERSION}`） | `invalid VIProductVersion format` |
-| 4 | `"${SRCDIR}/ariahost.exe"` 存在（`.nsi` 的编译期路径用 `/`：Windows 与 Linux 的 makensis 都接受，而 Linux 上 `\` 被当成文件名字符） | `File: failed opening file` |
+| 4 | `"${SRCDIR}\ariahost.exe"` 存在，且 `SRCDIR` 是**全反斜杠的绝对路径**（实测 run 45452855606：Windows 版 `makensis` 只认这个形态——`D:/a/.../x64/ariahost.exe` 正斜杠 exit 1，相对 `dist\x64\ariahost.exe` 按**脚本所在目录**解析、同样 exit 1；`D:\a\...\x64\ariahost.exe` exit 0。**不要为了跨平台改回 `/`**，Linux 版接受 `/` 但 Windows 不接受，这正是首发失败的根因） | `File: "…" -> no files found`（即使文件确实存在） |
 | 5 | `${GetSize}` / `IntFmt` 的用法（`EstimatedSize` 为 DWORD） | `Invalid command: ${GetSize}` 或写入注册表报类型错 |
 | 6 | `WriteUninstaller "$INSTDIR\uninst.exe"` 在 `Section` 内（架构 §4.10 清单要求 `uninst.exe`，旧名 `uninstall.exe` 已在卸载段一并 Delete） | 卸载程序缺失 |
 | 7 | 卸载段先 `Call un.QuitRunningInstance`（`--quit`，卸载器只能调 `un.` 前缀函数；安装器侧对应 `QuitRunningInstance`），再 `--uninstall-service`；per-user 提权只能 `ExecShell "runas"` | 卸载后 `sc query AriaHost` 仍有服务 / 文件占用删不掉 / 首次编译报函数未定义 |
@@ -89,24 +102,15 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 | 18 | 动态命令的可用性：`${AtLeastBuild} 17763`（`WinVer.nsh`，见 #19）、`${FileExists}` 用于目录、`${LoopWhile}` 循环、`SectionSetText` 在 Section 之后的函数里调用 | 首次编译报 `Invalid command` / 隐藏失效 |
 | 19 | **系统基线**：`${IfNot} ${AtLeastBuild} 17763` 拒装并给 `AH-E1001`。**不能用 `${AtLeastWin10}`**——它只比 major/minor（10.0.10240），会放过 Windows Server 2016（10.0.14393）与 Win10 1803 及更早，与需求 N6/Q16、架构 §4.10/§13 的「安装器卡 10.0.17763」冲突 | Server 2016 装上去了；或编译报 `unknown variable/constant "AtLeastBuild"`（老版 `WinVer.nsh`） |
 
-### 5.1 便宜的预检：Linux 上只跑 makensis（`ci.yml` 的 `nsi-syntax`）
+### 5.1 安装脚本编译门禁（Windows，真实载荷）
 
-等到整条 `cargo build` 跑完才碰 `makensis` 太贵——语法错会让第一次打 tag 先烧 10–25 Windows 分钟。所以 `ci.yml` 里有一个 ubuntu job 专门只验安装脚本：
+为什么不在 Release 里第一次编译 `.nsi`：绕到整条 `cargo build` 之后才发现语法错，第一次打 tag 就先烧 10–25 Windows 分钟（按 2× 计费）。所以编译期闸门放在 `ci.yml` 的 `windows` job 里，和 clippy/test/build 同一个 runner：
 
-```bash
-sudo apt-get install -y --no-install-recommends nsis
-mkdir -p dist/x64 && printf 'stub' > dist/x64/ariahost.exe
-makensis -WX -INPUTCHARSET UTF8 -DVERSION=0.0.0-stub -DVI_VERSION=0.0.0.0 \
-  -DARCH=x64 -DSRCDIR="$PWD/dist/x64" -DOUTFILE="$PWD/out/stub-setup.exe" installer/ariahost.nsi
-```
+- 载荷是 **`cargo build` 的真实产物**（`target\x86_64-pc-windows-msvc\release\ariahost.exe`），不是 stub。
+- `/DSRCDIR` 传**全反斜杠的绝对路径**，`/DOUTFILE` 同理；参数集与 `release.yml` 的 makensis 步骤一致，避免「CI 能编、发布编不过」。
+- 产物有下限守卫（<100000 字节即失败）：真 exe 是 240KB 量级，能挡住「载荷为空/stub」这类退化。
 
-- 选项用 **`-` 前缀**是 Linux 版 makensis 的写法（Debian man page 的 SYNOPSIS），不是 Windows 那种 `/V2`。
-- stub 只需「存在且可读」：`File` 不在编译期校验内容。
-- `!if /FileExists "${SRCDIR}/aria2c.exe"` 判空 → 可选分支被跳过，正是发布包的默认形态。
-- `-WX` 把 warning 当错误：`unknown variable/constant` 这类错误在部分 NSIS 版本上**只是 warning**，不加 `-WX` 就会假绿。
-- 它**证明不了**真机安装/卸载行为，也证明不了 Windows 版 makensis（choco 装的 3.11）与 Ubuntu 版（3.08/3.09）之间的差异。**这条 job 同样从未跑过。**
-
-本地想省一次 Windows 构建也可以照上面这条命令验（装了 NSIS 的 Linux/WSL，或把 `-DSRCDIR` 指到任意含 `ariahost.exe` 的目录）。
+**为什么不在 Linux 上跑（历史教训，别重犯）**：这里原有一个 ubuntu job `nsi-syntax`，`apt-get install nsis` + 1 字节 stub 只跑 `makensis`，长期显示绿色。但首发 tag 的 Release 依然失败（run 45451494558），探针 run 45452855606 证明 Windows 版只接受全反斜杠绝对路径——Linux 版接受 `/`，所以它的绿对 Windows **零证明力**。该 job 已删除，不要以任何形式恢复（包括「顺手加个跨平台路径兼容」）。
 
 编译通过不等于能装：**必须在干净虚拟机（无管理员、无已有安装）实测**，见 `docs/dev/test.md` 验收 #1–#3。
 
@@ -133,14 +137,14 @@ Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知
 
 ## 9. 未验证声明
 
-- 两个 workflow 从未在 GitHub 上运行；`installer/ariahost.nsi` 从未被 `makensis` 编译（`ci.yml` 的 `nsi-syntax` job 是它的第一次编译尝试，**同样从未跑过**）。
-- **以下三条是 2026-11-23 静态修复引入的假设，均未经 makensis 验证**：
-  1. `${AtLeastBuild} 17763` 依赖于所装 NSIS 的 `WinVer.nsh` 里有该宏（本机只核对了 NSIS 上游 master 的 `WinVer.nsh` 源码；3.08/3.09 包内文件未核对）。
-  2. `.nsi` 的编译期路径改用 `/` 分隔（为了让 Linux 能编）。NSIS 手册与 Windows API 都接受 `/`，但**没有在 Windows 版 makensis 上实测过**。
-  3. `Function un.QuitRunningInstance` + `Function HidePerUserServiceSection` 的拆分是首次编译才会暴露问题的改动（宏内无 label，理论无冲突）。
-- 版本注入链路（`version` job → `build` job → `makensis /D…`）是按 NSIS 与 Actions 的标准行为写的，但没有实测。
-- 首次真跑时最可能出问题的地方：`.nsi` 语法与宏、`choco install nsis` 的路径假设、`exec` 调用里含空格的路径（CI 传绝对路径，已加引号）、以及 `.nsi` 的中文字符集（已加 `/INPUTCHARSET UTF8`，仍未实测）。
+- **已验证**：源码 → 编译 → `makensis` 打包 → `SHA256SUMS`/manifest → `gh release create` 发布，全链路在 run **45454312274** 走通（产物与哈希见 §3，附件已下载回来独立重算）。**未验证**：安装向导本身——没有任何人在真机上点过它（`/S` 静默、AUMID 写入、`--install-service` 服务注册助手均无实测记录）。
+- **以下三条原为静态假设，现状已变**：
+  1. `${AtLeastBuild} 17763` 依赖所装 NSIS 的 `WinVer.nsh` 有该宏——编译期已通过，说明 choco 装的 3.11 里有它。
+  2. ~~编译期路径可用 `/` 分隔~~ —— **已被证伪并修正**：实测 run 45452855606 证明 Windows 版 `makensis` 的 `File` 只接受全反斜杠绝对路径，正斜杠与相对路径必然 `no files found`。`.nsi` 已改 `\`，这是硬约束，不要为了跨平台改回去。
+  3. `Function un.QuitRunningInstance` + `Function HidePerUserServiceSection` 的拆分——编译期已通过，运行时行为仍未验证。
+- 版本注入链路（`version` job → `build` job → `makensis /D…`）已在 run 45454312274 验证生效（PE 版本资源为 `0.1.0`，与 tag 一致）。
+- 剩余风险集中在运行期：真机安装/卸载、静默参数、服务注册与注销、AUMID 是否真的让 Toast 显示「AriaHost」。
 - **两处口头契约未经验证，首次实测后必须回写本文与 `.nsi`**：
   1. `--quit` 的退出码（脚本假设 0=已退出、1=无实例、2=超时，其余非 0 即中止）——由 M1 的 `ariahost-cli` 实现，实际返回以代码为准；
   2. per-user 卸载时服务注销只能 `runas` 发起，**拿不到提权进程退出码**（`nsExec` 不能提权），所以改用「轮询 `HKLM\SYSTEM\CurrentControlSet\Services\AriaHost` 是否消失 ≤30s」判成败。
-- 静态 CRT（验收 #15a）的落点是 `.cargo/config.toml` 的 `[target.x86_64-pc-windows-msvc] rustflags = ["-C","target-feature=+crt-static"]`（文件已建），但**从未编译验证**：`dumpbin /dependents` 里到底还会不会出现 `VCRUNTIME140*.dll` / `MSVCP140*.dll`，以首次 CI 日志为准。另外「proc-macro 不受 target rustflags 影响」属【推断】，同样待实测。
+- 静态 CRT（验收 #15a）的落点是 `.cargo/config.toml` 的 `[target.x86_64-pc-windows-msvc] rustflags = ["-C","target-feature=+crt-static"]`（文件已建）。是否真的无 `VCRUNTIME140*.dll` / `MSVCP140*.dll`，**以 `ci.yml` 的 `dumpbin /dependents` 门禁日志为准**——本文不单独声明该项已通过；「proc-macro 不受 target rustflags 影响」仍属【推断】。
