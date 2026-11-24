@@ -1,0 +1,10 @@
+[package]
+name = "ariahost-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost 公共基础：产品常量、错误码注册表、路径约定"
+
+[dependencies]

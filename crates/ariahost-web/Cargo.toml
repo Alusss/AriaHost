@@ -1,0 +1,14 @@
+[package]
+name = "ariahost-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost 网页管理页骨架：axum 路由与 healthz"
+
+[dependencies]
+ariahost-common = { path = "../ariahost-common" }
+axum.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

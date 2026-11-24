@@ -1,0 +1,31 @@
+# AriaHost — workspace 根清单（M1 骨架）
+#
+# 约定：
+# - crate 一律放 `crates/`，产物是单二进制 `ariahost.exe`（子命令区分面板/服务/助手）；
+# - 工具链 pin 只写在 `rust-toolchain.toml`，静态 CRT 只写在 `.cargo/config.toml`，
+#   本文件不重复这两件事；
+# - edition 固定 2021（不要 2024）；release 不加 `panic = "abort"`（会破坏 cargo test）。
+
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/doaio/wasm"
+
+[workspace.dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["net"] }
+windows-service = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,16 @@
+[package]
+name = "ariahost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost 单二进制入口：面板/服务/短命助手"
+
+[[bin]]
+name = "ariahost"
+path = "src/main.rs"
+
+[dependencies]
+ariahost-common = { path = "../ariahost-common" }
+ariahost-svc = { path = "../ariahost-svc" }

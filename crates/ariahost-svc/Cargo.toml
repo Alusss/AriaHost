@@ -1,0 +1,14 @@
+[package]
+name = "ariahost-svc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost ServiceHost 骨架：SCM 接入占位"
+
+[dependencies]
+ariahost-common = { path = "../ariahost-common" }
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true

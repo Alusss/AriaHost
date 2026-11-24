@@ -1,0 +1,13 @@
+[package]
+name = "ariahost-aria2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AriaHost 的 aria2 集成骨架：版本解析、来源枚举、RPC 最小数据结构"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
