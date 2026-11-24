@@ -34,6 +34,10 @@ const SIZE_TOLERANCE: i64 = 2;
 /// 「通道里有没有新快照」。500ms 足够跟手（刷新本身是 2s 一次），又不会烧 CPU。
 const IDLE_REPAINT: Duration = Duration::from_millis(500);
 
+/// 恢复窗口几何后最多检查多少帧：首帧窗口位置可能还没上报（部分平台先给 None），
+/// 不能因为第一次拿不到就永久放弃校正，也不能无限等。
+const MAX_GEOMETRY_CHECKS: u32 = 30;
+
 /// 操作提示的显示时长（复制成功 / 打开目录失败等）。
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -103,6 +107,12 @@ pub struct PanelApp {
     last_saved: Option<Geometry>,
     /// 本次启动是否已经写过窗口几何（只写一次）。
     geometry_saved: bool,
+    /// 恢复的几何是否已经按当前显示器校正过（只做一次）。
+    geometry_checked: bool,
+    /// 已经为校正尝试过多少帧（拿不到窗口位置时不会无限重试）。
+    geometry_checks: u32,
+    /// 启动时是否真的从 `window.json` 恢复了几何（没恢复就不需要校正）。
+    geometry_restored: bool,
 }
 
 impl PanelApp {
@@ -205,6 +215,9 @@ impl PanelApp {
             notice: None,
             last_saved: saved_geometry,
             geometry_saved: false,
+            geometry_checked: false,
+            geometry_checks: 0,
+            geometry_restored: saved_geometry.is_some(),
         }
     }
 
@@ -469,6 +482,62 @@ impl PanelApp {
         })
     }
 
+    /// 从 `window.json` 恢复的几何只按「点」钳制过，真正落到屏幕前还要用**当前显示器**再校一次：
+    /// 拔掉外接屏、改分辨率、换缩放比例之后，存下来的坐标可能整块跑到屏幕外。
+    ///
+    /// 为什么不在 `native_options` 里做：那时还没有窗口，egui 也还没告诉她显示器尺寸
+    /// （`ViewportInfo::monitor_size` 是每帧输入）。所以放到首帧之后，最多试
+    /// [`MAX_GEOMETRY_CHECKS`] 帧（有些平台首帧还没上报窗口位置）。
+    fn fix_restored_geometry(&mut self, ui: &egui::Ui) {
+        if self.geometry_checked || !self.geometry_restored {
+            return;
+        }
+        let Some((screen_width, screen_height)) = ui
+            .ctx()
+            .input(|input| input.viewport().monitor_size)
+            .map(|size| (size.x, size.y))
+        else {
+            return;
+        };
+        let Some(current) = Self::current_geometry(ui) else {
+            self.geometry_checks = self.geometry_checks.saturating_add(1);
+            if self.geometry_checks >= MAX_GEOMETRY_CHECKS {
+                self.geometry_checked = true;
+                self.log.push(format!(
+                    "窗口几何：{MAX_GEOMETRY_CHECKS} 帧内没拿到窗口位置，跳过越界校正（沿用文件里的值）"
+                ));
+            }
+            return;
+        };
+        self.geometry_checked = true;
+        let fixed = window::sanitize(current, Some((screen_width, screen_height)));
+        if fixed.same_as(current) {
+            return;
+        }
+        self.log.push(format!(
+            "窗口几何越界（{:.0}×{:.0} pt @ ({:.0}, {:.0})，显示器 {screen_width:.0}×{screen_height:.0}），\
+             已校正到 {:.0}×{:.0} pt @ ({:.0}, {:.0})",
+            current.width,
+            current.height,
+            current.x,
+            current.y,
+            fixed.width,
+            fixed.height,
+            fixed.x,
+            fixed.y
+        ));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                fixed.width,
+                fixed.height,
+            )));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                fixed.x, fixed.y,
+            )));
+        self.geometry_checked = true;
+    }
+
     /// 关窗时把几何写回：只写一次，且自测模式完全不碰（否则一次 4K 自测会把面板拉成 4K）。
     fn persist_geometry(&mut self, ui: &egui::Ui) {
         if !should_persist_geometry(self.selftest_frames.is_some(), self.geometry_saved) {
@@ -647,6 +716,7 @@ impl eframe::App for PanelApp {
         self.frames = self.frames.saturating_add(1);
         self.sample_memory();
         self.drain_worker();
+        self.fix_restored_geometry(ui);
         self.apply_requested_size(ui);
         if self.requested_size.is_none() || self.size_settled {
             self.frames_after_ready = self.frames_after_ready.saturating_add(1);

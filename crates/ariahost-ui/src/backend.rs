@@ -45,6 +45,15 @@ impl Backend {
         }
     }
 
+    /// 日志里的一行中文说明（比 `Debug` 打印后端位集更可读：后者会带 NOOP/METAL 之类的位名）。
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Auto => "wgpu 自选，并尊重 WGPU_BACKEND 环境变量",
+            Self::Dx12 => "只允许 D3D12（Windows 产品主路径）",
+            Self::Vulkan => "只允许 Vulkan（多数 Windows 机器上 wgpu 的自选项）",
+        }
+    }
+
     /// 映射到 wgpu 的后端位集。
     pub fn backends(self) -> wgpu::Backends {
         match self {
@@ -105,6 +114,19 @@ mod tests {
     fn as_str_roundtrips_with_parse() {
         for backend in [Backend::Auto, Backend::Dx12, Backend::Vulkan] {
             assert_eq!(Backend::parse(backend.as_str()), Some(backend));
+        }
+    }
+
+    #[test]
+    fn describe_is_chinese_and_names_the_backend() {
+        assert!(Backend::Auto.describe().contains("自选"));
+        assert!(Backend::Dx12.describe().contains("D3D12"));
+        assert!(Backend::Vulkan.describe().contains("Vulkan"));
+        for backend in [Backend::Auto, Backend::Dx12, Backend::Vulkan] {
+            let text = backend.describe();
+            // 不要把 wgpu 的位集 Debug 串（NOOP/METAL/…）直接打到日志里。
+            assert!(!text.contains("NOOP"), "{text}");
+            assert!(!text.contains("Backends("), "{text}");
         }
     }
 }

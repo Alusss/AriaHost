@@ -102,9 +102,9 @@ fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>, backend
         mode_text(selftest_frames, requested_size)
     ));
     log.push(format!(
-        "渲染后端选择：--backend {} → wgpu {:?}",
+        "渲染后端选择：--backend {}（{}）",
         backend.as_str(),
-        backend.backends()
+        backend.describe()
     ));
 
     let atlas_side = atlas_max_side(&log);
