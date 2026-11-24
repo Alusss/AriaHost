@@ -149,7 +149,10 @@ mod flex {
 ///
 /// 每个变体都保留足够原文用于诊断；[`RpcCallError::code`] 只返回**语义上真的对得上**的
 /// 既有 `ErrorCode`（见模块文档的映射表），没有对应码时返回 `None` 而不是硬套。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 只派生 `PartialEq`（不派生 `Eq`）：内嵌的 [`RpcError`] 只实现 `PartialEq`，
+/// 而在错误类型上强推全序相等没有实际用途。
+#[derive(Debug, Clone, PartialEq)]
 pub enum RpcCallError {
     /// 连接阶段失败（拒绝 / 超时 / 不可达）→ `AH-E2003`。
     Connect {
