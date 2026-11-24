@@ -5,9 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AriaHost 的 aria2 集成骨架：版本解析、来源枚举、RPC 最小数据结构"
+description = "AriaHost 的 aria2 集成：版本解析、来源枚举、JSON-RPC 客户端（零依赖手写 HTTP/1.1）"
 
 [dependencies]
+ariahost-common = { path = "../ariahost-common" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

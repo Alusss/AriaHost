@@ -1,7 +1,7 @@
 //! aria2 JSON-RPC 2.0 的最小数据结构。
 //!
-//! 本批只固定**传输层形状**（请求/响应/错误对象），不发请求、不定义方法清单。
-//! 方法名、参数顺序、token 注入与重连策略在 M2 的 RPC client 落地。
+//! 本模块只固定**传输层形状**（请求/响应/错误对象），不发请求、不定义方法清单。
+//! 发请求、token 注入与语义化方法在 [`crate::client`]（M1-2A）；重连/退避策略仍待 M2-1。
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

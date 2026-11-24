@@ -1,11 +1,23 @@
-//! aria2 集成骨架（架构 §3.2）。
+//! aria2 集成（架构 §3.2）。
 //!
-//! 本批只有三件事：版本行解析、核心来源枚举、JSON-RPC 最小数据结构。
-//! **不发任何网络请求、不拉起任何进程**；进程管理、RPC client、版本管理器在 M2/M3 落地。
+//! 模块：
+//! - [`version`]：`aria2c --version` 首行解析；
+//! - [`rpc`]：JSON-RPC 2.0 的请求/响应/错误对象（传输层形状）；
+//! - [`client`]：零依赖手写 HTTP/1.1 的 [`RpcClient`]（M1-2A），token 自动注入 + 错误码映射。
+//!
+//! `http` 是 `client` 的实现细节，不对外暴露。
+//!
+//! 边界：本 crate **不拉起 aria2c 进程、不读配置、不做重连策略**；RPC 只连本机明文端点
+//! （`127.0.0.1:6800`）。进程托管与重连属于 M2-1。
 
+pub mod client;
+mod http;
 pub mod rpc;
 pub mod version;
 
+pub use client::{
+    GlobalStat, RpcCallError, RpcClient, VersionInfo, DEFAULT_PORT, DEFAULT_TIMEOUT, RPC_PATH,
+};
 pub use rpc::{RpcError, RpcRequest, RpcResponse};
 pub use version::{parse_version_line, Aria2Version, VersionParseError};
 
