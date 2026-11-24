@@ -25,7 +25,7 @@ pub fn private_working_set_kb() -> Option<u64> {
             counters.cb,
         )
     };
-    (ok != 0).then(|| (counters.PrivateWorkingSetSize / 1024) as u64)
+    (ok != 0).then_some((counters.PrivateWorkingSetSize / 1024) as u64)
 }
 
 /// 非 Windows 目标（本项目只发 Windows，这里只为 `cargo check` 之类工具链检查不炸）。
