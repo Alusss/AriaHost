@@ -9,15 +9,17 @@ description = "AriaHost 面板（eframe/egui）：M2 技术闸门 + M2-1 真实�
 
 [dependencies]
 ariahost-common = { path = "../ariahost-common" }
-# M2-1：面板显示真数据——SCM 只读查询（服务状态）与 aria2 JSON-RPC（版本/速率/队列）。
-# 两者都是纯库：aria2 侧零依赖手写 HTTP，svc 侧的 windows-service 在非 Windows 上是空的，
-# 所以 ui crate 仍然可以在 Linux 上 `cargo check`（CI 只编 Windows）。
+# M2-2b：面板自己托管 aria2c（启动/停止），不复用 CLI 的 `--aria2-runtime-selftest` 逻辑。
+# core 已经在二进制里（cli 用到），这里只是让 ui 也能调；不新增任何传递依赖。
+ariahost-core = { path = "../ariahost-core" }
 ariahost-aria2 = { path = "../ariahost-aria2" }
 ariahost-svc = { path = "../ariahost-svc" }
 # EG-1：egui 整条栈 pin 0.37（防版本漂移）；eframe 默认 features 已含 wgpu 与 system_fonts。
 eframe.workspace = true
 egui.workspace = true
 egui_system_font_provider.workspace = true
+# EG-8：任务列表虚拟化（`TableBuilder::body().rows()`）。默认 features 已关，只留 Table。
+egui_extras.workspace = true
 # 窗口状态（%LOCALAPPDATA%\AriaHost\window.json）的读写；工作区已有同一套 serde，不新增供应链。
 serde.workspace = true
 serde_json.workspace = true

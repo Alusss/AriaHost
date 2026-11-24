@@ -42,7 +42,7 @@ pub enum Command {
         /// 渲染后端（`--backend`，默认 [`ariahost_ui::Backend::Auto`]）。
         backend: ariahost_ui::Backend,
     },
-    /// `--panel-selftest [--frames N] [--size WxH] [--backend ...]`：
+    /// `--panel-selftest [--frames N] [--size WxH] [--backend ...] [--seed-rows N]`：
     /// 隐藏自测入口，开窗渲染 N 帧后打印机器可读行并退出。
     PanelSelftest {
         /// 渲染帧数（尺寸到位后才开始计）。
@@ -51,6 +51,8 @@ pub enum Command {
         size: Option<(u32, u32)>,
         /// 渲染后端（`--backend`）。
         backend: ariahost_ui::Backend,
+        /// 灌入多少行假任务（EG-8/EG-9 的 200 行内存闸门）；`None` = 不灌。
+        seed_rows: Option<usize>,
     },
     /// `--service`：ServiceHost。
     Service,
@@ -261,19 +263,21 @@ fn parse_backend_arg(
     Ok((backend, index + 2))
 }
 
-/// 解析 `--panel-selftest` 的尾部参数：`--frames N`、`--size WxH`、`--backend <name>`，
-/// 顺序自由、各至多一次。
+/// 解析 `--panel-selftest` 的尾部参数：`--frames N`、`--size WxH`、`--backend <name>`、
+/// `--seed-rows N`，顺序自由、各至多一次。
 ///
 /// 这是隐藏入口（不进 `--help`），供验收/CI 在无人值守下量内存与交换链上限：
-/// 开窗渲染 N 帧后打印 `SELFTEST adapter=... atlas=... surface=... backend=... ok=1` 再退出。
+/// 开窗渲染 N 帧后打印 `SELFTEST ... rows=N ok=1` 再退出。
 /// `--size` 是**物理像素**，窗口允许超出屏幕——这是验证 1440p/4K 交换链的手段；
-/// `--backend` 用来把 DX12/Vulkan 单独钉死（本机 wgpu 自选 Vulkan，DX12 从未被验证过）。
+/// `--backend` 用来把 DX12/Vulkan 单独钉死；`--seed-rows` 灌假任务行（不连 RPC），
+/// 用来验 EG-8 虚拟化在 200 行时的内存。
 fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
     let mut frames = ariahost_ui::DEFAULT_SELFTEST_FRAMES;
     let mut frames_seen = false;
     let mut size = None;
     let mut backend = ariahost_ui::Backend::Auto;
     let mut backend_seen = false;
+    let mut seed_rows = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -307,6 +311,16 @@ fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
                 backend = parsed;
                 index = consumed;
             }
+            "--seed-rows" => {
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| UsageError::new("--seed-rows 缺少行数"))?;
+                if seed_rows.is_some() {
+                    return Err(UsageError::new("--seed-rows 重复"));
+                }
+                seed_rows = Some(parse_seed_rows(value)?);
+                index += 2;
+            }
             other => {
                 return Err(UsageError::new(format!(
                     "--panel-selftest 不认识的参数：{other}"
@@ -318,7 +332,22 @@ fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
         frames,
         size,
         backend,
+        seed_rows,
     })
+}
+
+/// `--seed-rows` 的取值：0..=[`ariahost_ui::MAX_SEED_ROWS`]（0 = 空表，用来验空态）。
+fn parse_seed_rows(value: &str) -> Result<usize, UsageError> {
+    match value.parse::<usize>() {
+        Ok(count) if count <= ariahost_ui::MAX_SEED_ROWS => Ok(count),
+        Ok(count) => Err(UsageError::new(format!(
+            "--seed-rows 上限 {}，收到：{count}",
+            ariahost_ui::MAX_SEED_ROWS
+        ))),
+        Err(_) => Err(UsageError::new(format!(
+            "--seed-rows 需要非负整数，收到：{value}"
+        ))),
+    }
 }
 
 /// `--frames` 的取值：正整数。
@@ -382,7 +411,8 @@ fn execute(command: &Command) -> i32 {
             frames,
             size,
             backend,
-        } => ariahost_ui::run_selftest(*frames, *size, *backend),
+            seed_rows,
+        } => ariahost_ui::run_selftest(*frames, *size, *backend, *seed_rows),
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {
@@ -650,6 +680,7 @@ mod tests {
                 frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
                 size: None,
                 backend: ariahost_ui::Backend::Auto,
+                seed_rows: None,
             })
         );
         assert_eq!(
@@ -658,7 +689,46 @@ mod tests {
                 frames: 5,
                 size: None,
                 backend: ariahost_ui::Backend::Auto,
+                seed_rows: None,
             })
+        );
+    }
+
+    #[test]
+    fn panel_selftest_parses_seed_rows() {
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--seed-rows", "200"]),
+            Ok(Command::PanelSelftest {
+                frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
+                size: None,
+                backend: ariahost_ui::Backend::Auto,
+                seed_rows: Some(200),
+            })
+        );
+        // 0 是合法的（空表 → 验空态），不是错误。
+        assert_eq!(
+            parse_args(&["--panel-selftest", "--frames", "5", "--seed-rows", "0"]),
+            Ok(Command::PanelSelftest {
+                frames: 5,
+                size: None,
+                backend: ariahost_ui::Backend::Auto,
+                seed_rows: Some(0),
+            })
+        );
+        // 越界 / 非数字 / 重复都要拒，且带 AH-E1001。
+        for bad in [
+            vec!["--panel-selftest", "--seed-rows", "999999"],
+            vec!["--panel-selftest", "--seed-rows", "-1"],
+            vec!["--panel-selftest", "--seed-rows", "abc"],
+            vec!["--panel-selftest", "--seed-rows"],
+            vec!["--panel-selftest", "--seed-rows", "1", "--seed-rows", "2"],
+        ] {
+            let error = parse_args(&bad).expect_err(&format!("{bad:?} 应当被拒"));
+            assert_eq!(error.code(), "AH-E1001", "{bad:?}");
+        }
+        assert_eq!(
+            parse_seed_rows(&ariahost_ui::MAX_SEED_ROWS.to_string()),
+            Ok(ariahost_ui::MAX_SEED_ROWS)
         );
     }
 
@@ -670,6 +740,7 @@ mod tests {
                 frames: ariahost_ui::DEFAULT_SELFTEST_FRAMES,
                 size: Some((2560, 1440)),
                 backend: ariahost_ui::Backend::Auto,
+                seed_rows: None,
             })
         );
         assert_eq!(
@@ -678,6 +749,7 @@ mod tests {
                 frames: 30,
                 size: Some((3840, 2160)),
                 backend: ariahost_ui::Backend::Auto,
+                seed_rows: None,
             })
         );
         assert_eq!(
@@ -686,6 +758,7 @@ mod tests {
                 frames: 30,
                 size: Some((1920, 1080)),
                 backend: ariahost_ui::Backend::Auto,
+                seed_rows: None,
             })
         );
     }
@@ -733,6 +806,7 @@ mod tests {
                 frames: 3,
                 size: Some((1920, 1080)),
                 backend: ariahost_ui::Backend::Dx12,
+                seed_rows: None,
             })
         );
         assert_eq!(
@@ -741,6 +815,7 @@ mod tests {
                 frames: 3,
                 size: None,
                 backend: ariahost_ui::Backend::Vulkan,
+                seed_rows: None,
             })
         );
     }

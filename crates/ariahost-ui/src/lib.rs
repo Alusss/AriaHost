@@ -1,10 +1,12 @@
-//! AriaHost 面板（M2 技术闸门切片）。
+//! AriaHost 面板。
 //!
-//! 本切片只验证四道技术闸门：**窗口能开、中文正常、IME 可输入、内存可控**；
-//! 不接服务控制、不接 RPC、不做任务列表（那是 M2-1）。
+//! 演进线索（每批都留了落点注释，便于逐条核对）：
+//! - **M2-0**：四道技术闸门——窗口能开、中文正常、IME 可输入、内存 <100MB；
+//! - **M2-1**：面板显示真数据（SCM 服务状态 + aria2 RPC 状态，后台线程 + 退避刷新）；
+//! - **M2-2b**：面板能**下载**——本进程托管 aria2c（启停）、任务列表（EG-8 虚拟化）、
+//!   新建/暂停/继续/移除、200 行内存验收（`--panel-selftest --seed-rows 200`）。
 //!
-//! 设计约束编号 `EG-n` 来自 `docs/requirements-and-design/2026-11-22-wasm-架构设计.md` §4.1.2，
-//! 每条落点都写在对应代码注释里，便于 M2-1 接手时逐条核对。
+//! 设计约束编号 `EG-n` 来自 `docs/requirements-and-design/2026-11-22-wasm-架构设计.md` §4.1.2。
 //!
 //! **设备上限与字形图集上限是两件事**（M2-0b 拆开，详见 [`DEVICE_MAX_SIDE`] 与
 //! [`ATLAS_MAX_SIDE_DEFAULT`] 的注释）：设备上限管交换链/窗口物理像素，图集上限管显存，
@@ -15,10 +17,13 @@
 
 mod app;
 mod backend;
+mod core_host;
 mod fonts;
 mod instance;
 mod logbuf;
 mod metrics;
+mod tasks;
+mod view;
 mod window;
 mod worker;
 
@@ -27,11 +32,16 @@ use std::sync::{Arc, Mutex};
 use ariahost_common::{ErrorCode, EXIT_ERR, EXIT_OK, PRODUCT_NAME, VERSION};
 use egui::ViewportBuilder;
 
-pub use app::RuntimeFacts;
+pub use app::{Banner, PanelInit, RuntimeFacts};
 pub use backend::Backend;
+pub use core_host::{CoreHost, CoreProbe, HostState};
 pub use logbuf::LogBuffer;
+pub use tasks::{TaskAction, TaskRow, TaskStatus};
+pub use view::{StatusView, Tone};
 pub use window::Geometry;
-pub use worker::{endpoint_text, Aria2Failure, Aria2Snapshot, ServiceSnapshot};
+pub use worker::{
+    endpoint_text, Aria2Failure, Aria2Snapshot, ServiceSnapshot, TaskRequest, Worker, WorkerOptions,
+};
 
 /// 面板单实例已被占用时的提示（中文，退出码 [`EXIT_ERR`]）。
 pub const DUPLICATE_INSTANCE_HINT: &str = "AriaHost 面板已在运行，本次不再重复开窗。";
@@ -80,26 +90,42 @@ pub const MAX_SELFTEST_SIDE: u32 = 8192;
 /// `--panel-selftest` 的默认帧数：约 2 秒 @60fps，够走完首帧、字体图集预热与 wgpu 上传。
 pub const DEFAULT_SELFTEST_FRAMES: u32 = 120;
 
+/// `--panel-selftest --seed-rows` 允许的最大行数。
+///
+/// 内存闸门的验收量级是 200；上限只是防手滑（`--seed-rows 100000000` 会把机器拖死）。
+pub const MAX_SEED_ROWS: usize = 5000;
+
 /// 启动面板（无参数入口）；返回进程退出码。
 pub fn run_panel(backend: Backend) -> i32 {
-    run(None, None, backend)
+    run(None, None, backend, None)
 }
 
-/// `--panel-selftest [--frames N] [--size WxH] [--backend ...]`：
+/// `--panel-selftest [--frames N] [--size WxH] [--backend ...] [--seed-rows N]`：
 /// 开窗 → 渲染 N 帧 → 打印一行机器可读结果 → 退出码 0。
 ///
 /// `size` 是**物理像素**（窗口客户区，等于交换链 extent）；窗口可以比屏幕大，用来验证
-/// 「超过 2048 的交换链在真机上能不能建起来」。输出格式见 [`report`]。
-pub fn run_selftest(frames: u32, size: Option<(u32, u32)>, backend: Backend) -> i32 {
-    run(Some(frames), size, backend)
+/// 「超过 2048 的交换链在真机上能不能建起来」。`seed_rows` 灌 N 行假任务（EG-8/EG-9 的
+/// 200 行内存闸门），此时**不连 RPC、不启动 aria2**。输出格式见 [`report`]。
+pub fn run_selftest(
+    frames: u32,
+    size: Option<(u32, u32)>,
+    backend: Backend,
+    seed_rows: Option<usize>,
+) -> i32 {
+    run(Some(frames), size, backend, seed_rows)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。
-fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>, backend: Backend) -> i32 {
+fn run(
+    selftest_frames: Option<u32>,
+    requested_size: Option<(u32, u32)>,
+    backend: Backend,
+    seed_rows: Option<usize>,
+) -> i32 {
     let log = Arc::new(LogBuffer::new());
     log.push(format!(
         "AriaHost {VERSION} 启动（{}）",
-        mode_text(selftest_frames, requested_size)
+        mode_text(selftest_frames, requested_size, seed_rows)
     ));
     log.push(format!(
         "渲染后端选择：--backend {}（{}）",
@@ -157,6 +183,19 @@ fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>, backend
     // EG-10：panic 也先进内部日志，再交给系统默认行为（不吞异常，但用户能在面板里看到记录）。
     install_panic_hook(&log);
 
+    // 运行时准备：读配置 → 解 secret → 定位核心。灌行自测不需要（也不该）碰磁盘上的配置。
+    let (setup, worker_options) = match seed_rows {
+        Some(_) => {
+            log.push("自测灌行模式：跳过配置/secret/核心定位（不连 RPC）".to_owned());
+            (None, worker::WorkerOptions::default())
+        }
+        None => {
+            let setup = core_host::HostSetup::prepare(&log);
+            let options = setup.worker_options(&log);
+            (Some(setup), options)
+        }
+    };
+
     let options = native_options(&log, backend, saved_geometry);
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
@@ -168,13 +207,18 @@ fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>, backend
         Box::new(move |cc| {
             let panel = app::PanelApp::new(
                 cc,
-                app_log,
-                app_facts,
-                lock,
-                selftest_frames,
-                requested_size,
-                atlas_side,
-                saved_geometry,
+                PanelInit {
+                    log: app_log,
+                    facts: app_facts,
+                    lock,
+                    selftest_frames,
+                    requested_size,
+                    atlas_cap: atlas_side,
+                    saved_geometry,
+                    seed_rows,
+                    setup,
+                    worker_options,
+                },
             );
             Ok(Box::new(panel))
         }),
@@ -206,6 +250,7 @@ fn run(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>, backend
 ///   （`wgpu-30.0.2/src/backend/wgpu_core.rs:3978-3981`），`wgpu_errors` 会大于 0。
 /// - `atlas=`：字形图集纹理的**实际尺寸**（`FontsView::font_image_size`），`atlas_cap=` 是配置上限。
 /// - `ok=1`：没有 wgpu 未捕获错误，且（若请求了 `--size`）窗口物理尺寸确实到达目标。
+/// - `rows=`：结束时任务表的行数（`--seed-rows 200` 用它证明「真的画了 200 行」）。
 fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
     if selftest_frames.is_none() {
         return;
@@ -216,7 +261,7 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
         .clone();
     println!(
         "SELFTEST adapter={} atlas={}x{} atlas_cap={} surface={}x{} window={}x{} backend={} \
-         frames={} ok={} wgpu_errors={} private_kb={}",
+         frames={} rows={} ok={} wgpu_errors={} private_kb={}",
         sanitize(&facts.adapter),
         facts.atlas_size[0],
         facts.atlas_size[1],
@@ -227,6 +272,7 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
         facts.window_physical[1],
         sanitize(&facts.backend),
         facts.frames,
+        facts.rows,
         u8::from(facts.ok),
         facts.wgpu_errors,
         facts.private_kb,
@@ -242,13 +288,28 @@ fn sanitize(value: &str) -> String {
 }
 
 /// 启动模式的中文描述（写进日志）。
-fn mode_text(selftest_frames: Option<u32>, requested_size: Option<(u32, u32)>) -> String {
+fn mode_text(
+    selftest_frames: Option<u32>,
+    requested_size: Option<(u32, u32)>,
+    seed_rows: Option<usize>,
+) -> String {
     match (selftest_frames, requested_size) {
         (Some(frames), Some((width, height))) => {
-            format!("自测模式，目标窗口 {width}×{height} px，渲染 {frames} 帧后退出")
+            format!(
+                "自测模式{}，目标窗口 {width}×{height} px，渲染 {frames} 帧后退出",
+                seed_text(seed_rows)
+            )
         }
-        (Some(frames), None) => format!("自测模式，渲染 {frames} 帧后退出"),
+        (Some(frames), None) => format!("自测模式{}，渲染 {frames} 帧后退出", seed_text(seed_rows)),
         (None, _) => "交互面板模式".to_owned(),
+    }
+}
+
+/// 灌行后缀（`--seed-rows N`）。
+fn seed_text(seed_rows: Option<usize>) -> String {
+    match seed_rows {
+        Some(count) => format!("（灌 {count} 行假任务）"),
+        None => String::new(),
     }
 }
 
@@ -407,8 +468,12 @@ mod tests {
 
     #[test]
     fn mode_text_is_chinese() {
-        assert!(mode_text(None, None).contains("面板"));
-        assert!(mode_text(Some(3), None).contains("3"));
-        assert!(mode_text(Some(3), Some((3840, 2160))).contains("3840×2160"));
+        assert!(mode_text(None, None, None).contains("面板"));
+        assert!(mode_text(Some(3), None, None).contains("3"));
+        assert!(mode_text(Some(3), Some((3840, 2160)), None).contains("3840×2160"));
+        // 灌行模式必须在日志里点明「假数据」，不能被误读成真任务。
+        let seeded = mode_text(Some(60), None, Some(200));
+        assert!(seeded.contains("200"), "{seeded}");
+        assert!(seeded.contains("假任务"), "{seeded}");
     }
 }

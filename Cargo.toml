@@ -24,6 +24,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 eframe = "0.37"
 egui = "0.37"
 egui_system_font_provider = "0.37"
+# 虚拟化表格（EG-8：200 行任务列表必须 `body().rows()`）。**关默认 features**：
+# 只要 Table/Strip，不要 image/svg/syntect/datepicker 等加载器（那会把 image 与
+# syntect 拖进依赖树）。它没有额外传递依赖，除 egui 之外只多一个 `document-features` 宏。
+egui_extras = { version = "0.37", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

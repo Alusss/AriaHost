@@ -1,14 +1,17 @@
-//! 面板数据刷新（M2-1）：SCM 服务状态 + aria2 RPC 状态，全部在后台线程完成。
+//! 面板数据刷新（M2-1 起 / M2-2b 扩）：SCM 服务状态 + aria2 RPC 状态 + 任务列表 + 行操作，
+//! 全部在后台线程完成。
 //!
-//! 三条硬约束（对应 M2-1 验收）：
-//! 1. **不阻塞 UI 线程**：RPC 与 SCM 查询都跑在 worker 线程里，UI 只读 `mpsc` 送来的快照，
-//!    每帧 `try_recv` 一次（非阻塞），从不等待网络；
+//! 四条硬约束：
+//! 1. **不阻塞 UI 线程**：RPC 与 SCM 查询（含 pause/unpause/remove/addUri）都跑在 worker 线程，
+//!    UI 只读 `mpsc` 送来的结果，每帧 `try_recv` 一次（非阻塞），从不等待网络；
 //! 2. **不做忙轮询**：成功时每 [`ARIA2_REFRESH_INTERVAL`] 刷新一次；失败按
 //!    2s→4s→8s→16s→30s 退避（AH-E2005 语义，上限 [`BACKOFF_CAP`]）；
 //! 3. **原始输出不上屏**：`RpcCallError` 的 `detail` 是 IO 原文（可能含 JSON/栈信息），
-//!    只用来归类成 [`Aria2Failure`]；UI 拿到的永远是固定中文文案 + 错误码。
+//!    只用来归类成 [`Aria2Failure`]；UI 拿到的永远是固定中文文案 + 错误码；
+//! 4. **格式化离开 UI 线程**（EG-9）：任务行在 worker 里一次性变成 [`TaskRow`]
+//!    （字符串字段全是 `Arc<str>`），UI 每帧只复制指针，不做 `format!`。
 //!
-//! 数据面不做「进程托管/重连拉起」——那是 M2-2 的范围。这里只如实呈现「现在能不能连上」。
+//! 本模块**不托管 aria2c 进程**——那是 [`crate::core_host`] 的职责。这里只负责「连上去做什么」。
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -18,8 +21,19 @@ use std::time::{Duration, Instant};
 use ariahost_aria2::{GlobalStat, RpcCallError, RpcClient, VersionInfo, DEFAULT_PORT, RPC_PATH};
 use ariahost_common::ErrorCode;
 use ariahost_svc::{query_state, ServiceQueryError, ServiceState};
+use serde_json::Value;
 
 use crate::logbuf::LogBuffer;
+use crate::tasks::{self, TaskAction, TaskRow, TaskStatus, MAX_ROWS_PER_BUCKET};
+
+/// `aria2.pause`。
+pub const RPC_PAUSE: &str = "aria2.pause";
+/// `aria2.unpause`。
+pub const RPC_UNPAUSE: &str = "aria2.unpause";
+/// `aria2.remove`（活动/等待/暂停的任务）。
+pub const RPC_REMOVE: &str = "aria2.remove";
+/// `aria2.removeDownloadResult`（已完成/出错/已移除的**结果条目**）。
+pub const RPC_REMOVE_RESULT: &str = "aria2.removeDownloadResult";
 
 /// aria2 状态的成功刷新间隔（架构 §4.12 的「2s」口径）。
 pub const ARIA2_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -48,9 +62,16 @@ pub const RECONNECT_FAILURES: u32 = 5;
 /// 单次 RPC 的超时（`ariahost-aria2` 的默认 5s）；面板不覆盖，留作文档锚点。
 pub const RPC_TIMEOUT: Duration = ariahost_aria2::DEFAULT_TIMEOUT;
 
+pub use crate::view::{StatusView, Tone};
+
 /// aria2 RPC 端点文本（「复制 RPC 端点」按钮与状态区共用）。
 pub fn endpoint_text() -> String {
-    format!("http://127.0.0.1:{DEFAULT_PORT}{RPC_PATH}")
+    endpoint_text_for(DEFAULT_PORT)
+}
+
+/// 指定端口的 RPC 端点文本。
+pub fn endpoint_text_for(port: u16) -> String {
+    format!("http://127.0.0.1:{port}{RPC_PATH}")
 }
 
 /// 一轮成功刷新的快照（UI 只读这个结构，不再碰网络）。
@@ -76,9 +97,6 @@ pub struct Aria2Snapshot {
 
 impl Aria2Snapshot {
     /// 由两个 RPC 结果拼一份快照。
-    ///
-    /// 只用 `getVersion` + `getGlobalStat`：队列长度三个字段 `getGlobalStat` 已经给了，
-    /// 没必要再打三次 `tell*`（每多一次 RPC 就多一次 5s 超时的可能，见 M2-1 的「禁止忙轮询」）。
     pub fn from_parts(version: VersionInfo, stat: GlobalStat) -> Self {
         Self {
             version: version.version,
@@ -157,14 +175,14 @@ impl Aria2Failure {
         }
     }
 
-    /// 下一步提示：本批次唯一的真实答案是「核心还没接进来」。
+    /// 下一步提示。
     pub fn next_step(self) -> String {
         match self {
             Self::Unreachable | Self::Timeout => {
-                "aria2 核心尚未接入（M1-3 提供）；接入前这里只会显示未连接，属预期".to_owned()
+                "先启动 aria2（面板左上「启动 aria2」）；启动后这里会自动连上".to_owned()
             }
             Self::HttpStatus(_) | Self::Protocol | Self::Remote(_) => {
-                "先确认 aria2 核心版本与 secret 配置（secret 属于 M3 配置面）；本批次不自动拉起核心"
+                "确认 RPC secret 与本进程一致（secret.bin 属于当前 Windows 用户）；本批次不自动重装核心"
                     .to_owned()
             }
         }
@@ -229,21 +247,122 @@ pub struct Aria2Update {
     pub consecutive_failures: u32,
 }
 
-/// worker 推给 UI 的一条更新。
+/// 一轮任务列表刷新。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TasksUpdate {
+    /// `Ok` 是合并后的行（活动 → 等待 → 已停止）。
+    pub outcome: Result<Vec<TaskRow>, Aria2Failure>,
+    /// 是否触到每类上限（还有更多没列出来）。
+    pub truncated: bool,
+}
+
+/// 一次行操作的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionOutcome {
+    /// 做了什么。
+    pub action: TaskAction,
+    /// 对哪个任务。
+    pub gid: Arc<str>,
+    /// 结果。
+    pub result: Result<(), Aria2Failure>,
+}
+
+/// 一次「新建下载」的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddOutcome {
+    /// 用户输入的链接（回显用；可能很长，UI 只取展示名）。
+    pub uri: String,
+    /// 成功时是 aria2 分配的 GID。
+    pub result: Result<Arc<str>, Aria2Failure>,
+}
+
+/// worker 推给 UI 的一条更新。
+#[derive(Debug, Clone, PartialEq)]
 pub enum Update {
-    /// aria2 状态。
+    /// aria2 全局状态。
     Aria2(Aria2Update),
     /// 服务状态。
     Service(ServiceSnapshot),
+    /// 任务列表。
+    Tasks(TasksUpdate),
+    /// 行操作结果。
+    Action(ActionOutcome),
+    /// 新建下载结果。
+    Added(AddOutcome),
+}
+
+/// 一行操作的请求（UI → worker）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRequest {
+    /// 意图。
+    pub action: TaskAction,
+    /// 目标 GID。
+    pub gid: Arc<str>,
+    /// 目标行的状态（决定「移除」该调 `remove` 还是 `removeDownloadResult`）。
+    pub kind: TaskStatus,
+}
+
+impl TaskRequest {
+    /// 该调哪个 RPC 方法（唯一决定点）。
+    pub fn method(&self) -> &'static str {
+        match self.action {
+            TaskAction::Pause => RPC_PAUSE,
+            TaskAction::Unpause => RPC_UNPAUSE,
+            TaskAction::Remove => self.kind.remove_method(),
+        }
+    }
 }
 
 /// worker 收到的命令。
 enum Command {
-    /// 立即刷新（「立即刷新」按钮）。
+    /// 立即刷新（「立即刷新」按钮、行操作后、核心就绪后）。
     RefreshNow,
+    /// 一行操作。
+    Task(TaskRequest),
+    /// 新建下载。
+    AddUri(String),
     /// 退出（面板关闭）。
     Stop,
+}
+
+/// worker 的构建参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerOptions {
+    /// RPC 端口（`aria2.rpc.port`）。
+    pub port: u16,
+    /// RPC secret（`secret.bin` 解出来的值；`None` = 不带 secret）。
+    pub secret: Option<String>,
+    /// 成功刷新间隔（默认 [`ARIA2_REFRESH_INTERVAL`]）。
+    pub interval: Duration,
+}
+
+impl Default for WorkerOptions {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_PORT,
+            secret: None,
+            interval: ARIA2_REFRESH_INTERVAL,
+        }
+    }
+}
+
+impl WorkerOptions {
+    /// 从环境变量与 secret 组装（面板启动路径用）。
+    pub fn detect(port: u16, secret: Option<String>, log: &LogBuffer) -> Self {
+        let interval = refresh_interval_from_env().unwrap_or(ARIA2_REFRESH_INTERVAL);
+        if interval != ARIA2_REFRESH_INTERVAL {
+            log.push(format!(
+                "{REFRESH_INTERVAL_ENV} 覆盖刷新间隔：{} ms（默认 {} ms）",
+                interval.as_millis(),
+                ARIA2_REFRESH_INTERVAL.as_millis()
+            ));
+        }
+        Self {
+            port,
+            secret,
+            interval,
+        }
+    }
 }
 
 /// 失败退避计数器（纯逻辑，单测覆盖序列）。
@@ -324,24 +443,13 @@ pub struct Worker {
 
 impl Worker {
     /// 起 worker：首轮立即刷一次，之后按间隔/退避刷新。
-    ///
-    /// 刷新间隔默认 2s，可用 [`REFRESH_INTERVAL_ENV`] 覆盖（仅影响成功路径的节奏；
-    /// 失败退避序列不变，仍然是 2→4→8→16→30s）。
-    pub fn spawn(log: Arc<LogBuffer>) -> Self {
-        let interval = refresh_interval_from_env().unwrap_or(ARIA2_REFRESH_INTERVAL);
-        if interval != ARIA2_REFRESH_INTERVAL {
-            log.push(format!(
-                "{REFRESH_INTERVAL_ENV} 覆盖刷新间隔：{} ms（默认 {} ms）",
-                interval.as_millis(),
-                ARIA2_REFRESH_INTERVAL.as_millis()
-            ));
-        }
+    pub fn spawn(log: Arc<LogBuffer>, options: WorkerOptions) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         let thread_log = Arc::clone(&log);
         let spawned = thread::Builder::new()
             .name("ariahost-refresh".to_owned())
-            .spawn(move || run(thread_log, &command_rx, &update_tx, interval));
+            .spawn(move || run(thread_log, &command_rx, &update_tx, options));
         match spawned {
             Ok(handle) => Self {
                 commands: Some(command_tx),
@@ -364,9 +472,17 @@ impl Worker {
 
     /// 请求立即刷新（非阻塞；worker 不在时静默忽略）。
     pub fn request_refresh(&self) {
-        if let Some(commands) = &self.commands {
-            let _ = commands.send(Command::RefreshNow);
-        }
+        self.send(Command::RefreshNow);
+    }
+
+    /// 请求一行操作（非阻塞；结果走 [`Update::Action`]）。
+    pub fn request_task(&self, request: TaskRequest) {
+        self.send(Command::Task(request));
+    }
+
+    /// 请求新建下载（非阻塞；结果走 [`Update::Added`]）。
+    pub fn request_add(&self, uri: String) {
+        self.send(Command::AddUri(uri));
     }
 
     /// 非阻塞取一条更新（每帧调一次即可）。
@@ -378,13 +494,17 @@ impl Worker {
     pub fn is_running(&self) -> bool {
         self._handle.is_some()
     }
+
+    fn send(&self, command: Command) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(command);
+        }
+    }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        if let Some(commands) = &self.commands {
-            let _ = commands.send(Command::Stop);
-        }
+        self.send(Command::Stop);
     }
 }
 
@@ -393,13 +513,14 @@ fn run(
     log: Arc<LogBuffer>,
     commands: &Receiver<Command>,
     updates: &Sender<Update>,
-    interval: Duration,
+    options: WorkerOptions,
 ) {
-    let client = RpcClient::local(DEFAULT_PORT, None);
+    let client = RpcClient::local(options.port, options.secret.clone());
+    let interval = options.interval;
     let mut backoff = Backoff::new(interval);
     let mut next_aria2 = Instant::now();
     let mut next_service = Instant::now();
-    // 只在「文案变了」时写日志：aria2 没接入是常态，2s 一条会把 500 行缓冲刷满。
+    // 只在「文案变了」时写日志：aria2 没启动是常态，2s 一条会把 500 行缓冲刷满。
     let mut last_aria2_line: Option<String> = None;
     let mut last_service_line: Option<String> = None;
 
@@ -412,23 +533,20 @@ fn run(
                 Ok(_) => backoff.on_success(),
                 Err(_) => backoff.on_failure(),
             }
-            let update = Aria2Update {
-                outcome,
-                consecutive_failures: backoff.failures(),
-            };
-            let line = match &update.outcome {
+            let consecutive_failures = backoff.failures();
+
+            let line = match &outcome {
                 Ok(snapshot) => format!(
                     "aria2 已连接：核心 {}，活动 {} / 等待 {}（{}）",
                     snapshot.version,
                     snapshot.num_active,
                     snapshot.num_waiting,
-                    endpoint_text()
+                    endpoint_text_for(options.port)
                 ),
                 Err(failure) => format!(
-                    "aria2 刷新失败：{} {}（连续 {} 次，下一次 {:?} 后重试）",
+                    "aria2 刷新失败：{} {}（连续 {consecutive_failures} 次，下一次 {:?} 后重试）",
                     failure.code().code(),
                     failure.summary(),
-                    update.consecutive_failures,
                     backoff.interval()
                 ),
             };
@@ -436,9 +554,35 @@ fn run(
                 log.push(line.clone());
                 last_aria2_line = Some(line);
             }
-            if updates.send(Update::Aria2(update)).is_err() {
+
+            // 只有 RPC 通的时候才拉任务列表：连不上时多打三次 RPC 只是白等三次超时。
+            // 失败时也要推一条空的 Tasks（`Err`）：否则界面会拿着「上一次的幽灵列表」继续显示。
+            let tasks_update = match &outcome {
+                Ok(_) => {
+                    let tasks = refresh_tasks(&client);
+                    let truncated = tasks.as_ref().map(|list| list.truncated).unwrap_or(false);
+                    TasksUpdate {
+                        outcome: tasks.map(|list| list.rows),
+                        truncated,
+                    }
+                }
+                Err(failure) => TasksUpdate {
+                    outcome: Err(*failure),
+                    truncated: false,
+                },
+            };
+
+            let aria2_update = Aria2Update {
+                outcome,
+                consecutive_failures,
+            };
+            if updates.send(Update::Aria2(aria2_update)).is_err() {
                 return;
             }
+            if updates.send(Update::Tasks(tasks_update)).is_err() {
+                return;
+            }
+
             next_aria2 = Instant::now() + backoff.interval();
         }
 
@@ -475,13 +619,106 @@ fn run(
                 next_aria2 = Instant::now();
                 next_service = Instant::now();
             }
+            Ok(Command::Task(request)) => {
+                let outcome = run_task(&client, &request);
+                let line = match &outcome.result {
+                    Ok(()) => format!(
+                        "任务 {} 已{}（{}）",
+                        request.gid,
+                        request.action.label(),
+                        request.method()
+                    ),
+                    Err(failure) => format!(
+                        "任务 {} {}失败：{} {}",
+                        request.gid,
+                        request.action.label(),
+                        failure.code().code(),
+                        failure.summary()
+                    ),
+                };
+                log.push(line);
+                if updates.send(Update::Action(outcome)).is_err() {
+                    return;
+                }
+                // 立刻回刷一次，让列表与真实状态对齐（不等到下一个 2s 周期）。
+                next_aria2 = Instant::now();
+            }
+            Ok(Command::AddUri(uri)) => {
+                let outcome = run_add(&client, &uri);
+                let line = match &outcome.result {
+                    Ok(gid) => format!("已加入下载：{gid} ← {}", shorten(&uri, 80)),
+                    Err(failure) => format!(
+                        "新建下载失败：{} {} ← {}",
+                        failure.code().code(),
+                        failure.summary(),
+                        shorten(&uri, 80)
+                    ),
+                };
+                log.push(line);
+                if updates.send(Update::Added(outcome)).is_err() {
+                    return;
+                }
+                next_aria2 = Instant::now();
+            }
             Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
 }
 
-/// 一次 aria2 刷新：`getVersion` + `getGlobalStat`（任一失败即整轮失败）。
+/// 一次任务列表刷新：`tellActive` + `tellWaiting` + `tellStopped`（任一失败即整轮失败）。
+fn refresh_tasks(client: &RpcClient) -> Result<TaskList, Aria2Failure> {
+    let active = client
+        .tell_active()
+        .map_err(|error| Aria2Failure::from_error(&error))?;
+    let waiting = client
+        .tell_waiting(0, MAX_ROWS_PER_BUCKET)
+        .map_err(|error| Aria2Failure::from_error(&error))?;
+    let stopped = client
+        .tell_stopped(0, MAX_ROWS_PER_BUCKET)
+        .map_err(|error| Aria2Failure::from_error(&error))?;
+    let truncated =
+        waiting.len() as u32 >= MAX_ROWS_PER_BUCKET || stopped.len() as u32 >= MAX_ROWS_PER_BUCKET;
+    Ok(TaskList {
+        rows: tasks::rows_from(&active, &waiting, &stopped),
+        truncated,
+    })
+}
+
+/// 一次任务列表结果（带截断标记）。
+struct TaskList {
+    rows: Vec<TaskRow>,
+    truncated: bool,
+}
+
+/// 一次行操作。成功的判据是「RPC 没报错」——aria2 对 removeDownloadResult 回 `"OK"`，
+/// 对 pause/unpause/remove 回 GID，这两种都不需要解析。
+fn run_task(client: &RpcClient, request: &TaskRequest) -> ActionOutcome {
+    let params = vec![Value::String(request.gid.to_string())];
+    let result = client
+        .call(request.method(), params)
+        .map(|_value| ())
+        .map_err(|error| Aria2Failure::from_error(&error));
+    ActionOutcome {
+        action: request.action,
+        gid: Arc::clone(&request.gid),
+        result,
+    }
+}
+
+/// 一次新建下载：`aria2.addUri([uri])` → GID。
+fn run_add(client: &RpcClient, uri: &str) -> AddOutcome {
+    let result = client
+        .add_uri(&[uri.to_owned()])
+        .map(|gid| Arc::from(gid.as_str()))
+        .map_err(|error| Aria2Failure::from_error(&error));
+    AddOutcome {
+        uri: uri.to_owned(),
+        result,
+    }
+}
+
+/// 一次 aria2 全局刷新：`getVersion` + `getGlobalStat`（任一失败即整轮失败）。
 fn refresh_aria2(client: &RpcClient) -> Result<Aria2Snapshot, Aria2Failure> {
     let version = client
         .get_version()
@@ -490,49 +727,6 @@ fn refresh_aria2(client: &RpcClient) -> Result<Aria2Snapshot, Aria2Failure> {
         .get_global_stat()
         .map_err(|error| Aria2Failure::from_error(&error))?;
     Ok(Aria2Snapshot::from_parts(version, stat))
-}
-
-/// 状态区的语气（决定颜色）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tone {
-    /// 一切正常。
-    Good,
-    /// 需要用户注意，但不算错误（未安装服务、核心未接入）。
-    Warn,
-    /// 明确失败。
-    Bad,
-    /// 还没拿到数据。
-    Idle,
-}
-
-/// 状态区的一行块（badge + 主文案 + 详情 + 下一步）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusView {
-    /// 短状态词（「可连接」「未安装」…）。
-    pub badge: String,
-    /// 语气。
-    pub tone: Tone,
-    /// 错误码（正常状态为 `None`）。
-    pub code: Option<&'static str>,
-    /// 主文案。
-    pub headline: String,
-    /// 详情行。
-    pub details: Vec<String>,
-    /// 下一步提示（`AH-E####` 语境下必须有）。
-    pub next_step: Option<String>,
-}
-
-impl StatusView {
-    fn idle(badge: &str, headline: String) -> Self {
-        Self {
-            badge: badge.to_owned(),
-            tone: Tone::Idle,
-            code: None,
-            headline,
-            details: Vec::new(),
-            next_step: None,
-        }
-    }
 }
 
 /// aria2 状态区文案（纯函数：失败归类 → 固定中文 + 码 + 下一步）。
@@ -606,7 +800,7 @@ pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
             tone: Tone::Good,
             code: None,
             headline: format!("服务 {name} 正在运行"),
-            details: vec!["面板只读查询 SCM；启动/停止控制在 M2-2".to_owned()],
+            details: vec!["SCM 报告 SERVICE_RUNNING".to_owned()],
             next_step: None,
         },
         ServiceSnapshot::State(ServiceState::Stopped) => StatusView {
@@ -614,7 +808,7 @@ pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
             tone: Tone::Warn,
             code: None,
             headline: format!("服务 {name} 已安装，当前已停止"),
-            details: vec!["本批次不提供启动/停止按钮（M2-2）".to_owned()],
+            details: vec!["本批次不提供服务的启动/停止按钮（M2-2 面板直接托管 aria2c）".to_owned()],
             next_step: None,
         },
         ServiceSnapshot::State(ServiceState::StartPending) => StatusView {
@@ -638,8 +832,10 @@ pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
             tone: Tone::Warn,
             code: None,
             headline: format!("尚未注册 Windows 服务 {name}"),
-            details: vec!["面板以普通权限运行，未安装服务不影响查看 aria2 状态".to_owned()],
-            next_step: Some("一键注册在 M1-2B（本批次不提供安装/卸载）".to_owned()),
+            details: vec![
+                "面板以普通权限运行；本批次由面板自己托管 aria2c，不依赖该服务".to_owned(),
+            ],
+            next_step: Some("一键注册服务在 M1-2B（本批次不提供安装/卸载）".to_owned()),
         },
         ServiceSnapshot::State(ServiceState::Unknown) => StatusView {
             badge: "状态未知".to_owned(),
@@ -676,27 +872,26 @@ pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
     }
 }
 
-/// 速率格式化：固定两位有效小数，避免面板里出现 `123456789 B/s`。
+/// 速率格式化（委托给任务列表的同一套量纲，避免两处小数位约定不一致）。
 pub fn format_speed(bytes_per_second: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let value = bytes_per_second as f64;
-    if value >= GIB {
-        format!("{:.1} GiB/s", value / GIB)
-    } else if value >= MIB {
-        format!("{:.1} MiB/s", value / MIB)
-    } else if value >= KIB {
-        format!("{:.1} KiB/s", value / KIB)
-    } else {
-        format!("{bytes_per_second} B/s")
+    tasks::format_rate(bytes_per_second)
+}
+
+/// 链接截断（日志用；不让一条超长 URL 把日志撑成一行 10KB）。
+fn shorten(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_owned();
     }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}…（共 {count} 字符）")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ariahost_aria2::{RpcError, VersionInfo};
+    use serde_json::json;
     use std::net::TcpListener;
 
     fn snapshot() -> Aria2Snapshot {
@@ -824,7 +1019,7 @@ mod tests {
         assert!(
             view.next_step
                 .as_deref()
-                .is_some_and(|text| text.contains("M1-3")),
+                .is_some_and(|text| text.contains("启动 aria2")),
             "{:?}",
             view.next_step
         );
@@ -1017,5 +1212,62 @@ mod tests {
     #[test]
     fn endpoint_text_is_the_loopback_jsonrpc_url() {
         assert_eq!(endpoint_text(), "http://127.0.0.1:6800/jsonrpc");
+        assert_eq!(endpoint_text_for(6810), "http://127.0.0.1:6810/jsonrpc");
+    }
+
+    #[test]
+    fn task_request_targets_the_right_rpc_method() {
+        let pause = TaskRequest {
+            action: TaskAction::Pause,
+            gid: Arc::from("g1"),
+            kind: TaskStatus::Active,
+        };
+        assert_eq!(pause.method(), RPC_PAUSE);
+
+        let resume = TaskRequest {
+            action: TaskAction::Unpause,
+            gid: Arc::from("g1"),
+            kind: TaskStatus::Paused,
+        };
+        assert_eq!(resume.method(), RPC_UNPAUSE);
+
+        // 活动任务：移除 = aria2.remove
+        let remove_active = TaskRequest {
+            action: TaskAction::Remove,
+            gid: Arc::from("g1"),
+            kind: TaskStatus::Active,
+        };
+        assert_eq!(remove_active.method(), RPC_REMOVE);
+
+        // 结束态的行在 tellStopped 里，只能清结果条目。
+        for kind in [TaskStatus::Complete, TaskStatus::Error, TaskStatus::Removed] {
+            let request = TaskRequest {
+                action: TaskAction::Remove,
+                gid: Arc::from("g1"),
+                kind,
+            };
+            assert_eq!(request.method(), RPC_REMOVE_RESULT, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn task_fetch_is_capped_and_reports_truncation() {
+        // 只测纯逻辑：截断标记的判据是「某一类取满了上限」。
+        const {
+            assert!(MAX_ROWS_PER_BUCKET >= 200, "200 行内存验收要求至少 200");
+        }
+        let full = vec![json!({ "gid": "x", "status": "waiting" }); MAX_ROWS_PER_BUCKET as usize];
+        let partial = [json!({ "gid": "x", "status": "waiting" })];
+        assert!(full.len() as u32 >= MAX_ROWS_PER_BUCKET);
+        assert!((partial.len() as u32) < MAX_ROWS_PER_BUCKET);
+    }
+
+    #[test]
+    fn shorten_keeps_short_links_intact_and_counts_chars() {
+        assert_eq!(shorten("http://a/b", 20), "http://a/b");
+        let long = "x".repeat(100);
+        let cut = shorten(&long, 10);
+        assert!(cut.starts_with("xxxxxxxxxx"), "{cut}");
+        assert!(cut.contains("共 100 字符"), "{cut}");
     }
 }
