@@ -38,6 +38,8 @@ git push -u origin feat/short-slug
 5. 新增依赖要在 PR 里用一句话说明理由。
 6. **每个完整的变化都要及时提交并推送**（项目规范）：做完一件完整的事就 `commit` + `push`，不要攒成一堆未提交的改动。半成品留在本地分支上，不要推 `main`；推到 `main` 的必须是「自洽、能讲清、可回退」的一步。
 
+> **推送通道说明**：本仓库在部分网络环境下 `git push`（HTTPS 与 SSH-over-443）会卡死，而 `api.github.com` 稳定可达。此时用 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/push-via-api.ps1` 经 GitHub REST API 推送。该脚本按 tree 逐字节还原内容，但因为 GitHub 会把提交时区归一到 `+0000`，**远端 SHA 与本地 SHA 不同**（内容一致，脚本末尾会打印 tree 比对结果）。用了中继之后请继续用中继推送，不要混用 `git push`（会非快进）。网络正常时 `git push` 仍是首选。
+
 ## 4. 提交信息
 
 Conventional Commits 风格，中文正文：
