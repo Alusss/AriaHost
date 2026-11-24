@@ -48,6 +48,24 @@ pub enum ErrorCode {
     ///
     /// 本批 CLI 契约指定用此码；架构 §4.12 未单列该码，故语义按「配置/用法类」归类。
     Usage,
+    /// AH-E1002：配置解析/校验失败（TOML 语法坏了、字段类型不符）。
+    ///
+    /// 可执行建议：**修复它，或删除后重新生成**（文件已经坏了，删掉不心疼）。
+    ConfigParseFailed,
+    /// AH-E1003：配置读写 IO 失败（无权限、磁盘满、文件被占用）。
+    ///
+    /// 可执行建议：检查文件/目录权限与磁盘空间后重试。
+    ConfigIoFailed,
+    /// AH-E1004：凭据加解密失败（DPAPI / `secret.bin`）。
+    ///
+    /// 可执行建议：重新生成 RPC secret（`secret.bin` 损坏或不属于当前用户 profile）。
+    CredentialCryptoFailed,
+    /// AH-E1005：配置 schema 版本过新（本程序比文件旧，通常是用户降级了 AriaHost）。
+    ///
+    /// **与 [`Self::ConfigParseFailed`] 的差别是可执行建议**：文件没坏，只是比本程序新。
+    /// 建议是「把 AriaHost 升级回去」或「先备份再重置配置」——
+    /// **绝不能建议「删掉配置」**，否则用户一键丢掉全部设置（架构 §4.12 主按钮口径）。
+    ConfigSchemaTooNew,
 
     // ---- E2### aria2 核心 ----
     /// AH-E2001：未找到 aria2c（→ MSG-U06）。
@@ -115,6 +133,10 @@ impl ErrorCode {
     pub const fn code(self) -> &'static str {
         match self {
             Self::Usage => "AH-E1001",
+            Self::ConfigParseFailed => "AH-E1002",
+            Self::ConfigIoFailed => "AH-E1003",
+            Self::CredentialCryptoFailed => "AH-E1004",
+            Self::ConfigSchemaTooNew => "AH-E1005",
             Self::Aria2NotFound => "AH-E2001",
             Self::Aria2StartTimeout => "AH-E2002",
             Self::RpcHandshakeFailed => "AH-E2003",
@@ -145,6 +167,10 @@ impl ErrorCode {
     pub const fn category(self) -> ErrorCategory {
         match self {
             Self::Usage
+            | Self::ConfigParseFailed
+            | Self::ConfigIoFailed
+            | Self::CredentialCryptoFailed
+            | Self::ConfigSchemaTooNew
             | Self::PortConflict
             | Self::CoreVersionTooOld
             | Self::ExeInUse
@@ -178,6 +204,10 @@ mod tests {
     /// 注册表全集：新增变体时必须同步，防止漏映射。
     const ALL: &[ErrorCode] = &[
         ErrorCode::Usage,
+        ErrorCode::ConfigParseFailed,
+        ErrorCode::ConfigIoFailed,
+        ErrorCode::CredentialCryptoFailed,
+        ErrorCode::ConfigSchemaTooNew,
         ErrorCode::Aria2NotFound,
         ErrorCode::Aria2StartTimeout,
         ErrorCode::RpcHandshakeFailed,

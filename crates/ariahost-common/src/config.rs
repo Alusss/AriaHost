@@ -465,22 +465,22 @@ impl Default for LifecycleSection {
 // 错误类型
 // ---------------------------------------------------------------------------
 
-/// 配置读写的失败原因。
+/// 配置读写失败原因。
 ///
-/// 说明：E1 段（配置存储）目前只有 `AH-E1001`（命令行用法），没有「配置损坏/IO」的既有码；
-/// 按「不新造错误码」的约束，`Parse`/`Io` 的 [`ConfigError::code`] 返回 `None`，
-/// 由调用方按 `kind` 决定提示动作。详见交付报告。
+/// 每个 kind 对应一个既有 E1 段错误码（`AH-E1001`–`AH-E1005`），
+/// 让 UI 能按码选主按钮（尤其是 `UnsupportedSchemaVersion` 与 `Parse` 的**建议不同**：
+/// 前者是「升级/备份后重置」，后者才是「修复或删除」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigErrorKind {
-    /// 拿不到配置根目录（`%APPDATA%` 缺失）。
+    /// 拿不到配置根目录（`%APPDATA%` 缺失）→ `AH-E1001`。
     PathUnavailable,
-    /// 读/写/改名失败。
+    /// 读/写/改名失败 → `AH-E1003`。
     Io,
-    /// TOML 解析失败（含 schema 字段类型不符）。
+    /// TOML 解析失败（含 schema 字段类型不符）→ `AH-E1002`。
     Parse,
-    /// `schema_version` 比本程序新，拒绝按旧规则改写。
+    /// `schema_version` 比本程序新，拒绝按旧规则改写 → `AH-E1005`。
     UnsupportedSchemaVersion,
-    /// secret 生成/加解密失败。
+    /// secret 生成/加解密失败 → `AH-E1004`。
     Secret,
 }
 
@@ -511,14 +511,20 @@ impl ConfigError {
         self.path.as_deref()
     }
 
-    /// 对应的既有错误码（`Io`/`Parse` 没有合适既有码 → `None`）。
+    /// 对应的错误码（E1 配置段）。
+    ///
+    /// 末尾的 `_` 分支是**刻意保留的兜底位**：将来新增 `ConfigErrorKind` 变体时，
+    /// 若还没来得及在架构 §4.12 里申请到码，这里返回 `None` 而不是被编译器逼着
+    /// 硬塞进某个既有码（`None` 的调用方会退回「按 kind 给提示」）。
+    #[allow(unreachable_patterns)]
     pub fn code(&self) -> Option<ErrorCode> {
         match self.kind {
             ConfigErrorKind::PathUnavailable => Some(ErrorCode::Usage),
-            ConfigErrorKind::Io
-            | ConfigErrorKind::Parse
-            | ConfigErrorKind::UnsupportedSchemaVersion
-            | ConfigErrorKind::Secret => None,
+            ConfigErrorKind::Parse => Some(ErrorCode::ConfigParseFailed),
+            ConfigErrorKind::Io => Some(ErrorCode::ConfigIoFailed),
+            ConfigErrorKind::Secret => Some(ErrorCode::CredentialCryptoFailed),
+            ConfigErrorKind::UnsupportedSchemaVersion => Some(ErrorCode::ConfigSchemaTooNew),
+            _ => None,
         }
     }
 }
@@ -1115,7 +1121,11 @@ mod tests {
 
         let error = load_from(&path).expect_err("坏 TOML 必须报错");
         assert_eq!(error.kind(), ConfigErrorKind::Parse);
-        assert_eq!(error.code(), None, "E1 段没有既有的「配置损坏」码，不硬凑");
+        assert_eq!(
+            error.code(),
+            Some(ErrorCode::ConfigParseFailed),
+            "配置损坏必须给 AH-E1002（可删可修）"
+        );
         assert!(error.to_string().contains("解析失败"), "{error}");
         // 关键：原文件一个字节都不许改。
         assert_eq!(fs::read_to_string(&path).expect("读回"), original);
@@ -1194,6 +1204,38 @@ beta = "two"
         assert!(!sibling(&path, "tmp").exists());
     }
 
+    /// 五种失败类别 → E1 段错误码的一对一映射（含「不给删」的那一条）。
+    #[test]
+    fn every_error_kind_maps_to_a_distinct_e1_code() {
+        let build = |kind: ConfigErrorKind| {
+            ConfigError::new(kind, Some(Path::new("config.toml")), "detail")
+        };
+
+        let path_unavailable = build(ConfigErrorKind::PathUnavailable);
+        assert_eq!(path_unavailable.code(), Some(ErrorCode::Usage));
+        assert_eq!(path_unavailable.code().expect("有码").code(), "AH-E1001");
+
+        let parse = build(ConfigErrorKind::Parse);
+        assert_eq!(parse.code(), Some(ErrorCode::ConfigParseFailed));
+        assert_eq!(parse.code().expect("有码").code(), "AH-E1002");
+
+        let io = build(ConfigErrorKind::Io);
+        assert_eq!(io.code(), Some(ErrorCode::ConfigIoFailed));
+        assert_eq!(io.code().expect("有码").code(), "AH-E1003");
+
+        let secret = build(ConfigErrorKind::Secret);
+        assert_eq!(secret.code(), Some(ErrorCode::CredentialCryptoFailed));
+        assert_eq!(secret.code().expect("有码").code(), "AH-E1004");
+
+        let too_new = build(ConfigErrorKind::UnsupportedSchemaVersion);
+        assert_eq!(too_new.code(), Some(ErrorCode::ConfigSchemaTooNew));
+        assert_eq!(too_new.code().expect("有码").code(), "AH-E1005");
+
+        // 语义护栏：解析失败可以说「删掉重建」，schema 过新绝不能这么说
+        //（否则用户一键丢掉全部设置）。这里用 code 的差异把这条契约钉住。
+        assert_ne!(parse.code(), too_new.code());
+    }
+
     #[test]
     fn newer_schema_version_is_refused() {
         let dir = TestDir::new("schema");
@@ -1201,6 +1243,11 @@ beta = "two"
         fs::write(&path, "schema_version = 99\n").expect("写");
         let error = load_from(&path).expect_err("更高版本必须拒绝");
         assert_eq!(error.kind(), ConfigErrorKind::UnsupportedSchemaVersion);
+        assert_eq!(
+            error.code(),
+            Some(ErrorCode::ConfigSchemaTooNew),
+            "schema 过新必须与「解析失败」区分：不能建议用户删配置"
+        );
     }
 
     #[test]
