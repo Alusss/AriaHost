@@ -325,10 +325,11 @@ mod tests {
 
     #[test]
     fn rejects_non_http_status_line() {
+        // 三个都带完整的头结束标记：这里要验的是「状态行不合法」，不是「头没收全」。
         for raw in [
             &b"200 OK\r\n\r\n"[..],
             &b"HTTP/1.1 OK\r\n\r\n"[..],
-            &b"\r\n"[..],
+            &b"\r\n\r\n"[..],
         ] {
             let head_end = find_header_end(raw).expect("应找到头结束标记");
             let error = parse_head(raw, head_end).expect_err("非法状态行必须报错");
