@@ -124,13 +124,9 @@ mod state {
 
         let service = match manager.open_service(name, ServiceAccess::QUERY_STATUS) {
             Ok(service) => service,
-            Err(error) => {
-                // 「没装」是面板第一屏的常态，不是错误。
-                if win32_code(&error) == Some(ERROR_SERVICE_DOES_NOT_EXIST) {
-                    return Ok(ServiceState::NotInstalled);
-                }
-                return Err(map_error(&error, "打开服务"));
-            }
+            // 「没装」是面板第一屏的常态，不是错误。
+            Err(error) if is_not_installed(&error) => return Ok(ServiceState::NotInstalled),
+            Err(error) => return Err(map_error(&error, "打开服务")),
         };
 
         let status = service
@@ -145,6 +141,11 @@ mod state {
             windows_service::Error::Winapi(io_error) => io_error.raw_os_error(),
             _ => None,
         }
+    }
+
+    /// 是否「服务不存在」（Win32 1060）。
+    fn is_not_installed(error: &windows_service::Error) -> bool {
+        win32_code(error) == Some(ERROR_SERVICE_DOES_NOT_EXIST)
     }
 
     /// 错误码映射：只用既有 `E5###`。

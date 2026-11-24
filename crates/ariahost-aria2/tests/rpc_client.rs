@@ -114,10 +114,11 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn content_length(head: &str) -> usize {
     for line in head.split("\r\n") {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                return value.trim().parse().expect("Content-Length 必须是数字");
-            }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse().expect("Content-Length 必须是数字");
         }
     }
     panic!("客户端请求必须带 Content-Length：{head}");
@@ -136,14 +137,14 @@ fn http_ok(body: &str) -> String {
 }
 
 fn jsonrpc_ok(id: &Value, result: Value) -> String {
-    http_ok(&json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+    let body = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+    http_ok(&body)
 }
 
 fn jsonrpc_error(id: &Value, code: i64, message: &str) -> String {
-    http_ok(
-        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
-            .to_string(),
-    )
+    let body = json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+        .to_string();
+    http_ok(&body)
 }
 
 fn http_status(status: u16, reason: &str) -> String {

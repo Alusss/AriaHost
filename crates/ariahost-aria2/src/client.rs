@@ -106,7 +106,7 @@ pub struct GlobalStat {
     pub num_stopped_total: Option<u64>,
 }
 
-/// 「字符串或数字 → `u64`」的 serde 助手。
+// 「字符串或数字 → `u64`」的 serde 助手（外层用普通注释：同一 item 不能既有 outer 又有 inner 文档）。
 mod flex {
     //! 只服务于 [`super::GlobalStat`] 的字段反序列化。
 
@@ -138,10 +138,7 @@ mod flex {
         deserializer: D,
     ) -> Result<Option<u64>, D::Error> {
         let value = Option::<Value>::deserialize(deserializer)?;
-        value
-            .as_ref()
-            .map(|item| u64_value::<D::Error>(item))
-            .transpose()
+        value.as_ref().map(u64_value::<D::Error>).transpose()
     }
 }
 
@@ -199,9 +196,7 @@ impl RpcCallError {
             Self::Connect { .. } | Self::Transport { .. } | Self::Protocol { .. } => {
                 Some(ErrorCode::RpcHandshakeFailed)
             }
-            Self::HttpStatus { status } if matches!(status, 403 | 404) => {
-                Some(ErrorCode::HttpRejected)
-            }
+            Self::HttpStatus { status: 403 | 404 } => Some(ErrorCode::HttpRejected),
             Self::HttpStatus { .. } | Self::Remote { .. } | Self::MethodNotFound { .. } => None,
         }
     }
@@ -337,18 +332,19 @@ impl RpcClient {
     pub fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, RpcCallError> {
         let id = self.next_request_id();
         let request = RpcRequest::new(id, method, self.prepare_params(params));
-        let body = serde_json::to_vec(&request).map_err(|error| RpcCallError::Protocol {
-            detail: format!("请求序列化失败：{error}"),
-        })?;
+        let request_body =
+            serde_json::to_vec(&request).map_err(|error| RpcCallError::Protocol {
+                detail: format!("请求序列化失败：{error}"),
+            })?;
 
-        let response = http::post_json(self.addr, RPC_PATH, &body, self.timeout)
+        let response_body = http::post_json(self.addr, RPC_PATH, &request_body, self.timeout)
             .map_err(|error| self.map_http_error(error))?;
 
         let parsed: RpcResponse =
-            serde_json::from_slice(&response.body).map_err(|error| RpcCallError::Protocol {
+            serde_json::from_slice(&response_body).map_err(|error| RpcCallError::Protocol {
                 detail: format!(
                     "响应体不是合法 JSON-RPC（{} 字节）：{error}",
-                    response.body.len()
+                    response_body.len()
                 ),
             })?;
 

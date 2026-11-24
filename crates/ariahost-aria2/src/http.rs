@@ -72,17 +72,9 @@ impl std::error::Error for HttpError {
     }
 }
 
-/// 解析后的响应。
-pub struct HttpResponse {
-    /// 状态码（只可能是 2xx：非 2xx 已在读取阶段变成 [`HttpError::Status`]）。
-    pub status: u16,
-    /// 响应体原始字节。
-    pub body: Vec<u8>,
-}
-
-/// 响应头解析结果。
+/// 解析后的响应头。
 struct Head {
-    /// 状态码。
+    /// 状态码（只用于 2xx 判定；非 2xx 已在校验后立刻返回 [`HttpError::Status`]）。
     status: u16,
     /// `Content-Length`；缺省表示「读到 EOF」。
     content_length: Option<usize>,
@@ -90,7 +82,9 @@ struct Head {
     body_start: usize,
 }
 
-/// `POST {path}`，把 `body` 原样写出，读回一个 2xx 响应。
+/// `POST {path}`，把 `body` 原样写出，返回 2xx 的响应体字节。
+///
+/// 非 2xx 一律变成 [`HttpError::Status`]，不返回给调用方；响应体收尾规则见模块文档。
 ///
 /// `timeout` 同时用于 connect、写、单次读。
 pub fn post_json(
@@ -98,7 +92,7 @@ pub fn post_json(
     path: &str,
     body: &[u8],
     timeout: Duration,
-) -> Result<HttpResponse, HttpError> {
+) -> Result<Vec<u8>, HttpError> {
     if timeout.is_zero() {
         return Err(HttpError::Malformed("超时必须大于 0".to_owned()));
     }
@@ -145,22 +139,15 @@ fn build_request(addr: SocketAddr, path: &str, body: &[u8]) -> Vec<u8> {
 }
 
 /// 读到「响应头已知长度且已收全」或 EOF 为止，然后切出响应体。
-fn read_response(stream: &mut TcpStream) -> Result<HttpResponse, HttpError> {
+fn read_response(stream: &mut TcpStream) -> Result<Vec<u8>, HttpError> {
     let mut buffer: Vec<u8> = Vec::new();
     let mut head: Option<Head> = None;
     let mut chunk = [0u8; READ_CHUNK];
 
     loop {
         // 已知长度时先判断是否已收全，避免为一个已经完整的响应多做一次阻塞 read。
-        if let Some(parsed) = &head {
-            if let Some(length) = parsed.content_length {
-                let total = parsed.body_start.checked_add(length).ok_or_else(|| {
-                    HttpError::Malformed(format!("Content-Length 溢出：{length}"))
-                })?;
-                if buffer.len() >= total {
-                    break;
-                }
-            }
+        if response_complete(&head, buffer.len()) {
+            break;
         }
 
         match stream.read(&mut chunk) {
@@ -177,16 +164,7 @@ fn read_response(stream: &mut TcpStream) -> Result<HttpResponse, HttpError> {
             )));
         }
 
-        if head.is_none() {
-            if let Some(head_end) = find_header_end(&buffer) {
-                let parsed = parse_head(&buffer, head_end)?;
-                if !(200..300).contains(&parsed.status) {
-                    // 非 2xx 不必等 body：状态码本身就是结论。
-                    return Err(HttpError::Status(parsed.status));
-                }
-                head = Some(parsed);
-            }
-        }
+        try_parse_head(&mut head, &buffer)?;
     }
 
     let head = head.ok_or_else(|| {
@@ -196,30 +174,51 @@ fn read_response(stream: &mut TcpStream) -> Result<HttpResponse, HttpError> {
     })?;
 
     let body = match head.content_length {
-        Some(length) => {
-            let end = head
-                .body_start
-                .checked_add(length)
-                .ok_or_else(|| HttpError::Malformed(format!("Content-Length 溢出：{length}")))?;
-            buffer
-                .get(head.body_start..end)
-                .ok_or_else(|| {
-                    HttpError::Malformed(format!(
-                        "响应体不足：声明 {length} 字节，实收 {} 字节",
-                        buffer.len().saturating_sub(head.body_start)
-                    ))
-                })?
-                .to_vec()
-        }
+        Some(length) => buffer
+            .get(head.body_start..head.body_start + length)
+            .ok_or_else(|| {
+                HttpError::Malformed(format!(
+                    "响应体不足：声明 {length} 字节，实收 {} 字节",
+                    buffer.len().saturating_sub(head.body_start)
+                ))
+            })?
+            .to_vec(),
         None => buffer
             .get(head.body_start..)
             .map_or_else(Vec::new, <[u8]>::to_vec),
     };
 
-    Ok(HttpResponse {
-        status: head.status,
-        body,
-    })
+    Ok(body)
+}
+
+/// 响应是否已收全：只有 `Content-Length` 已知时才能判定。
+///
+/// 长度溢出的校验在 [`parse_head`] 里做过，所以这里的加法不会溢出。
+fn response_complete(head: &Option<Head>, received: usize) -> bool {
+    let Some(parsed) = head else {
+        return false;
+    };
+    let Some(length) = parsed.content_length else {
+        return false;
+    };
+    received >= parsed.body_start + length
+}
+
+/// 头部收全时解析一次并做 2xx 校验；头部还没收全就什么都不做。
+fn try_parse_head(head: &mut Option<Head>, buffer: &[u8]) -> Result<(), HttpError> {
+    if head.is_some() {
+        return Ok(());
+    }
+    let Some(head_end) = find_header_end(buffer) else {
+        return Ok(());
+    };
+    let parsed = parse_head(buffer, head_end)?;
+    if !(200..300).contains(&parsed.status) {
+        // 非 2xx 不必等 body：状态码本身就是结论。
+        return Err(HttpError::Status(parsed.status));
+    }
+    *head = Some(parsed);
+    Ok(())
 }
 
 /// 找到响应头结束标记的起点；没有则返回 `None`（继续读）。
@@ -267,22 +266,28 @@ fn parse_head(buffer: &[u8], head_end: usize) -> Result<Head, HttpError> {
                 })?;
                 content_length = Some(length);
             }
-            "transfer-encoding" => {
-                if value.to_ascii_lowercase().contains("chunked") {
-                    return Err(HttpError::Malformed(
-                        "对端使用 chunked 编码；本客户端只支持 Content-Length 或读到 EOF"
-                            .to_owned(),
-                    ));
-                }
+            "transfer-encoding" if value.to_ascii_lowercase().contains("chunked") => {
+                return Err(HttpError::Malformed(
+                    "对端使用 chunked 编码；本客户端只支持 Content-Length 或读到 EOF".to_owned(),
+                ));
             }
             _ => {}
         }
     }
 
+    let body_start = head_end + HEADER_END.len();
+    // 长度溢出在这里一次校验掉：`response_complete` 与切 body 的加法因此不会溢出。
+    if let Some(length) = content_length.filter(|length| body_start.checked_add(*length).is_none())
+    {
+        return Err(HttpError::Malformed(format!(
+            "Content-Length 溢出：{length}"
+        )));
+    }
+
     Ok(Head {
         status,
         content_length,
-        body_start: head_end + HEADER_END.len(),
+        body_start,
     })
 }
 
