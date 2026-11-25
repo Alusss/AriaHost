@@ -38,10 +38,18 @@ version（解析版本 + 元数据自检，ubuntu）
 ## 3. 产物
 
 ```text
-AriaHost-<ver>-x64-setup.exe         安装包（x64，per-user，首版唯一产物）
-AriaHost-<ver>-x64-manifest.json     版本清单（product/version/arch/target/variant/commit/built_at/files）
+AriaHost-<ver>-x64-setup.exe         安装包（x64，per-user）
+AriaHost-<ver>-x86-setup.exe         安装包（x86，per-user）——M4-1 起随 tag 发布
+AriaHost-<ver>-<arch>-manifest.json  版本清单（product/version/arch/target/variant/commit/built_at/files）
 SHA256SUMS.txt                       校验和；build 与 publish 各生成一次，覆盖范围不同（见下）
 ```
+
+**v0.1.3 的实测产物（run 45695433791 全绿，双架构首个正式版；tag → commit `520ce9875079d8abbc3fb37907b27c4ad4427e6c`）**：
+
+| 附件 | 字节 | SHA-256（下载回来独立重算，与 `SHA256SUMS.txt` 逐字一致） |
+|---|---|---|
+| `AriaHost-0.1.3-x64-setup.exe` | 8277700 | `70b546dabc7000d8296fc32bfff37a8d52bfaac59e5278ffe6c4e81e1d50b5b0` |
+| `AriaHost-0.1.3-x86-setup.exe` | 8069194 | `fdbfcc458ca32d08a85a7447940e714f13ee53a0539b81ee26ef7866f325e1e5` |
 
 **v0.1.0 的实测产物（run 45454312274，已发布）**：
 
@@ -59,11 +67,38 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 - `build` job（进 artifact）：覆盖 **setup + `ariahost.exe`** 两行。
 - `publish` job（挂到 Release 附件）：在 `out/` 里只有安装包（`find` 只捞 `*-x64-setup.exe` 与 `*manifest.json`），`sha256sum ./*.exe` **只覆盖安装包**。要让 exe 的校验和也对外可见，看同目录的 `manifest.json` —— 它的 `files` 字段里带着 build 时算的两行。
 
-首版**只出这一个包**：x86（`-x86-setup.exe`）与全机变体（`-machine-` 段）都在 M4 才进流水线，见 [ci.md](ci.md) §3。
+**v0.1.0 只出 x64 一个包**（run 45454312274）；**v0.1.3 起 x86 进发布矩阵**，同一 tag 出 `x64` 与 `x86` 两个 per-user 包。全机变体（`-machine-` 段）仍在 M4 后，见 [ci.md](ci.md) §3。
 
 安装包命名由 `installer/ariahost.nsi` 的 `OUTFILE` 决定，版本/架构经 `/DVERSION`、`/DARCH` 注入，**不要在脚本里写死版本号**；CI 另用 `/DOUTFILE=<绝对路径>` 覆盖默认名，避免依赖 makensis 的工作目录假设。
 
 **M4 加变体时的 glob 陷阱**：per-user 是 `AriaHost-<ver>-x64-setup.exe`，全机变体是 `AriaHost-<ver>-x64-machine-setup.exe`。`build` 的 SHA256SUMS 步骤与 `publish` 的 `find` 现在都只匹配 `*-x64-setup.exe`（全机包不会被命中）；一旦为了「省事」改成 `*-setup.exe`，同一发布会一次捞出多个包，校验和与 Release 附件会重名/互相覆盖。`build` 里另有一道 `machine` 名字断言，命中即失败。
+
+### 3.1 v0.1.3 发布实录（双架构首个正式版，2026-11-26）
+
+**矩阵**：`release.yml` 两条腿各出一个 per-user 包（`fail-fast: false`），x64 腿 `x86_64-pc-windows-msvc`、x86 腿 `i686-pc-windows-msvc`，同一 tag、同一 commit `520ce98`。
+
+**x86 腿的构建证据**（run 45695433791 的「构建 x86 per-user」job 日志原文）：
+
+| 项 | 日志原文 |
+|---|---|
+| 构建命令 | `cargo build --workspace --release --locked --target i686-pc-windows-msvc` |
+| 工具链 | `OK：rustc 与 rust-toolchain.toml 一致` |
+| 静态 CRT | `OK：x86 产物只依赖系统 DLL（无 VCRUNTIME/MSVCP）`（`dumpbin`）——**32 位下静态 CRT 同样成立** |
+| 核心资产 | `aria2 zip SHA-256 = 35f6514cc5dd7e98a87b3c4c2d25a0754b9b063dbe59bc0f22d483464f61e5b6`（32 位 zip，对照 64 位 `67d01530…`）；`随包 aria2c.exe SHA-256 = b9cd71b2…` |
+| 许可 | `许可原文对账通过：COPYING SHA-256 = 8177F97513213526DF2CF6184D8FF986C675AFB514D4E68A404010521B880643` |
+
+**PE 机器类型核验（外部探针，不采信 manifest 自述）**：按偏移 `e_lfanew` 读出 `Signature`，确认等于 `0x00004550`（即 `PE\0\0`）后，再读 `Machine` 字段判架构。
+
+| 包内文件 | `Machine` | 字节 | SHA-256 |
+|---|---|---|---|
+| x64 `ariahost.exe` | `0x8664` | 20052992 | `98c42fe3b0688895419d03d2879412c732e3e5d103467169745297fd8fab47cd` |
+| x86 `ariahost.exe` | `0x014C` | 16903168 | `888aec4ae559bdcc7d3ed38a9296036884ea7b0c8d0d3141d4a3472d688b4028` |
+| x64 `aria2c.exe` | `0x8664` | 5649408 | `be2099c214f63a3cb4954b09a0becd6e2e34660b886d4c898d260febfe9d70c2` |
+| x86 `aria2c.exe` | `0x014C` | 6006798 | `b9cd71b275af11b63c33457b0f43f2f2675937070c563e195f223efd7fa4c74b` |
+
+两个 arch 的 `manifest.json` 里 `files[].sha256` 与上表**逐字一致**——但 manifest 是产物自述，**结论以上表的独立读数为准**。
+
+**仍未验证**：x86 包的真机安装与运行（尤其 egui/wgpu 在 i686 上的 DX12 设备创建、4 GB 地址空间下图集与缓冲是否够用）；x64/x86 两包在同一台机上的互斥行为（同版本不同架构不能并存，未实测）。
 
 ## 4. 首次发布 checklist
 
@@ -118,6 +153,8 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 ### 5.2 makensis 从哪来（两条线路，2026-11-26 定）
 
 历史：`v0.1.3` 的第一次发布 **两条腿同时红在「安装 NSIS」这一步**，上游是 `community.chocolatey.org` 先 503 再 504。红点在整条 Windows 编译**之后**——私有仓按 2× 分钟计费，等于一次上游抖动烧掉两轮全量编译。现在的顺序是三条，前两条都不依赖 chocolatey.org：
+
+**runner 实证（2026-11-26，run 45693192261）**：日志原文 `NSIS 就绪（SourceForge 便携包，SHA-256 已核对；makensis 在 Bin\ 下）`——便携包直接命中（`2,363,925 B`、SHA-256 `ba63dffc…b3d8`），**choco 那条线路一次都没被用到**。
 
 | 顺序 | 来源 | 失败即转下一条 | 证据 |
 |---|---|---|---|
