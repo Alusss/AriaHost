@@ -685,6 +685,18 @@ impl PanelApp {
             self.quit_save_pending = true;
             // 标记「已提交关窗」：下一次 close_requested 是我们自己发的，pump_close 必须放行。
             self.exit_committed = true;
+            // task-62 取证开关：模拟「关窗被系统吞掉」——照常走完停止链、照常标记「已发出关窗」，
+            // 但这里**不发** Close，也不排自己的看门狗，好让 ctl 的第二张网成为唯一出口。
+            // 不设开关时这段不执行，行为与之前逐字节一致。
+            if crate::ctl::simulating_close_swallowed() {
+                self.log.push_level(
+                    Level::Warn,
+                    "panel",
+                    "退出：取证开关 ARIAHOST_QUIT_SIMULATE=close-swallowed——截断关窗（模拟系统吞掉 Close），改由 ctl 第二张网收尾",
+                );
+                crate::ctl::mark_quit_done();
+                return;
+            }
             // task-59 第二张网：关窗指令也可能被系统吞掉（真机矩阵在「下载中」抓到过：
             // aria2 已停、进程却永远停在「已停止」）。所以发完关窗后自己记一个截止时间，
             // 到点还没退就直接退——退出不再依赖「Close 一定生效」。

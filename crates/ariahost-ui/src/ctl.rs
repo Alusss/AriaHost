@@ -71,12 +71,83 @@ pub const CONSUME_WAIT: Duration = Duration::from_secs(2);
 /// 与 `core_host::STOP_EXPECTED_SECS` 的口径一致——**不缩短**，缩短会在慢盘上丢掉会话保存。
 pub const FALLBACK_STOP_WAIT: Duration = Duration::from_secs(15);
 
-/// 仅取证用的强制兜底开关（环境变量名）。
+/// 仅取证用的「强制走哪条退路」开关（环境变量名）。
 ///
-/// 真机 1/6 的「不出帧」是随机态，验收要求**可重复地**证明兜底路径走得通，所以留一个
-/// 显式的注入点：设了它，ctl 线程就当作「回执没等到」，直接走兜底。
+/// 真机 1/6 的「不出帧」是随机态，验收要求**可重复地**证明两条退路都走得通，所以留一个
+/// 显式的注入点。取值：
+/// - `fallback`：等价于「2s 内没等到出帧回执」→ 直接由 ctl 线程收尾（第一张网）；
+/// - `close-swallowed`：帧路径照常接住并走完停止链，但**关窗不生效**（模拟系统吞掉
+///   `ViewportCommand::Close`）→ 由第二张网收尾。
+///
 /// 它只改变**退出走哪条路**，不改任何业务状态；设了会写一条显眼的 WARN 日志，不会静默生效。
-pub const SIMULATE_FALLBACK_ENV: &str = "ARIAHOST_QUIT_FALLBACK_SIMULATE";
+pub const SIMULATE_ENV: &str = "ARIAHOST_QUIT_SIMULATE";
+
+/// 旧开关名（只认「设了就算数」的布尔语义，一律折算成 [`Simulate::Fallback`]）。
+///
+/// `task-59` 的取证脚本用它；合并成统一开关后仍然认，避免老脚本静默失效——
+/// 静默失效最坏的结果是「以为在测 B，其实走的是 A」，读数全废还不报警。
+/// 新脚本请用 [`SIMULATE_ENV`]。
+pub const SIMULATE_ENV_LEGACY: &str = "ARIAHOST_QUIT_FALLBACK_SIMULATE";
+
+/// 取证注入点的取值（`ARIAHOST_QUIT_SIMULATE` 的值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Simulate {
+    /// 强制第一张网：跳过 2s 回执等待，直接由 ctl 线程收尾。
+    Fallback,
+    /// 强制第二张网：帧路径正常接住并走完停止链，但关窗不生效。
+    CloseSwallowed,
+}
+
+impl Simulate {
+    /// 字符串 → 取值（纯函数，便于单测）。
+    ///
+    /// 认不出的值返回 `None`（**不猜**）：取证开关拼错时宁可当没设，也不要悄悄走另一条路。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "fallback" => Some(Self::Fallback),
+            "close-swallowed" => Some(Self::CloseSwallowed),
+            _ => None,
+        }
+    }
+
+    /// 反方向：用于日志里原样回显取值。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::CloseSwallowed => "close-swallowed",
+        }
+    }
+}
+
+/// 读环境变量得到注入点（没设 / 值认不出 → `None`）。
+///
+/// 兼容旧开关：`ARIAHOST_QUIT_FALLBACK_SIMULATE` 只要设了（任意非空值）就按
+/// [`Simulate::Fallback`] 处理，与 `task-59` 脚本的语义一致。
+pub fn simulate() -> Option<Simulate> {
+    resolve(
+        std::env::var(SIMULATE_ENV).ok().as_deref(),
+        std::env::var(SIMULATE_ENV_LEGACY).ok().as_deref(),
+    )
+}
+
+/// 两个环境变量取值 → 注入点（纯函数，便于单测：不碰进程环境）。
+///
+/// 优先级：新开关认得出来就用它；新开关设了但认不出，也仍然回落到旧开关
+/// （取证时改错值不至于把整轮验证变成「什么都没开」而无人察觉）。
+pub fn resolve(current: Option<&str>, legacy: Option<&str>) -> Option<Simulate> {
+    if let Some(kind) = current.and_then(Simulate::parse) {
+        return Some(kind);
+    }
+    match legacy {
+        Some(raw) if !raw.trim().is_empty() => Some(Simulate::Fallback),
+        _ => None,
+    }
+}
+
+/// 当前是否强制「关窗被吞」（app 的帧路径据此截断 `Close`）。
+pub fn simulating_close_swallowed() -> bool {
+    simulate() == Some(Simulate::CloseSwallowed)
+}
 
 /// 客户端唯一支持的指令。
 pub const QUIT: &str = "quit";
@@ -462,13 +533,15 @@ mod platform {
             // task-59：等 UI 回执。等到 = 帧路径接手（行为与以前一致）；
             // 等不到 = 那一帧没发生（实测 1/6），由 ctl 线程自己收尾，绝不把退出挂在出帧上。
             if quit {
-                let simulated = std::env::var_os(SIMULATE_FALLBACK_ENV).is_some();
-                if simulated {
+                let sim = simulate();
+                let simulated = sim == Some(Simulate::Fallback);
+                if let Some(kind) = sim {
                     log.push_level(
                         logfile::Level::Warn,
                         FALLBACK_TARGET,
                         format!(
-                            "ctl.fallback: 环境变量 {SIMULATE_FALLBACK_ENV} 已设置——强制走兜底（仅取证用）"
+                            "ctl.fallback: 取证开关 {SIMULATE_ENV}={} 已设置——只改变退出走哪条路（仅取证用）",
+                            kind.as_str()
                         ),
                     );
                 }
@@ -523,6 +596,55 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulate_parses_only_known_values() {
+        // 取证开关：认得的两种取值各到位（task-62）。
+        assert_eq!(Simulate::parse("fallback"), Some(Simulate::Fallback));
+        assert_eq!(
+            Simulate::parse("close-swallowed"),
+            Some(Simulate::CloseSwallowed)
+        );
+        // 前后空白容忍（环境变量常被随手带空格）。
+        assert_eq!(Simulate::parse("  fallback  "), Some(Simulate::Fallback));
+        // 拼错不猜：当没设，宁可少走一条取证分支，也不要悄悄改变退出路径。
+        for garbage in ["", "1", "true", "close_swallowed", "Fallback", "fallback2"] {
+            assert_eq!(Simulate::parse(garbage), None, "不该认 {garbage:?}");
+        }
+        // 反方向回显与解析互为逆运算（日志里原样打这个值）。
+        for kind in [Simulate::Fallback, Simulate::CloseSwallowed] {
+            assert_eq!(Simulate::parse(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn simulate_env_is_unset_in_tests() {
+        // 单测里不允许被取证开关影响：若外部真设了，这里会失败，提醒把它去掉再跑。
+        assert_eq!(simulate(), None);
+        assert!(!simulating_close_swallowed());
+    }
+
+    #[test]
+    fn resolve_prefers_new_switch_and_keeps_legacy_working() {
+        // 新开关认得出来 → 用它。
+        assert_eq!(
+            resolve(Some("close-swallowed"), None),
+            Some(Simulate::CloseSwallowed)
+        );
+        assert_eq!(resolve(Some("fallback"), None), Some(Simulate::Fallback));
+        // 旧开关只要非空 → Fallback（老脚本语义：设了就算数）。
+        assert_eq!(resolve(None, Some("1")), Some(Simulate::Fallback));
+        assert_eq!(resolve(None, Some("true")), Some(Simulate::Fallback));
+        // 新开关设了但认不出 → 仍回落到旧开关，不让整轮取证悄悄变成「什么都没开」。
+        assert_eq!(
+            resolve(Some("close_swallowed"), Some("1")),
+            Some(Simulate::Fallback)
+        );
+        // 都空 / 都认不出 → 不生效。
+        assert_eq!(resolve(None, None), None);
+        assert_eq!(resolve(Some("typo"), None), None);
+        assert_eq!(resolve(Some("typo"), Some("  ")), None);
+    }
 
     #[test]
     fn mark_quit_done_is_observable_by_wait() {
