@@ -505,6 +505,36 @@ fn run_web_selftest() -> i32 {
     }
 }
 
+/// 安装结果 → (上屏文案, 退出码)。
+///
+/// **纯函数**：单测只覆盖到这一层。`run_install_service()` 会真的向 SCM 注册服务，
+/// 单测里**绝不能调**——CI runner 是管理员（装成功、退出 0），开发者机器多半不是
+/// （退出 1），同一条断言在两种身份下结果不同。
+fn install_report(outcome: ariahost_svc::InstallOutcome) -> (&'static str, i32) {
+    match outcome {
+        ariahost_svc::InstallOutcome::Created => ("服务已注册（AriaHost）", EXIT_OK),
+        ariahost_svc::InstallOutcome::AlreadyExisted => {
+            ("服务本来就在（已注册，无需重装）", EXIT_OK)
+        }
+    }
+}
+
+/// 卸载结果 → (上屏文案, 退出码)。`NotInstalled` 是**成功**（幂等），不是错误。
+///
+/// 同样是纯函数：`run_uninstall_service()` 在装了 AriaHost 的机器上会删掉**真实的**
+/// 用户服务，单测里绝不能调。
+fn uninstall_report(outcome: ariahost_svc::UninstallOutcome) -> (&'static str, i32) {
+    match outcome {
+        ariahost_svc::UninstallOutcome::Removed => ("服务已注销（AriaHost）", EXIT_OK),
+        ariahost_svc::UninstallOutcome::NotInstalled => ("服务本来就没装（幂等成功）", EXIT_OK),
+    }
+}
+
+/// 服务类失败 → 退出码：**一律非 0**（具体 `AH-E` 码由 [`report_service_error`] 上屏）。
+const fn service_failure_exit_code() -> i32 {
+    EXIT_ERR
+}
+
 /// `--install-service`：注册 Windows 服务（需要管理员）。
 fn run_install_service() -> i32 {
     let exe = match std::env::current_exe() {
@@ -519,10 +549,7 @@ fn run_install_service() -> i32 {
     };
     match ariahost_svc::install(&exe) {
         Ok(outcome) => {
-            let text = match outcome {
-                ariahost_svc::InstallOutcome::Created => "服务已注册（AriaHost）",
-                ariahost_svc::InstallOutcome::AlreadyExisted => "服务本来就在（已注册，无需重装）",
-            };
+            let (text, exit) = install_report(outcome);
             println!("{text}：{}", exe.display());
             // 启动类型也是安装器与排障要看的事实：首版**固定手动（按需）启动**，不随系统自启
             // （需求第 5 条：不偷偷开机启服务）。要改得走 SCM 工具，CLI 不提供 `--auto`。
@@ -532,11 +559,11 @@ fn run_install_service() -> i32 {
             println!(
                 "下一步：`ariahost --service` 由系统拉起；面板里点「启动 aria2」不需要管理员。"
             );
-            EXIT_OK
+            exit
         }
         Err(error) => {
             report_service_error("注册服务失败", &error);
-            EXIT_ERR
+            service_failure_exit_code()
         }
     }
 }
@@ -545,16 +572,13 @@ fn run_install_service() -> i32 {
 fn run_uninstall_service() -> i32 {
     match ariahost_svc::uninstall() {
         Ok(outcome) => {
-            let text = match outcome {
-                ariahost_svc::UninstallOutcome::Removed => "服务已注销（AriaHost）",
-                ariahost_svc::UninstallOutcome::NotInstalled => "服务本来就没装（幂等成功）",
-            };
+            let (text, exit) = uninstall_report(outcome);
             println!("{text}");
-            EXIT_OK
+            exit
         }
         Err(error) => {
             report_service_error("注销服务失败", &error);
-            EXIT_ERR
+            service_failure_exit_code()
         }
     }
 }
@@ -597,6 +621,11 @@ fn run_service_status() -> i32 {
 /// 把状态报告编成单行 JSON（**稳定契约**：字段顺序固定、缺值一律 `null`）。
 ///
 /// 形状：`{"installed":bool,"state":str,"start_type":str|null,"pid":number|null}`
+/// - `state` ∈ `not-installed` / `stopped` / `start-pending` / `running` / `stop-pending` / `unknown`
+/// - `start_type` ∈ `auto` / `demand` / `disabled` / `system` / `boot`（未安装为 `null`）
+///
+/// 取值一律 **kebab-case**：与 `InstallOutcome`（`created`/`already-existed`）、
+/// `UninstallOutcome`（`removed`/`not-installed`）同一套风格，消费者不用猜大小写。
 fn service_status_json(report: &ariahost_svc::ServiceStatusReport) -> String {
     let start_type = match report.start_type {
         Some(mode) => format!("\"{}\"", mode.as_str()),
@@ -1146,8 +1175,16 @@ mod tests {
         assert_eq!(run_args(&["--service"]), EXIT_ERR);
     }
 
+    /// `--install-service` / `--uninstall-service` **只测解析**。
+    ///
+    /// 单测**不得**执行这两个命令：它们真的改 SCM。
+    /// - CI runner 是管理员 → 会把测试二进制注册成 `deps\ariahost-<hash>.exe` 服务且退出 0；
+    /// - 非管理员 → 退出 1；结果依赖运行身份，不确定；
+    /// - 更危险的是 `--uninstall-service`：在装了 AriaHost 的机器上会删掉**用户真实的**服务。
+    ///
+    /// 退出码/上屏文案的映射改用下面的纯函数测试（`install_report`/`uninstall_report`）。
     #[test]
-    fn install_and_uninstall_are_short_lived_helpers() {
+    fn install_and_uninstall_are_parsed_only() {
         assert_eq!(
             parse_args(&["--install-service"]),
             Ok(Command::InstallService)
@@ -1156,10 +1193,81 @@ mod tests {
             parse_args(&["--uninstall-service"]),
             Ok(Command::UninstallService)
         );
-        // 平台相关：Windows 非管理员下是「需要管理员」失败（EXIT_ERR），
-        // 非 Windows 上是 Unsupported（也是 EXIT_ERR）；绝不能再是「假装成功」。
-        assert_eq!(run_args(&["--install-service"]), EXIT_ERR);
-        assert_eq!(run_args(&["--uninstall-service"]), EXIT_ERR);
+    }
+
+    /// 结果 → (文案, 退出码) 的纯函数契约：装成功/已存在都是 0，卸成功/本来没装也都是 0。
+    ///
+    /// 判据：这条用例在**管理员与非管理员身份下结果相同**，因为整条路径不碰 SCM。
+    #[test]
+    fn install_and_uninstall_outcomes_map_to_exit_codes() {
+        for outcome in [
+            ariahost_svc::InstallOutcome::Created,
+            ariahost_svc::InstallOutcome::AlreadyExisted,
+        ] {
+            let (text, exit) = install_report(outcome);
+            assert_eq!(exit, EXIT_OK, "{outcome:?} 必须是成功");
+            assert!(!text.is_empty(), "{outcome:?} 必须有上屏文案");
+        }
+        // 幂等：服务本来在，重装不报错。
+        assert!(install_report(ariahost_svc::InstallOutcome::AlreadyExisted)
+            .0
+            .contains("本来就在"));
+
+        for outcome in [
+            ariahost_svc::UninstallOutcome::Removed,
+            ariahost_svc::UninstallOutcome::NotInstalled,
+        ] {
+            let (text, exit) = uninstall_report(outcome);
+            assert_eq!(exit, EXIT_OK, "{outcome:?} 必须是成功");
+            assert!(!text.is_empty(), "{outcome:?} 必须有上屏文案");
+        }
+        // 卸载的「本来没装」是幂等成功，文案要把这件事说清楚。
+        assert!(
+            uninstall_report(ariahost_svc::UninstallOutcome::NotInstalled)
+                .0
+                .contains("幂等")
+        );
+    }
+
+    /// 服务类失败：**一律非 0 退出**，且必须带 `AH-E` 码（不许裸 Win32 码）。
+    #[test]
+    fn service_errors_always_fail_with_a_code() {
+        use ariahost_svc::ServiceError;
+
+        let cases = [
+            ServiceError::Unsupported,
+            ServiceError::NotFromScm {
+                detail: "手工运行（Win32 1063）".to_owned(),
+            },
+            ServiceError::NeedsAdmin {
+                detail: "打开本机 SCM（Win32 5）".to_owned(),
+            },
+            ServiceError::NotInstalled {
+                detail: "服务不存在（Win32 1060）".to_owned(),
+            },
+            ServiceError::Unavailable {
+                detail: "控制被拒".to_owned(),
+            },
+            ServiceError::RegisterPrereq {
+                detail: "ProgramData 不可写".to_owned(),
+            },
+        ];
+        for error in cases {
+            let code = error.code().code();
+            assert!(
+                code.starts_with("AH-E"),
+                "{error:?} 的错误码必须是 AH-E 前缀，实际 {code}"
+            );
+            assert_eq!(service_failure_exit_code(), EXIT_ERR, "服务类失败一律非 0");
+        }
+        assert_eq!(
+            ServiceError::NeedsAdmin {
+                detail: String::new()
+            }
+            .code()
+            .code(),
+            "AH-E5002"
+        );
     }
 
     #[test]
