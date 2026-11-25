@@ -102,36 +102,61 @@ pub const AUTO_PROBE_ORDER: [(&str, wgpu::Backends); 3] = [
 /// `attempt` 必须「试完就把实例丢掉」——返回值里的 guard 在函数内被 `drop`，
 /// 所以同一时刻最多只有一个后端被实例化。这一点由单测用 Drop 计数器证明，
 /// 不靠注释保证。
+/// 返回 `(胜出的后端, 可取证轨迹)`。
+///
+/// **轨迹**是给现场支持用的：形如 `vulkan:no_adapter>dx12:ready`，会以
+/// `SELFTEST_NOTE probe=…` 打出去，也能在面板日志里逐行看到「尝试 X → 失败（原因）→ 最终 Y」。
+/// 没有这条轨迹，「用户说内存高」就只能靠猜是哪个后端。
 pub fn probe_in_order<P, G>(
     order: &[(&'static str, wgpu::Backends)],
     mut attempt: P,
     log: &mut Vec<String>,
-) -> Option<wgpu::Backends>
+) -> (Option<wgpu::Backends>, String)
 where
     P: FnMut(wgpu::Backends) -> (Probe, G),
 {
+    let mut trace: Vec<String> = Vec::new();
+    // (label, 失败原因)：回退到更贵后端时要如实说出「为什么不是第一个」。
+    let mut failures: Vec<(&'static str, &'static str)> = Vec::new();
+
     for (label, backends) in order {
         let (probe, guard) = attempt(*backends);
-        match probe {
-            Probe::Ready => {
+        let reason = match probe {
+            Probe::Ready => None,
+            Probe::Unsupported => Some("本构建没编入该后端"),
+            Probe::NoAdapter => Some("后端在，但枚举不到可用显卡适配器"),
+        };
+
+        let Some(reason) = reason else {
+            trace.push(format!("{label}:ready"));
+            log.push(format!(
+                "后端探测：尝试 {label} → 可用；最终后端 = {label}（只开这一个，不走全集）"
+            ));
+            if !failures.is_empty() {
+                let why = failures
+                    .iter()
+                    .map(|(l, r)| format!("{l} 不可用（{r}）"))
+                    .collect::<Vec<_>>()
+                    .join("；");
                 log.push(format!(
-                    "后端探测：{label} 可用 → 只开 {label}（不走全集；全集比单后端多约 20MB）"
+                    "后端探测：注意——{why}，已回退到 {label}；DX12 实测私用工作集 116.4MB，比 Vulkan 的 51.6MB 高，内存会更高"
                 ));
-                drop(guard);
-                return Some(*backends);
             }
-            Probe::Unsupported => log.push(format!(
-                "后端探测：{label} 不可用（本构建未编入该后端）→ 试下一个"
-            )),
-            Probe::NoAdapter => log.push(format!(
-                "后端探测：{label} 后端在，但没有可用显卡适配器 → 试下一个"
-            )),
-        }
+            drop(guard);
+            return (Some(*backends), trace.join(">"));
+        };
+
+        trace.push(format!("{label}:{reason}"));
+        failures.push((label, reason));
+        log.push(format!(
+            "后端探测：尝试 {label} → 失败（{reason}）→ 试下一个"
+        ));
         // 先丢实例再试下一个：同时持有两个等于把 20MB 又加回来。
         drop(guard);
     }
+
     log.push("后端探测：没有一个后端可用 → 退回 wgpu 默认（建议用 --backend 明确指定）".to_owned());
-    None
+    (None, trace.join(">"))
 }
 
 /// 把后端位集写成中文日志（避免把 `Backends(DX12 | VULKAN)` 这种 Debug 串打到用户日志里）。
@@ -203,6 +228,7 @@ mod tests {
             )
         };
 
+        let (chosen, trace) = chosen;
         assert_eq!(chosen, Some(wgpu::Backends::VULKAN), "应落到第二个后端");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "成功之后不许继续探测");
         assert_eq!(
@@ -211,23 +237,39 @@ mod tests {
             "同一时刻最多一个实例存活（同时持有两个 = 白修那 20MB）"
         );
         assert_eq!(alive.load(Ordering::SeqCst), 0, "返回前必须把实例丢掉");
+        // 轨迹要能回答「为什么不是第一个」：这是现场支持唯一的取证入口。
+        assert_eq!(trace, "dx12:后端在，但枚举不到可用显卡适配器>vulkan:ready");
         assert!(
             log.iter()
-                .any(|line| line.contains("dx12 后端在，但没有可用显卡")),
+                .any(|line| line.contains("尝试 dx12 → 失败")
+                    && line.contains("枚举不到可用显卡适配器")),
             "失败原因要写清楚：{log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line.contains("已回退到 vulkan")),
+            "回退时必须说清「为什么不是第一个 + 内存代价」：{log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line.contains("最终后端 = vulkan")),
+            "必须有一行给出最终后端：{log:?}"
+        );
+        assert!(
+            log.last().is_some_and(|line| line.contains("内存会更高")),
+            "回退警示压在最末尾（最容易看到的位置）：{log:?}"
         );
     }
 
     #[test]
     fn probe_reports_unsupported_apart_from_no_adapter() {
         let mut log = Vec::new();
-        let chosen = probe_in_order(
+        let (chosen, trace) = probe_in_order(
             &[("dx12", wgpu::Backends::DX12)],
             |_| (Probe::Unsupported, ()),
             &mut log,
         );
         assert_eq!(chosen, None);
-        assert!(log[0].contains("未编入该后端"), "{log:?}");
+        assert_eq!(trace, "dx12:本构建没编入该后端");
+        assert!(log[0].contains("没编入该后端"), "{log:?}");
         assert!(log[1].contains("没有一个后端可用"), "{log:?}");
     }
 

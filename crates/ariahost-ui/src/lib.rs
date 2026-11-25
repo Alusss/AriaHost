@@ -338,7 +338,8 @@ fn run(
         UiPrefs::default()
     };
 
-    let options = native_options(&log, resolve_backends(backend, &log), saved_geometry);
+    let (backends, probe_trace) = resolve_backends(backend, &log);
+    let options = native_options(&log, backends, saved_geometry);
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
     let app_facts = Arc::clone(&facts);
@@ -414,7 +415,7 @@ fn run(
 
     match result {
         Ok(()) => {
-            report(selftest_frames, &facts);
+            report(selftest_frames, &facts, probe_trace.as_deref());
             EXIT_OK
         }
         Err(error) => {
@@ -439,7 +440,7 @@ fn run(
 /// - `atlas=`：字形图集纹理的**实际尺寸**（`FontsView::font_image_size`），`atlas_cap=` 是配置上限。
 /// - `ok=1`：没有 wgpu 未捕获错误，且（若请求了 `--size`）窗口物理尺寸确实到达目标。
 /// - `rows=`：结束时任务表的行数（`--seed-rows 200` 用它证明「真的画了 200 行」）。
-fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
+fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace: Option<&str>) {
     if selftest_frames.is_none() {
         return;
     }
@@ -465,6 +466,11 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>) {
         facts.wgpu_errors,
         facts.private_kb,
     );
+    // 后端选择轨迹：`vulkan:no_adapter>dx12:ready` 这类。现场说「内存高」时，
+    // 第一件事就是要知道到底落在哪个后端、以及为什么不是首选的那个。
+    if let Some(trace) = probe_trace {
+        println!("SELFTEST_NOTE probe={}", sanitize(trace));
+    }
     if let Some(reason) = facts.reason.as_deref() {
         println!("SELFTEST_NOTE {reason}");
     }
@@ -575,17 +581,17 @@ fn native_options(
 ///   显式设了 `WGPU_BACKEND` 时尊重它（与 wgpu 自己的默认行为对齐）；
 /// - `dx12` / `vulkan` = **只**允许该后端，**不回退**：配了 dx12 起不来就如实报错，
 ///   绝不偷偷换后端（否则「配了 dx12 却在跑 vulkan」这种假验收就回来了）。
-fn resolve_backends(backend: Backend, log: &LogBuffer) -> eframe::wgpu::Backends {
+fn resolve_backends(backend: Backend, log: &LogBuffer) -> (eframe::wgpu::Backends, Option<String>) {
     use eframe::wgpu;
 
     match backend {
         Backend::Dx12 => {
             log.push("后端：只允许 dx12（显式指定，不回退；起不来会如实报错）".to_owned());
-            backend.backends()
+            (backend.backends(), Some("dx12:显式指定".to_owned()))
         }
         Backend::Vulkan => {
             log.push("后端：只允许 vulkan（显式指定，不回退；起不来会如实报错）".to_owned());
-            backend.backends()
+            (backend.backends(), Some("vulkan:显式指定".to_owned()))
         }
         Backend::Auto => {
             if let Some(from_env) = wgpu::Backends::from_env() {
@@ -593,21 +599,27 @@ fn resolve_backends(backend: Backend, log: &LogBuffer) -> eframe::wgpu::Backends
                     "后端：auto 尊重 WGPU_BACKEND → 只开 {}",
                     backend::bits_label(from_env)
                 ));
-                return from_env;
+                return (from_env, Some("env:WGPU_BACKEND".to_owned()));
             }
             let mut lines = Vec::new();
-            let chosen =
+            let (chosen, trace) =
                 backend::probe_in_order(&backend::AUTO_PROBE_ORDER, probe_once, &mut lines);
             for line in lines {
                 log.push(line);
             }
-            chosen.unwrap_or_else(|| {
-                log.push(
-                    "后端：退回 wgpu 默认全集（内存与性能都不是最优；建议用 --backend 指定）"
-                        .to_owned(),
-                );
-                wgpu::Backends::default()
-            })
+            match chosen {
+                Some(bits) => (bits, Some(trace)),
+                None => {
+                    log.push(
+                        "后端：退回 wgpu 默认全集（内存与性能都不是最优；建议用 --backend 指定）"
+                            .to_owned(),
+                    );
+                    (
+                        wgpu::Backends::default(),
+                        Some(format!("{trace}>fallback:all")),
+                    )
+                }
+            }
         }
     }
 }

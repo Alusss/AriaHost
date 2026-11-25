@@ -8,12 +8,18 @@ use std::time::{Duration, Instant};
 use ariahost_common::ErrorCode;
 use ariahost_svc::{ServiceStartMode, ServiceState};
 
-/// 「安装」的等待预算：SCM 注册通常秒级，30s 是给慢盘/杀软留下的余量（task-46 指定）。
+/// 「安装」的**第一段预算**（升一句告警，**不收尾**）：SCM 注册通常秒级，30s 是给慢盘/杀软留的余量。
 pub const INSTALL_BUDGET: Duration = Duration::from_secs(30);
-/// 「启动」的等待预算。
+/// 「启动」的第一段预算。
 pub const START_BUDGET: Duration = Duration::from_secs(30);
-/// 「停止」的等待预算：架构 §4.6 是 15s 优雅 + 10s 强制 = 25s（task-46 指定）。
+/// 「停止」的第一段预算：架构 §4.6 是 15s 优雅 + 10s 强制 = 25s。
 pub const STOP_BUDGET: Duration = Duration::from_secs(25);
+/// **第二段（硬上限）**：到点才收尾，且收尾文案必须写明「这是面板侧预算，不是 SCM 的结论」。
+///
+/// 为什么必须两段：SCM 在慢盘/杀软/域控环境下合法地慢过 30 秒是常事，第一段就判失败等于
+/// 替用户下结论（实测过一次：30s 判超时，但 31s 时服务其实已经起来了）。**面板只能说自己
+/// 等累了，不能说系统没做成。**
+pub const UI_HARD_CAP: Duration = Duration::from_secs(120);
 /// 优雅停止段落的长度（架构 §4.6 第一段）。
 pub const STOP_GRACEFUL: Duration = Duration::from_secs(15);
 
@@ -229,11 +235,19 @@ impl Stage {
         }
     }
 
-    /// 是否已超出该操作的预算。
-    pub fn over_budget(self, now: Instant) -> bool {
+    /// 是否已过**第一段预算**（该升一句告警了，但还不能收尾）。
+    pub fn escalated(self, now: Instant) -> bool {
         match self {
             Self::Idle => false,
             Self::Waiting { op, .. } => self.elapsed(now) > op.budget(),
+        }
+    }
+
+    /// 是否已到**面板侧硬上限**（到点才允许收尾）。
+    pub fn past_hard_cap(self, now: Instant) -> bool {
+        match self {
+            Self::Idle => false,
+            Self::Waiting { .. } => self.elapsed(now) > UI_HARD_CAP,
         }
     }
 }
@@ -245,19 +259,23 @@ impl Stage {
 pub fn waiting_text(stage: Stage, now: Instant) -> Option<(String, String, Option<String>)> {
     let op = stage.op()?;
     let waited = stage.elapsed(now);
-    let seconds = format!("{:.1}", waited.as_secs_f32());
 
     let progress = match op {
         Op::Stop if waited <= STOP_GRACEFUL => "停止中…（正在优雅停止）".to_owned(),
         Op::Stop if waited <= STOP_BUDGET => "停止中…（优雅超时，正在强制结束）".to_owned(),
-        Op::Stop => "停止中…（已超出 25 秒预算，仍在等 SCM 回报）".to_owned(),
+        Op::Stop => "停止中…（面板侧预算已过，仍在等 SCM 回报）".to_owned(),
         other => other.progress().to_owned(),
     };
 
-    let counter = if stage.over_budget(now) {
-        format!("已等 {seconds} 秒（超出预算，可能仍在后台完成；可点「刷新状态」核对）")
+    // **等宽惰性**：秒数取整并定宽右对齐，同一行的字符数不随秒数变化——否则每过一秒
+    // 整段文案就换一次长度，卡片跟着抖一下，看起来像界面在抽。
+    let secs = waited.as_secs();
+    let counter = if stage.past_hard_cap(now) {
+        format!("已等 {secs:>3} 秒 · 面板侧等待已到上限（不是 SCM 的结论：服务可能仍在后台完成）")
+    } else if stage.escalated(now) {
+        format!("已等 {secs:>3} 秒 · 仍在等 SCM 回话（面板侧预算已过，但不会因此判失败）")
     } else {
-        format!("已等 {seconds} 秒")
+        format!("已等 {secs:>3} 秒")
     };
 
     Some((progress, op.waiting_hint().to_owned(), Some(counter)))
@@ -336,10 +354,12 @@ pub fn notice_after(op: Op, outcome: NoticeOutcome) -> (NoticeTone, String) {
             Op::Stop => (NoticeTone::Ok, "服务已停止；会话与队列已落盘。".to_owned()),
         },
         NoticeOutcome::TimedOut => (
-            NoticeTone::Bad,
+            // **Info 不是 Bad**：这是面板自己等累了，不是系统给了失败。染红等于替 SCM 下结论。
+            NoticeTone::Info,
             format!(
-                "{}没有在预算内完成（可能仍在后台继续）。点「刷新状态」再核对一次。",
-                op.progress().trim_end_matches('…')
+                "{}：面板侧等待已到 {} 秒上限——这不是 SCM 的结论，服务可能仍在后台完成。点「刷新状态」核对。",
+                op.progress().trim_end_matches('…'),
+                UI_HARD_CAP.as_secs()
             ),
         ),
     }
@@ -428,10 +448,10 @@ impl ServiceCard {
         Some((op, outcome))
     }
 
-    /// 超出预算就收尾（返回一次，之后不再重复报）。
+    /// 到**面板侧硬上限**才收尾（返回一次，之后不再重复报）。第一段预算只升文案，不叫这里。
     pub fn timeout_if_due(&mut self, now: Instant) -> Option<(Op, NoticeOutcome)> {
         let op = self.pending?;
-        if !self.stage.over_budget(now) {
+        if !self.stage.past_hard_cap(now) {
             return None;
         }
         let outcome = NoticeOutcome::TimedOut;
@@ -529,18 +549,26 @@ mod tests {
             waiting_text(stage, now + Duration::from_secs(5)).expect("等待态必须有文案");
         assert!(progress.contains("优雅停止"), "实际：{progress}");
         assert!(hint.contains("15 秒"), "提示里要讲清楚两段：{hint}");
-        assert!(counter.expect("应有计时").contains("已等 5.0 秒"));
+        assert!(counter.expect("应有计时").contains("已等   5 秒"));
 
         // 第 20 秒：强制段（>15s 且 <=25s）。
         let (progress, _, _) =
             waiting_text(stage, now + Duration::from_secs(20)).expect("仍在等待");
         assert!(progress.contains("强制结束"), "实际：{progress}");
 
-        // 第 30 秒：超预算。
+        // 第 30 秒：过了第一段预算——**只升一句**，明说不会因此判失败。
         let (progress, _, counter) =
             waiting_text(stage, now + Duration::from_secs(30)).expect("仍在等待");
-        assert!(progress.contains("超出 25 秒预算"), "实际：{progress}");
-        assert!(counter.expect("应有计时").contains("超出预算"));
+        assert!(progress.contains("面板侧预算已过"), "实际：{progress}");
+        let counter = counter.expect("应有计时");
+        assert!(counter.contains("仍在等 SCM 回话"), "实际：{counter}");
+        assert!(counter.contains("不会因此判失败"), "实际：{counter}");
+
+        // 第 121 秒：到面板侧硬上限，才允许说「等累了」，且必须声明不是系统结论。
+        let (_, _, counter) =
+            waiting_text(stage, now + UI_HARD_CAP + Duration::from_secs(1)).expect("仍在等待");
+        let counter = counter.expect("应有计时");
+        assert!(counter.contains("不是 SCM 的结论"), "实际：{counter}");
     }
 
     #[test]
@@ -636,22 +664,80 @@ mod tests {
     }
 
     #[test]
-    fn card_times_out_once_and_says_so() {
+    fn first_stage_budget_escalates_but_never_finishes() {
         let mut card = ServiceCard::new();
         card.begin(Op::Stop);
         let now = match card.stage() {
             Stage::Waiting { since, .. } => since,
             Stage::Idle => unreachable!(),
         };
-        // 预算内：不收尾。
-        assert!(card.timeout_if_due(now + Duration::from_secs(20)).is_none());
-        // 超预算：收尾一次。
-        let first = card
-            .timeout_if_due(now + Duration::from_secs(26))
-            .expect("应报超时");
-        assert_eq!(first.1, NoticeOutcome::TimedOut);
+        // 26s（已过 25s 第一段）：升文案，但**不收尾、不报失败**——SCM 只是慢，不是没做成。
+        assert!(card.timeout_if_due(now + Duration::from_secs(26)).is_none());
+        assert_eq!(card.pending(), Some(Op::Stop), "第一段不许清掉等待态");
+        assert!(card.notice().is_none(), "第一段不许写结果提示");
+        assert!(card.stage().escalated(now + Duration::from_secs(26)));
+        assert!(!card.stage().past_hard_cap(now + Duration::from_secs(26)));
+        // 期间 SCM 回话仍必须如实呈现：31s 时到位 → 判成功，而不是「超时」。
+        let done = card
+            .observe(Some(ServiceState::Stopped))
+            .expect("SCM 到位就该判成功");
+        assert_eq!(done, (Op::Stop, NoticeOutcome::Done));
+    }
+
+    #[test]
+    fn hard_cap_finishes_but_says_it_is_not_scm_s_conclusion() {
+        let mut card = ServiceCard::new();
+        card.begin(Op::Install);
+        let now = match card.stage() {
+            Stage::Waiting { since, .. } => since,
+            Stage::Idle => unreachable!(),
+        };
+        assert!(card
+            .timeout_if_due(now + UI_HARD_CAP - Duration::from_secs(1))
+            .is_none());
+        let (op, outcome) = card
+            .timeout_if_due(now + UI_HARD_CAP + Duration::from_secs(1))
+            .expect("到硬上限才收尾");
+        assert_eq!((op, outcome), (Op::Install, NoticeOutcome::TimedOut));
+        let (tone, message) = card.notice().expect("必须有提示");
+        assert_eq!(*tone, NoticeTone::Info, "面板等累了不是失败，不许染红");
+        assert!(
+            message.contains("不是 SCM 的结论"),
+            "必须写明这是面板侧预算：{message}"
+        );
+        assert!(message.contains("120"), "把硬上限秒数写出来：{message}");
         // 不重复报。
-        assert!(card.timeout_if_due(now + Duration::from_secs(40)).is_none());
+        assert!(card
+            .timeout_if_due(now + Duration::from_secs(200))
+            .is_none());
+    }
+
+    #[test]
+    fn counter_text_keeps_a_stable_width() {
+        // 等宽惰性：秒数从 1 位涨到 3 位，整行长度不变（否则卡片每秒抖一下）。
+        let mut card = ServiceCard::new();
+        card.begin(Op::Start);
+        let now = match card.stage() {
+            Stage::Waiting { since, .. } => since,
+            Stage::Idle => unreachable!(),
+        };
+        let sample = |secs: u64| {
+            let (_, _, counter) = waiting_text(card.stage(), now + Duration::from_secs(secs))
+                .expect("等待态必须有文案");
+            counter.expect("等待态第三行（计数）必须有")
+        };
+        // 同一档内秒数变化（1 位 → 2 位 → 3 位）行宽必须一致；跨档文案本来就不同，不比宽度。
+        for tier in [[1u64, 9, 10], [40, 65, 99], [121, 130, 200]] {
+            let widths: Vec<usize> = tier.iter().map(|s| sample(*s).chars().count()).collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "同档秒数变化不许改变行宽：{tier:?} → {widths:?}"
+            );
+        }
+        // 三段文案各自要能自证性质（未过预算 / 已过预算但未收尾 / 已到硬上限）。
+        assert!(!sample(5).contains("预算"));
+        assert!(sample(65).contains("不会因此判失败"));
+        assert!(sample(125).contains("不是 SCM 的结论"));
     }
 
     #[test]

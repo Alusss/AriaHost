@@ -845,7 +845,9 @@ impl PanelApp {
         };
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let timeout = op.budget();
+        // 两段式预算（task-57）：提权/助手进程的等待上限用**第二段**硬上限。
+        // 第一段（op.budget() = 25~30s）只让界面升一句告警，**不收尾、不判失败**。
+        let timeout = service::UI_HARD_CAP;
         let spawned = std::thread::Builder::new()
             .name("ariahost-svc-elevate".to_owned())
             .spawn(move || {
@@ -931,13 +933,20 @@ impl PanelApp {
                 );
             }
             E::WaitTimedOut { waited } => {
+                // 到面板侧硬上限。**不是失败**：授权框可能还在等人点，或者这次授权没被确认。
+                // 语气用 Info，并且必须写明这是面板的判断，不是 SCM 的结论。
                 self.log.push(format!(
-                    "{}：助手进程未在预算内结束（{:.1}s）",
+                    "{}：面板侧等待到上限（{:.1}s），停在这里；服务状态仍以 SCM 为准",
                     op.button(),
                     waited.as_secs_f32()
                 ));
-                self.service_card
-                    .finish(op, service::NoticeOutcome::TimedOut);
+                self.service_card.settle(
+                    service::NoticeTone::Info,
+                    format!(
+                        "面板侧等待已到 {} 秒上限——这不是 SCM 的结论。授权框可能还在等你，或这次授权没被确认；点「刷新状态」核对，必要时再点一次。",
+                        service::UI_HARD_CAP.as_secs()
+                    ),
+                );
             }
         }
         ctx.request_repaint();
