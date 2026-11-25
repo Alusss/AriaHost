@@ -13,8 +13,9 @@
 //! （实测量级：父进程死后 0.5s 内 aria2c 消失）。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use ariahost_common::config::{self as config_layer, Config};
@@ -336,6 +337,52 @@ pub struct CoreHost {
     probe: CoreProbe,
 }
 
+/// 兜底停止入口的登记位（task-59）。
+///
+/// 为什么需要它：`ctl` 线程收到的 `--quit` 可能永远等不到 UI 出帧（实测 1/6），
+/// 那时必须由 ctl 线程自己收尾。但真正的停止链（保存会话 → `aria2.shutdown` → 三段式）
+/// 属于托管线程，它的命令发送端只存在于 UI 线程持有的 [`CoreHost`] 里。
+/// 这里把发送端登记到进程级静态，让 ctl 线程**复用同一条停止链**，而不是另写一套 RPC 调用。
+static STOP_REQUEST: OnceLock<Mutex<Option<Sender<HostCommand>>>> = OnceLock::new();
+/// 托管线程完成一次停止（或确认没有运行时）后置位，供 ctl 兜底路径等待。
+static STOP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 请托管线程优雅停一次，**不依赖 UI 帧**（task-59 兜底路径）。
+///
+/// 返回 `false` = 没有可用的托管线程（自测模式 / 线程起不来 / 已登记过但通道已断），
+/// 调用方据此判断「没有会话要保存，直接退出」。
+///
+/// 只有 Windows 的 ctl 兜底路径会调用（非 Windows 没有命名管道，`serve` 不启动）。
+#[cfg(windows)]
+pub fn request_stop_without_ui() -> bool {
+    let Some(cell) = STOP_REQUEST.get() else {
+        return false;
+    };
+    let Ok(guard) = cell.lock() else {
+        return false;
+    };
+    let Some(commands) = guard.as_ref() else {
+        return false;
+    };
+    STOP_DONE.store(false, Ordering::SeqCst);
+    commands.send(HostCommand::Stop).is_ok()
+}
+
+/// 等托管线程把这次停止做完，最多 `timeout`。返回 `true` = 已停（会话已保存）。
+#[cfg(windows)]
+pub fn wait_stop_done(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if STOP_DONE.load(Ordering::SeqCst) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 impl CoreHost {
     /// 起托管线程。`setup` 源自 [`HostSetup::prepare`]。
     pub fn spawn(log: Arc<LogBuffer>, setup: HostSetup) -> Self {
@@ -347,6 +394,15 @@ impl CoreHost {
         } = setup;
         let (command_tx, command_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
+        // task-59：把停止入口登记到进程级静态，供 ctl 兜底路径在「UI 不出帧」时复用同一条停止链。
+        // 只登记第一次：同一进程只会有一次真实面板启动（单实例锁在前）。
+        let cell = STOP_REQUEST.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = cell.lock() {
+            if guard.is_none() {
+                *guard = Some(command_tx.clone());
+            }
+        }
+        STOP_DONE.store(false, Ordering::SeqCst);
         let thread_log = Arc::clone(&log);
         let spawned = thread::Builder::new()
             .name("ariahost-core".to_owned())
@@ -448,25 +504,30 @@ fn run(
                 });
                 start_once(host, inputs, updates, &log);
             }
-            HostCommand::Stop => match runtime.as_mut() {
-                Some(host) => stop_once(host, updates, &log),
-                // 没起过就直接回「已停止」，让 UI 的忙态能被解开。
-                None => {
-                    emit(
-                        updates,
-                        HostUpdate::bare(HostState::Stopped {
-                            exit_code: None,
-                            forced: false,
-                        }),
-                    );
+            HostCommand::Stop => {
+                match runtime.as_mut() {
+                    Some(host) => stop_once(host, updates, &log),
+                    // 没起过就直接回「已停止」，让 UI 的忙态能被解开。
+                    None => {
+                        emit(
+                            updates,
+                            HostUpdate::bare(HostState::Stopped {
+                                exit_code: None,
+                                forced: false,
+                            }),
+                        );
+                    }
                 }
-            },
+                // task-59：无论有没有运行时，这一次停止已经「做完了」，ctl 兜底路径可以退。
+                STOP_DONE.store(true, Ordering::SeqCst);
+            }
             HostCommand::Shutdown => {
                 if let Some(host) = runtime.as_mut() {
                     let _ = host.stop(&mut |event| {
                         forward(event, updates, &log);
                     });
                 }
+                STOP_DONE.store(true, Ordering::SeqCst);
                 return;
             }
         }

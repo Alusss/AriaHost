@@ -16,17 +16,26 @@
 //!
 //! `ok` 后面带**服务端 pid**：客户端据此等那个进程真的消失，而不是「发完就算成功」。
 //!
-//! ## 收到 quit 之后做什么
+//! ## 收到 quit 之后做什么（task-59：两条路，绝不依赖 UI 出帧）
 //!
-//! **不** `process::exit`，也不自己停 aria2c——只做两件事：
-//! 1. 置位 [`take_quit_request`] 的标记；
-//! 2. `ctx.request_repaint()` 把面板从空闲里叫醒（egui 只在有输入/重绘请求时出帧，
-//!    不叫醒的话这条请求要等到用户动鼠标才被看见）。
+//! 1. 置位 [`take_quit_request`] 的标记 + `ctx.request_repaint()` 叫醒面板；
+//!    立刻回 `ok pid=` 并放开管道（客户端的 10s 预算从发出请求起算，不能被我们的等待吃掉）。
+//! 2. **等 UI 回执**（[`mark_quit_consumed`] 由 `draw()` 在消费后置位）最多 [`CONSUME_WAIT`]。
+//!    - 等到 → 帧路径接手，行为与以前完全一致（`app.rs` 里 `begin_quit(ctx, false)`）。
+//!    - 等不到 → **本线程自己收尾**（[`fallback_quit`]）：请托管线程优雅停一次
+//!      （复用同一条停止链：保存会话 → `aria2.shutdown` → 三段式），最多等 [`FALLBACK_STOP_WAIT`]，
+//!      然后 `process::exit(0)`。aria2c 还有 Job Object（`KILL_ON_JOB_CLOSE`）兜底，不留孤儿。
 //!
-//! 真正的退出（保存会话 → 停 aria2c → 关窗）由面板既有的 exit 档完成：
-//! `app.rs` 里 `begin_quit(ctx, false)` 那条路径。**故意不在这里 `ViewportCommand::Close`**：
-//! 那会被 `ui.close_action` 的三档拦下（tray 档会变成「藏进托盘」，ask 档会弹对话框），
-//! 而卸载要的是「真退」。
+//! 为什么必须有第二条路：`ctx.request_repaint()` 从非 UI 线程发起**不保证一定出帧**
+//! （托盘隐藏 / 窗口被遮挡 / 空闲定时器没排上），而 `take_quit_request` 只在 `draw()` 里被调用。
+//! 真机实测 1/6 次「收到 quit 之后 50 秒没有任何消费行」，安装器的 `--quit` 于是拿到 `timeout`
+//! → 覆盖升级中止并报「仍在运行」。**不做**「直接 exit 不保存」那种更省事的写法：那会丢掉未完成会话。
+//!
+//! 两条路都写文件日志且 target 不同：帧路径是 `panel`（`走退出档`），兜底是 `ctl.fallback`
+//! （`开始收尾` / `停止完成` / `没有可用的托管线程`），排障时看 target 就能判断走了哪条。
+//!
+//! **故意不在这里 `ViewportCommand::Close`**：那会被 `ui.close_action` 的三档拦下
+//! （tray 档会变成「藏进托盘」、ask 档会弹对话框），而卸载要的是「真退」。
 //!
 //! ## DACL
 //!
@@ -42,8 +51,25 @@
 //! 只有「读一行 + 写一行」，微秒级。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+#[cfg(windows)]
+use ariahost_common::logfile;
 
 use crate::logbuf::LogBuffer;
+
+/// 兜底路径的日志 target：文件日志里必须能一眼区分「帧路径」与「兜底路径」。
+pub const FALLBACK_TARGET: &str = "ctl.fallback";
+/// ctl 线程等 UI「已消费 quit」回执的上限；超时即走兜底（task-59）。
+///
+/// 为什么是 2s：正常帧路径的实测是 100–240ms（含一次 repaint 唤醒），2s 已留 8 倍余量；
+/// 而安装器的 `--quit` 预算是 10s，兜底（停止链实测 4.1–4.3s）必须留得下。
+pub const CONSUME_WAIT: Duration = Duration::from_secs(2);
+/// 兜底路径等托管线程把停止做完的上限。
+///
+/// `CoreRuntime::stop` 自己分三段（优雅 → force → 强杀），实测 4.1–4.3s；15s 是它的兜底上限，
+/// 与 `core_host::STOP_EXPECTED_SECS` 的口径一致——**不缩短**，缩短会在慢盘上丢掉会话保存。
+pub const FALLBACK_STOP_WAIT: Duration = Duration::from_secs(15);
 
 /// 客户端唯一支持的指令。
 pub const QUIT: &str = "quit";
@@ -89,12 +115,86 @@ pub fn parse_ack_pid(ack: &str) -> Option<u32> {
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// 服务端是否已启动（幂等保护，避免自测/重建窗口时起两条线程抢同一个管道）。
 static SERVING: AtomicBool = AtomicBool::new(false);
+/// 「UI 已消费掉这次 quit」的回执位（task-59）。
+///
+/// 存在的理由：`ctx.request_repaint()` 从非 UI 线程发起**不保证一定出帧**
+/// （托盘隐藏 / 窗口被遮挡 / 空闲定时器没被排上），而 `take_quit_request` 只在 `draw()` 里被调用。
+/// 一旦那一帧没发生，标志就永远躺着、进程永不退出（真机实测 1/6 复现，日志可证：
+/// 「收到 quit，已交给面板退出流程」之后 50 秒没有消费行）。
+/// 所以：ctl 线程置位后**等这个回执**，等不到就自己收尾——退出路径不再以「一定会出帧」为前提。
+static QUIT_CONSUMED: AtomicBool = AtomicBool::new(false);
 
 /// 面板每帧调用一次：取走「收到过 quit」这件事（只返回一次 `true`）。
 ///
 /// 与 [`serve`] 同一份进程内状态，所以 UI 线程读它不需要锁。
 pub fn take_quit_request() -> bool {
     QUIT_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// UI 消费掉 quit 后调用（`app.rs::draw` 里紧跟 [`take_quit_request`]）：给 ctl 线程回执。
+pub fn mark_quit_consumed() {
+    QUIT_CONSUMED.store(true, Ordering::SeqCst);
+}
+
+/// 等 UI 回执，最多 `timeout`。`true` = 帧路径已接手，ctl 线程不必兜底。
+///
+/// 用固定小步轮询而不是条件变量：ctl 线程本来就在串行 accept 里阻塞，20ms 轮询既不耗 CPU，
+/// 也不引入新的同步原语——这条路径只在真的来了 `--quit` 时才会走到。
+pub fn wait_quit_consumed(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if QUIT_CONSUMED.load(Ordering::SeqCst) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 兜底收尾（task-59）：ctl 线程自己把会话存好、把 aria2 停掉，然后退出。
+///
+/// **不做**「直接 exit 不保存」：那会把未完成会话丢掉。若根本没有托管的运行时
+/// （面板没起过 aria2 / 线程没起来 / 自测），没有会话要存，直接退即可。
+///
+/// 退出码恒为 0：对客户端来说「进程消失了」就是成功；真正的失败信息在日志里，
+/// 客户端契约（成功 0 / 拒绝 1 / 超时 2）不因兜底而变。
+#[cfg(windows)]
+fn fallback_quit(log: &std::sync::Arc<LogBuffer>) {
+    log.push_level(
+        logfile::Level::Warn,
+        FALLBACK_TARGET,
+        "ctl.fallback: 开始收尾（保存会话 → aria2.shutdown → exit 0）".to_owned(),
+    );
+    if !crate::core_host::request_stop_without_ui() {
+        log.push_level(
+            logfile::Level::Warn,
+            FALLBACK_TARGET,
+            "ctl.fallback: 没有可用的托管线程（aria2 未托管）→ 直接退出，无会话需保存".to_owned(),
+        );
+        std::process::exit(0);
+    }
+    log.push_level(
+        logfile::Level::Info,
+        FALLBACK_TARGET,
+        format!("ctl.fallback: 已请求托管线程优雅停止，最多等 {FALLBACK_STOP_WAIT:?}"),
+    );
+    if crate::core_host::wait_stop_done(FALLBACK_STOP_WAIT) {
+        log.push_level(
+            logfile::Level::Info,
+            FALLBACK_TARGET,
+            "ctl.fallback: 停止完成（会话已保存、aria2.shutdown 已发）→ exit 0".to_owned(),
+        );
+    } else {
+        log.push_level(
+            logfile::Level::Warn,
+            FALLBACK_TARGET,
+            "ctl.fallback: 等满预算仍未停完 → exit 0（aria2c 由 Job Object KILL_ON_JOB_CLOSE 兜底）"
+                .to_owned(),
+        );
+    }
+    std::process::exit(0);
 }
 
 /// 是否已经起了服务端（自检与排障用）。
@@ -292,8 +392,11 @@ mod platform {
 
             let line = read_line(handle);
             let request = parse_request(&line);
+            let mut quit = false;
             match &request {
                 Request::Quit => {
+                    quit = true;
+                    QUIT_CONSUMED.store(false, Ordering::SeqCst);
                     QUIT_REQUESTED.store(true, Ordering::SeqCst);
                     log.push(
                         "控制管道：收到 quit，已交给面板退出流程（保存会话 → 停 aria2c → 关窗）"
@@ -306,6 +409,8 @@ mod platform {
                     log.push(format!("控制管道：未知指令 {command:?}，已拒绝"));
                 }
             }
+            // 先回答、先放开管道：客户端的 10s 预算是从发出请求起算的，
+            // 不能让它把 2s 的回执等待也算进去。
             let ack = ack_line(&request, std::process::id());
             if !write_line(handle, &ack) {
                 log.push("控制管道：应答写不出去（客户端可能已断开）".to_owned());
@@ -313,6 +418,24 @@ mod platform {
             unsafe {
                 DisconnectNamedPipe(handle);
                 CloseHandle(handle);
+            }
+            // task-59：等 UI 回执。等到 = 帧路径接手（行为与以前一致）；
+            // 等不到 = 那一帧没发生（实测 1/6），由 ctl 线程自己收尾，绝不把退出挂在出帧上。
+            if quit {
+                if wait_quit_consumed(CONSUME_WAIT) {
+                    log.push_level(
+                        logfile::Level::Info,
+                        FALLBACK_TARGET,
+                        format!("ctl.fallback: 未启用（帧路径已在 {CONSUME_WAIT:?} 内接手）"),
+                    );
+                } else {
+                    log.push_level(
+                        logfile::Level::Warn,
+                        FALLBACK_TARGET,
+                        format!("ctl.fallback: {CONSUME_WAIT:?} 内没有出帧回执，改由 ctl 线程收尾"),
+                    );
+                    fallback_quit(&log);
+                }
             }
         }
     }

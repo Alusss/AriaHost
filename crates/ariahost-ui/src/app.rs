@@ -3277,6 +3277,9 @@ impl PanelApp {
         // 控制管道（M3-f）：`ariahost --quit` 由 ctl 线程置位，这里消费并走退出档。
         // 必须放在最前面：晚一帧消费就可能让客户端多等一轮握手。
         if self.quit.is_none() && crate::ctl::take_quit_request() {
+            // task-59：先给 ctl 线程回执，再走退出流程。ctl 等到这份回执就不再兜底；
+            // 等不到（那一帧没发生）它会自己收尾，所以这一行是「帧路径」的确认位，不能省。
+            crate::ctl::mark_quit_consumed();
             self.log
                 .push("控制管道：收到 quit，走退出档（保存会话 → 停 aria2c → 关窗）".to_owned());
             self.begin_quit(ui.ctx(), false);
