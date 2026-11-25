@@ -29,6 +29,7 @@ pub mod clean;
 pub mod download;
 pub mod error;
 pub mod fetch;
+pub mod history;
 pub mod http;
 pub mod release;
 pub mod runtime;
@@ -49,6 +50,10 @@ pub use download::{
 pub use error::{CoreError, LineAttempt};
 pub use fetch::{
     known_sha256, parse_version_arg, verify_hash, FetchOutcome, Fetcher, HashState, KNOWN_SHA256,
+};
+pub use history::{
+    History, HistoryEntry, HistoryError, HistorySource, HistoryStats, HistoryStatus, LoadOutcome,
+    RecordOutcome, HISTORY_FILE, HISTORY_ROTATED, MAX_ENTRIES,
 };
 pub use http::{
     fetch_json, fetch_zip, HttpClient, HttpOptions, HttpReply, DEFAULT_MAX_BODY, DEFAULT_TIMEOUT,

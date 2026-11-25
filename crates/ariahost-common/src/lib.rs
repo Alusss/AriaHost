@@ -6,10 +6,12 @@
 pub mod config;
 pub mod error;
 pub mod paths;
+pub mod redact;
 
 pub use config::{Aria2Source, Config, ConfigError, ConfigErrorKind, RpcListen, ServiceMode};
 pub use error::{ErrorCategory, ErrorCode};
 pub use paths::Plane;
+pub use redact::{redact, redact_uri, REDACTED};
 
 /// 产品显示名（窗口标题、日志、安装器共用）。
 pub const PRODUCT_NAME: &str = "AriaHost";
