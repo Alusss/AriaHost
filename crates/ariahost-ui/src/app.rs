@@ -880,7 +880,13 @@ impl PanelApp {
                 |ui| {
                     for group in settings::Group::ALL {
                         let selected = self.settings.group() == group;
-                        if ui.selectable_label(selected, group.label()).clicked() {
+                        // 用真 `Button`（`.selected()` 出高亮）而不是 `selectable_label`：
+                        // 后者在 accesskit 里不作为可执行控件暴露，屏幕阅读器/UIA **点不动**，
+                        // 等于用键盘或辅助技术的人无法切换分组（真机验收时正是卡在这里）。
+                        if ui
+                            .add(egui::Button::new(group.label()).selected(selected))
+                            .clicked()
+                        {
                             self.settings.set_group(group);
                         }
                     }
@@ -1078,26 +1084,22 @@ impl PanelApp {
         ui.add_space(4.0);
 
         // ui.close_action：三档，保存后立即生效。
+        // 用单选按钮而不是下拉：三项本来就该一眼看全，且 `ComboBox` 的弹出项在 accesskit 里
+        // 不是可执行控件（UIA/屏幕阅读器点不动），真机验收与辅助技术都会卡住。
         ui.horizontal(|ui| {
             ui.add_sized([150.0, 18.0], egui::Label::new("关闭按钮行为"));
             let current = self.settings.draft().ui.close_action.clone();
-            let label = close_action_label(&current);
-            egui::ComboBox::from_id_salt("settings_close_action")
-                .selected_text(label)
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    for (value, text) in [
-                        ("tray", "隐藏到托盘（默认）"),
-                        ("ask", "每次询问"),
-                        ("exit", "直接退出（按退出流程停 aria2）"),
-                    ] {
-                        if ui.selectable_label(current == value, text).clicked() {
-                            self.settings.draft_mut().ui.close_action = value.to_owned();
-                            self.settings.revalidate();
-                        }
-                    }
-                });
-            ui.label(RichText::new("默认 tray").weak());
+            for (value, text) in [
+                ("tray", "隐藏到托盘（默认）"),
+                ("ask", "每次询问"),
+                ("exit", "直接退出（按退出流程停 aria2）"),
+            ] {
+                let mut checked = current == value;
+                if ui.radio_value(&mut checked, true, text).changed() && checked {
+                    self.settings.draft_mut().ui.close_action = value.to_owned();
+                    self.settings.revalidate();
+                }
+            }
         });
         if let Some(reason) = self.settings.error("ui.close_action") {
             ui.label(RichText::new(reason.to_owned()).color(tone_color(Tone::Bad)));
@@ -1109,22 +1111,17 @@ impl PanelApp {
         ui.horizontal(|ui| {
             ui.add_sized([150.0, 18.0], egui::Label::new("渲染器 renderer"));
             let current = self.settings.draft().ui.renderer.clone();
-            egui::ComboBox::from_id_salt("settings_renderer")
-                .selected_text(current.clone())
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    for (value, text) in [
-                        ("auto", "auto（默认）"),
-                        ("wgpu", "wgpu"),
-                        ("glow", "glow（逃生口，本构建未编译）"),
-                    ] {
-                        if ui.selectable_label(current == value, text).clicked() {
-                            self.settings.draft_mut().ui.renderer = value.to_owned();
-                            self.settings.revalidate();
-                        }
-                    }
-                });
-            ui.label(RichText::new("默认 auto").weak());
+            for (value, text) in [
+                ("auto", "auto（默认）"),
+                ("wgpu", "wgpu"),
+                ("glow", "glow（逃生口，本构建未编译）"),
+            ] {
+                let mut checked = current == value;
+                if ui.radio_value(&mut checked, true, text).changed() && checked {
+                    self.settings.draft_mut().ui.renderer = value.to_owned();
+                    self.settings.revalidate();
+                }
+            }
         });
         if self.settings.draft().ui.renderer.trim() == "glow" {
             ui.horizontal(|ui| {
@@ -1183,23 +1180,17 @@ impl PanelApp {
         ui.horizontal(|ui| {
             ui.add_sized([150.0, 18.0], egui::Label::new("退出时默认动作"));
             let current = self.settings.draft().lifecycle.quit_default.clone();
-            let label = quit_default_label(&current);
-            egui::ComboBox::from_id_salt("settings_quit_default")
-                .selected_text(label)
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    for (value, text) in [
-                        ("tray", "收进托盘继续下载"),
-                        ("pause", "暂停任务后退出（默认）"),
-                        ("stop", "停止任务后退出"),
-                    ] {
-                        if ui.selectable_label(current == value, text).clicked() {
-                            self.settings.draft_mut().lifecycle.quit_default = value.to_owned();
-                            self.settings.revalidate();
-                        }
-                    }
-                });
-            ui.label(RichText::new("默认 pause").weak());
+            for (value, text) in [
+                ("tray", "收进托盘继续下载"),
+                ("pause", "暂停任务后退出（默认）"),
+                ("stop", "停止任务后退出"),
+            ] {
+                let mut checked = current == value;
+                if ui.radio_value(&mut checked, true, text).changed() && checked {
+                    self.settings.draft_mut().lifecycle.quit_default = value.to_owned();
+                    self.settings.revalidate();
+                }
+            }
         });
         Self::settings_note(
             ui,
@@ -2581,26 +2572,6 @@ impl eframe::App for PanelApp {
 
         self.show_close_prompt(ui.ctx());
         self.maybe_finish_selftest(ui);
-    }
-}
-
-/// 「关闭按钮行为」下拉的中文标签（值域 = 架构 §4.11 第 37 项：tray | ask | exit）。
-fn close_action_label(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "ask" => "每次询问",
-        "exit" => "直接退出",
-        "tray" => "隐藏到托盘",
-        _ => "未知值（将被校验拦下）",
-    }
-}
-
-/// 「退出时默认动作」下拉的中文标签（架构 §7-R 的三种退出选项）。
-fn quit_default_label(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "tray" => "收进托盘继续下载",
-        "stop" => "停止任务后退出",
-        "pause" => "暂停任务后退出",
-        _ => "未知值（将被校验拦下）",
     }
 }
 
