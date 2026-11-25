@@ -476,6 +476,22 @@ fn parse_dimension(raw: &str, label: &str) -> Result<u32, UsageError> {
 /// 的命令，在输出前按需附着父控制台（[`crate::console::ensure_for_cli_output`]）；
 /// 面板与服务两条路径**不附着**——面板要绝对避免「关掉 cmd 窗口就被连带杀掉」，
 /// 服务由 SCM 在 Session 0 拉起、那里根本没有控制台。
+/// 这一次调用要不要初始化文件日志（`ariahost.log`，需求 F11）。
+///
+/// 判据只有一条：**长驻形态才写**。面板（无参或只给 `--backend`）与 `--service` 是用户/SCM
+/// 长期持有的进程，它们的历史值得留；其余全是**安装器或脚本调用的短命助手**（`--quit`、
+/// `--install-service`、`--uninstall-service`、`--service-status`、`--write-aumid`、
+/// `--diagnose`、`--aria2-fetch` 与各 `*-selftest`），它们：
+///
+/// 1. 每次调用都会往**用户看的那份日志**里塞一行，一次卸载就能灌好几行 `quit:`；
+/// 2. 常常跑在权限未定的上下文里（卸载时可能正被拒访问），"打不开日志文件"那条 stderr
+///    噪音会让安装器日志看起来像出错。
+///
+/// `--log-selftest` 不在这里判断：它天生就是测写日志的，在 `main` 里更早的分支就已经初始化。
+pub fn inits_file_log(args: &[String]) -> bool {
+    matches!(parse(args), Ok(Command::Panel { .. } | Command::Service))
+}
+
 pub fn run(args: &[String]) -> i32 {
     match parse(args) {
         Ok(command) => {
@@ -1168,6 +1184,41 @@ mod tests {
                 backend: ariahost_ui::Backend::Auto
             })
         );
+    }
+
+    #[test]
+    fn file_log_inits_only_for_long_lived_forms() {
+        // 长驻：面板（无参 / 只给 --backend）与服务。
+        for args in [vec![], vec!["--backend", "dx12"], vec!["--service"]] {
+            assert!(
+                inits_file_log(&owned(&args)),
+                "长驻形态应初始化文件日志：{args:?}"
+            );
+        }
+        // 短命助手与自检：一律不写文件日志（安装器噪音 / 权限未定上下文）。
+        for args in [
+            vec!["--quit"],
+            vec!["--install-service"],
+            vec!["--uninstall-service"],
+            vec!["--service-status"],
+            vec!["--write-aumid", r"C:\x.lnk"],
+            vec!["--diagnose"],
+            vec!["--diagnose", "--out", r"C:\d"],
+            vec!["--aria2-fetch"],
+            vec!["--aria2-runtime-selftest"],
+            vec!["--panel-selftest"],
+            vec!["--panel-selftest", "--drive", "settings"],
+            vec!["--web-selftest"],
+            vec!["--version"],
+            vec!["--help"],
+            // 用法错误也不写（这一支只打印用法）。
+            vec!["--bogus"],
+        ] {
+            assert!(
+                !inits_file_log(&owned(&args)),
+                "短命形态不该初始化文件日志：{args:?}"
+            );
+        }
     }
 
     #[test]

@@ -10,9 +10,11 @@
 //! 所以 CLI 分支在输出前按需附着父控制台——见 [`console`]。Cargo 的 `[[bin]]` 没有
 //! 「按构建 profile 选子系统」的能力，只能在 crate 根下这个属性，两条路径靠代码弥合。
 //!
-//! **文件日志**（需求 F11）：进程一起来就按平面初始化 `ariahost.log` 写入器（见
-//! [`ariyahost_common::logfile`]），短命助手也留一行痕迹——卸载/升级排障时「安装器到底调没调
-//! `--quit`」正是要看的那一行。
+//! **文件日志**（需求 F11）：只有**长驻形态**（面板、`--service`）初始化 [`
+//! ariahost_common::logfile`] 写入器并留一行启动痕迹。安装器调用的短命助手（`--quit`、
+//! `--install-service` 等）**不写**——否则给用户看的日志会被安装器噪音灌满，而且它们在
+//! 权限未定的上下文里跑，"打不开日志文件"的 stderr 噪音会让安装器日志看起来像出错。
+//! 判据在 [`cli::inits_file_log`]；`--log-selftest` 例外，它自己初始化。
 
 // GUI 子系统：Windows 双击 exe 不再先弹一个控制台黑窗（本批 task-48 的起因）。
 // 非 Windows 一律不加（那是 Windows-only 属性）。
@@ -38,12 +40,10 @@ fn main() {
         std::process::exit(log_selftest(&args[1..]));
     }
 
-    // 文件日志：只在真正干活的模式初始化。`--help`/`--version` 这类纯信息命令不该在用户盘上
-    // 建目录。`--service` 落服务平面（`%ProgramData%`），其余落用户平面（`%APPDATA%`）。
-    let informational = args
-        .iter()
-        .any(|arg| arg == "--help" || arg == "-h" || arg == "--version" || arg == "-V");
-    if !informational {
+    // 文件日志：只有长驻形态（面板 / `--service`）才初始化。安装器与脚本调用的短命助手
+    // 一律不写——理由见模块文档与 [`cli::inits_file_log`]。`--service` 落服务平面
+    // （`%ProgramData%`），面板落用户平面（`%APPDATA%`）。
+    if cli::inits_file_log(&args) {
         let plane = if args.iter().any(|arg| arg == "--service") {
             Plane::Service
         } else {
