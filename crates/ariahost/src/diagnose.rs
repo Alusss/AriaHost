@@ -790,7 +790,9 @@ mod platform {
         unsafe {
             let module = GetModuleHandleW(c"ntdll.dll".as_ptr().cast::<u16>());
             if !module.is_null() {
-                if let Some(address) = GetProcAddress(module, c"RtlGetVersion".as_ptr().cast::<u8>()) {
+                if let Some(address) =
+                    GetProcAddress(module, c"RtlGetVersion".as_ptr().cast::<u8>())
+                {
                     // SAFETY: 地址来自 `GetProcAddress("RtlGetVersion")`，签名与别名一致。
                     let rtl: RtlGetVersionFn = std::mem::transmute(address);
                     let mut info = OSVERSIONINFOW {
