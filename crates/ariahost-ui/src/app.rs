@@ -286,6 +286,8 @@ pub struct PanelApp {
     settings_open: bool,
     /// 设置页编辑状态（首次打开才读盘，之后全是内存副本）。
     settings: crate::settings::Settings,
+    /// 隐藏自检驱动用：本帧绘制出来的控件矩形（键 = 配置键 / 文案 / 分组名）。
+    pub(crate) drive_targets: crate::drive::Targets,
     /// 设置页里「打开配置文件所在目录」等动作的提示（复用 notice 会串味，单独一条）。
     settings_flash: Option<(String, Instant)>,
 }
@@ -293,6 +295,19 @@ pub struct PanelApp {
 impl PanelApp {
     /// 建面板：先装字体、收集运行事实，再起后台线程。
     pub fn new(cc: &eframe::CreationContext<'_>, init: PanelInit) -> Self {
+        Self::build(&cc.egui_ctx, cc.wgpu_render_state.as_ref(), init)
+    }
+
+    /// 隐藏自检驱动用：没有 eframe，也**没有 wgpu 渲染态**（驱动只关心控件与状态）。
+    pub fn for_drive(ctx: &egui::Context, init: PanelInit) -> Self {
+        Self::build(ctx, None, init)
+    }
+
+    fn build(
+        ctx: &egui::Context,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
+        init: PanelInit,
+    ) -> Self {
         let PanelInit {
             log,
             facts,
@@ -308,7 +323,7 @@ impl PanelApp {
             open_web,
         } = init;
 
-        let font = crate::fonts::install(&cc.egui_ctx, &log);
+        let font = crate::fonts::install(ctx, &log);
         log.push(format!(
             "中文字体：{}",
             match font.resolved.as_deref() {
@@ -326,7 +341,7 @@ impl PanelApp {
             atlas_side: atlas_cap,
             ..RuntimeFacts::default()
         };
-        match &cc.wgpu_render_state {
+        match render_state {
             Some(render_state) => {
                 let info = render_state.adapter.get_info();
                 runtime.adapter = info.name.clone();
@@ -456,7 +471,18 @@ impl PanelApp {
             settings_open: false,
             settings: crate::settings::Settings::new(),
             settings_flash: None,
+            drive_targets: crate::drive::Targets::default(),
         }
+    }
+
+    /// 驱动断言用：只读访问设置页状态（**不给可变入口**，防止绕过输入路径改 draft）。
+    pub fn settings_state(&self) -> &crate::settings::Settings {
+        &self.settings
+    }
+
+    /// 设置页是否打开。
+    pub fn settings_page_open(&self) -> bool {
+        self.settings_open
     }
 
     /// 自测灌行模式（不连任何后端）。
@@ -760,20 +786,22 @@ impl PanelApp {
                     let dirty = self.settings.is_dirty();
                     let has_error = self.settings.has_errors();
                     let can_save = dirty && !has_error;
-                    if ui
+                    let save_response = ui
                         .add_enabled(can_save, egui::Button::new("保存"))
-                        .on_hover_text("写入 %APPDATA%\\AriaHost\\config.toml（原子写）")
-                        .clicked()
-                    {
+                        .on_hover_text("写入 %APPDATA%\\AriaHost\\config.toml（原子写）");
+                    self.drive_targets.note("保存", save_response.rect);
+                    if save_response.clicked() {
                         self.save_settings();
                     }
-                    if ui
-                        .add_enabled(dirty, egui::Button::new("撤销更改"))
-                        .clicked()
-                    {
+                    let undo_response =
+                        ui.add_enabled(dirty, egui::Button::new("撤销更改"));
+                    self.drive_targets.note("撤销更改", undo_response.rect);
+                    if undo_response.clicked() {
                         self.settings.undo();
                     }
-                    if ui.button("恢复默认").clicked() {
+                    let reset_response = ui.button("恢复默认");
+                    self.drive_targets.note("恢复默认", reset_response.rect);
+                    if reset_response.clicked() {
                         self.settings.reset_defaults();
                     }
                     ui.separator();
@@ -883,10 +911,10 @@ impl PanelApp {
                         // 用真 `Button`（`.selected()` 出高亮）而不是 `selectable_label`：
                         // 后者在 accesskit 里不作为可执行控件暴露，屏幕阅读器/UIA **点不动**，
                         // 等于用键盘或辅助技术的人无法切换分组（真机验收时正是卡在这里）。
-                        if ui
-                            .add(egui::Button::new(group.label()).selected(selected))
-                            .clicked()
-                        {
+                        let response =
+                            ui.add(egui::Button::new(group.label()).selected(selected));
+                        self.drive_targets.note(group.label(), response.rect);
+                        if response.clicked() {
                             self.settings.set_group(group);
                         }
                     }
@@ -920,6 +948,7 @@ impl PanelApp {
                     .desired_width(width)
                     .hint_text(hint),
             );
+            self.drive_targets.note(key, response.rect);
             if response.changed() {
                 self.settings.set_text(key, text);
             }
@@ -1095,7 +1124,9 @@ impl PanelApp {
                 ("exit", "直接退出（按退出流程停 aria2）"),
             ] {
                 let mut checked = current == value;
-                if ui.radio_value(&mut checked, true, text).changed() && checked {
+                let radio = ui.radio_value(&mut checked, true, text);
+                self.drive_targets.note(text, radio.rect);
+                if radio.changed() && checked {
                     self.settings.draft_mut().ui.close_action = value.to_owned();
                     self.settings.revalidate();
                 }
@@ -1117,7 +1148,9 @@ impl PanelApp {
                 ("glow", "glow（逃生口，本构建未编译）"),
             ] {
                 let mut checked = current == value;
-                if ui.radio_value(&mut checked, true, text).changed() && checked {
+                let radio = ui.radio_value(&mut checked, true, text);
+                self.drive_targets.note(text, radio.rect);
+                if radio.changed() && checked {
                     self.settings.draft_mut().ui.renderer = value.to_owned();
                     self.settings.revalidate();
                 }
@@ -1186,7 +1219,9 @@ impl PanelApp {
                 ("stop", "停止任务后退出"),
             ] {
                 let mut checked = current == value;
-                if ui.radio_value(&mut checked, true, text).changed() && checked {
+                let radio = ui.radio_value(&mut checked, true, text);
+                self.drive_targets.note(text, radio.rect);
+                if radio.changed() && checked {
                     self.settings.draft_mut().lifecycle.quit_default = value.to_owned();
                     self.settings.revalidate();
                 }
@@ -2488,6 +2523,14 @@ impl eframe::App for PanelApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl PanelApp {
+    /// 把一帧画完：真实窗口（`eframe::App::ui`）与隐藏自检驱动
+    /// （`--panel-selftest --drive`）**共用这一条绘制路径**，避免驱动测到的不是产品代码。
+    pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.frames = self.frames.saturating_add(1);
         // 控制管道（M3-f）：`ariahost --quit` 由 ctl 线程置位，这里消费并走退出档。
         // 必须放在最前面：晚一帧消费就可能让客户端多等一轮握手。
@@ -2539,7 +2582,9 @@ impl eframe::App for PanelApp {
                 } else {
                     "设置"
                 };
-                if ui.button(label).clicked() {
+                let entry = ui.button(label);
+                self.drive_targets.note("设置入口", entry.rect);
+                if entry.clicked() {
                     self.toggle_settings();
                 }
             });

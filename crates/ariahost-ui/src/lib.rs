@@ -18,6 +18,7 @@
 mod app;
 mod backend;
 mod core_host;
+mod drive;
 pub mod ctl;
 mod fonts;
 mod instance;
@@ -225,7 +226,7 @@ pub const MAX_SEED_ROWS: usize = 5000;
 
 /// 启动面板（无参数入口）；返回进程退出码。
 pub fn run_panel(backend: Backend, open_web: Option<OpenWebFn>) -> i32 {
-    run(None, None, backend, None, open_web)
+    run(None, None, backend, None, open_web, None)
 }
 
 /// `--panel-selftest [--frames N] [--size WxH] [--backend ...] [--seed-rows N]`：
@@ -239,8 +240,9 @@ pub fn run_selftest(
     size: Option<(u32, u32)>,
     backend: Backend,
     seed_rows: Option<usize>,
+    drive: Option<String>,
 ) -> i32 {
-    run(Some(frames), size, backend, seed_rows, None)
+    run(Some(frames), size, backend, seed_rows, None, drive)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。
@@ -250,6 +252,7 @@ fn run(
     backend: Backend,
     seed_rows: Option<usize>,
     open_web: Option<OpenWebFn>,
+    drive: Option<String>,
 ) -> i32 {
     let log = Arc::new(LogBuffer::new());
     log.push(format!(
@@ -336,6 +339,42 @@ fn run(
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
     let app_facts = Arc::clone(&facts);
+
+    // 隐藏自检驱动（`--panel-selftest --drive <场景>`）：不开窗、不要 wgpu，
+    // 只用 egui 的 RawInput 注入事件跑**同一条绘制路径**（PanelApp::draw）。
+    if let Some(scenario) = drive.as_deref() {
+        let ctx = egui::Context::default();
+        let mut panel = app::PanelApp::for_drive(
+            &ctx,
+            PanelInit {
+                log: Arc::clone(&log),
+                facts: Arc::clone(&facts),
+                lock,
+                selftest_frames,
+                requested_size,
+                atlas_cap: atlas_side,
+                saved_geometry,
+                seed_rows,
+                setup,
+                worker_options,
+                prefs,
+                open_web,
+            },
+        );
+        let lines = match scenario {
+            "settings" => crate::drive::run_settings(&ctx, &mut panel),
+            other => vec![format!("未知驱动场景：{other}（已知：settings）")],
+        };
+        println!("DRIVE scenario={scenario}");
+        for line in &lines {
+            println!("{line}");
+        }
+        let ok = !lines.is_empty()
+            && lines
+                .iter()
+                .all(|line| line.contains("PASS") || line.starts_with("0 "));
+        return if ok { EXIT_OK } else { EXIT_ERR };
+    }
 
     let result = eframe::run_native(
         PRODUCT_NAME,

@@ -55,6 +55,15 @@ pub enum Command {
         /// 灌入多少行假任务（EG-8/EG-9 的 200 行内存闸门）；`None` = 不灌。
         seed_rows: Option<usize>,
     },
+    /// `--panel-selftest --drive <场景>`：隐藏自检入口（不进 `--help`）。
+    ///
+    /// 用 egui 自己的 `RawInput` 注入事件驱动面板的真实绘制路径 —— 不开窗、不要 wgpu、
+    /// 不需要解锁桌面，因此**可以在 CI 里跑**。存在的理由：`egui 0.37` 只消费 accesskit
+    /// 的 `Click`，UIA 对 `TextEdit`/`RadioButton`/`CheckBox` 的驱动全部无效。
+    PanelDrive {
+        /// 场景名（目前只有 `settings`）。
+        scenario: String,
+    },
     /// `--web-selftest`：隐藏自检入口，跑一遍网页管理页的端到端自检（不出现在 `--help`）。
     WebSelftest,
     /// `--service`：ServiceHost。
@@ -337,7 +346,16 @@ fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
                 backend = parsed;
                 index = consumed;
             }
-            "--seed-rows" => {
+            "--drive" => {
+            // 隐藏入口（不进 --help）：用 egui 自己的 RawInput 注入事件跑设置页场景。
+            let Some(value) = rest.get(index + 1) else {
+                return Err(UsageError::new("--drive 需要一个场景名（目前只有 settings）"));
+            };
+            return Ok(Command::PanelDrive {
+                scenario: value.clone(),
+            });
+        }
+        "--seed-rows" => {
                 let value = rest
                     .get(index + 1)
                     .ok_or_else(|| UsageError::new("--seed-rows 缺少行数"))?;
@@ -454,12 +472,19 @@ fn execute(command: &Command) -> i32 {
         // 面板：M2 起真的起窗（eframe/egui + wgpu）。这里不再有「等待回车」的占位逻辑——
         // 双击快捷方式时用户看到的是窗口，不是控制台输出。
         Command::Panel { backend } => ariahost_ui::run_panel(*backend, Some(web_open_hook())),
+        Command::PanelDrive { scenario } => ariahost_ui::run_selftest(
+            0,
+            None,
+            ariahost_ui::Backend::Auto,
+            None,
+            Some(scenario.clone()),
+        ),
         Command::PanelSelftest {
             frames,
             size,
             backend,
             seed_rows,
-        } => ariahost_ui::run_selftest(*frames, *size, *backend, *seed_rows),
+        } => ariahost_ui::run_selftest(*frames, *size, *backend, *seed_rows, None),
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {
