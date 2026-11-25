@@ -270,6 +270,8 @@ pub struct PanelApp {
     window_hidden: bool,
     /// 退出流程（`Some` = 正在「保存会话并停止」）。
     quit: Option<QuitFlow>,
+    /// 已提交关窗（自己发的那次 Close 要放行，否则会陷入 CancelClose 循环）。
+    exit_committed: bool,
     /// 「ask」档的面板内关闭对话框。
     close_prompt: Option<ClosePrompt>,
     /// 启动时检测到的未完成任务数（信息条用；`None` = 不显示）。
@@ -445,6 +447,7 @@ impl PanelApp {
             tray_tried: false,
             window_hidden: false,
             quit: None,
+            exit_committed: false,
             close_prompt: None,
             session_pending: None,
             open_web,
@@ -623,6 +626,8 @@ impl PanelApp {
             self.quit = None;
             // 先让本帧把几何写盘，再关窗：退出后不该丢窗口位置。
             self.quit_save_pending = true;
+            // 标记「已提交关窗」：下一次 close_requested 是我们自己发的，pump_close 必须放行。
+            self.exit_committed = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -633,6 +638,12 @@ impl PanelApp {
     /// 点 X 的处理（三档；自测与灌行模式直接放行）。
     fn pump_close(&mut self, ctx: &egui::Context) {
         if self.selftest_mode() || self.seed_mode() || self.quit.is_some() {
+            return;
+        }
+        // 退出流程已经决定关窗：这一帧的 close_requested 就是**我们自己**发的那次 Close，
+        // 必须放行。否则会「CancelClose → 重新 begin_quit → 再 Close」无限循环：
+        // 实测症状是 aria2 已停、面板停在「已停止」，但进程永不退出（M2-3 真机验收抓到的）。
+        if self.exit_committed {
             return;
         }
         if !ctx.input(|input| input.viewport().close_requested()) {
