@@ -326,3 +326,23 @@ Get-Counter '\Process(ariahost)\Working Set - Private'
 
 ---
 
+
+### 6.16 每个**架构目标**都要真编一次；packed 结构体字段禁取引用
+
+两条同源教训，都来自 2026-11-26 首次 32 位真跑（release run `45663151807`）。
+
+**（1）x64 绿不代表 i686 绿，且 `check` 就能抓住一部分**
+同一次双腿构建里，`构建 x64 per-user` 全绿、`构建 x86 per-user` 红在 Rust 编译。**架构目标是独立的观测对象**，与 §6.4 的「目标 OS 单独跑」并列：`x86_64-pc-windows-msvc` 通过不证明 `i686-pc-windows-msvc` 通过。而这类错误（`E0793`）在 `cargo check --target i686` 阶段就会报——**所以「只做 check 不做 build」并不必然漏掉它，漏掉它的是「根本没对 i686 编过」**。别把「我们跑了 check」当成「我们验过 32 位」，也别把「32 位要跑 test」当成能替代「32 位要编一次」——两者是不同关卡。
+
+**（2）Win32 `pshpack1` 结构体：取字段引用是 UB，不是风格问题**
+`NOTIFYICONDATAW` 在 `shellapi.h` 里由 `#include <pshpack1.h>` 包裹 → **两种架构上都是 1 字节对齐**。对字段取 `&mut`（`fill_wide(&mut data.szTip, …)`）即构造错位引用：
+
+- **x86**：字段偏移变奇数 → `error[E0793]: reference to field of packed struct is unaligned`，编译直接失败；
+- **x64**：恰好落在偶数偏移 → **编译通过但仍是 UB**（「即使从不解引用也是 UB」，rustc 原话）。所以 x64 上长期带着一个不会被发现的隐患。
+
+**正确写法**：`fill_wide(&mut [u16])` 写本地缓冲 → 用 `std::ptr::addr_of_mut!(data.szTip)` 取裸指针 → `copy_nonoverlapping` / `write_unaligned`。**禁止**为绕过它加 `#[allow(...)]`，也禁止把「x64 能编过」当作修好的证据。
+
+**禁用模式扫描**（新代码合入前跑一次，命中即人工核对）：
+```bash
+grep -nE '&(mut )?(data|nid|nidw|obj)\.[a-zA-Z_]+' crates/ariahost-ui/src/
+```
