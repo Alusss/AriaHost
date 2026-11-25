@@ -1,6 +1,6 @@
 //! 面板本体（eframe / egui）。
 //!
-//! M2-2b 起面板能**下载**：顶部是 aria2 核心的状态机与启停按钮，中间是虚拟化任务表
+//! M2 起面板能**下载**：顶部是 aria2 核心的状态机与启停按钮，中间是虚拟化任务表
 //! （EG-8，200 行只用 `body().rows()` 画可见那几十行），下面是新建下载入口，
 //! 折叠区里留着运行信息、输入法自检与内部日志。
 //!
@@ -80,7 +80,11 @@ const BANNER_TIMEOUT: Duration = Duration::from_secs(12);
 const OPTIMISTIC_TTL: Duration = Duration::from_secs(15);
 
 /// 任务行的固定行高（虚拟化步长；`body().rows()` 必须是常数行高才能算可见区间）。
-const ROW_HEIGHT: f32 = 22.0;
+///
+/// UI-Spec §5.4 定版 **32**（原 22）：行内要同时塞进度条与「暂停/继续/移除」三颗按钮，
+/// 22 高时三者互相压着、用户读不动。改这个数只影响可见区间算法，不影响虚拟化口径
+/// （EG-8：仍然只用 `body().rows()` 画可见那几十行，不改成逐行 `ui.horizontal`）。
+const ROW_HEIGHT: f32 = 32.0;
 
 /// 起窗后收集到的运行事实：面板信息区显示，`--panel-selftest` 用它打印机器可读行。
 #[derive(Debug, Clone, Default)]
@@ -1128,7 +1132,7 @@ impl PanelApp {
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Windows 服务");
+                    ui.label(RichText::new("Windows 服务").font(subtitle_font(ui)));
                     ui.label(
                         RichText::new("把 aria2 装成系统服务：开机自启，面板关掉也能继续下载")
                             .weak(),
@@ -1170,7 +1174,7 @@ impl PanelApp {
                 RichText::new(label)
                 .strong()
                 // 字号只从 `text_styles` 阶梯取（§2.2 规则 1），不写字面量字号。
-                .font(egui::TextStyle::Heading.resolve(ui.style()))
+                .font(subtitle_font(ui))
                 .color(color),
             );
             self.drive_targets.note("服务状态", badge.rect);
@@ -2148,7 +2152,7 @@ impl PanelApp {
             badge(ui, &view);
             ui.label(RichText::new(&view.headline).strong());
             if busy {
-                ui.add(egui::Spinner::new().size(14.0));
+                ui.add(egui::Spinner::new());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.main_buttons(ui, running, busy, ready);
@@ -2777,7 +2781,7 @@ impl PanelApp {
         let mut quit_now = false;
 
         ui.horizontal(|ui| {
-            ui.heading(format!("任务（{total}）"));
+            ui.label(RichText::new(format!("任务（{total}）")).font(subtitle_font(ui)));
             if self.tasks_truncated {
                 ui.label(
                     RichText::new(format!("仅显示每类前 {} 条", tasks::MAX_ROWS_PER_BUCKET))
@@ -3194,7 +3198,8 @@ impl PanelApp {
     /// 当前窗口客户区的物理像素尺寸（= eframe 交给交换链的 extent）。
     fn physical_window_size(&self, ui: &egui::Ui) -> (u32, u32) {
         let scale = ui.ctx().pixels_per_point();
-        let points = ui.max_rect().size();
+        let rect = ui.max_rect();
+        let points = egui::vec2(rect.width(), rect.height());
         (
             (points.x * scale).round().max(0.0) as u32,
             (points.y * scale).round().max(0.0) as u32,
@@ -3618,6 +3623,14 @@ impl PanelApp {
         self.show_close_prompt(ui.ctx());
         self.maybe_finish_selftest(ui);
     }
+}
+
+/// 二级标题用的字号（`AriaSubtitle` 16pt）。
+///
+/// 一屏只允许**一个** `Heading`：壳里的页面标题（`{产品名} · {页面}`）。屏内的小标题
+/// 一律降到这一档，否则「标题」失去层级含义（§2.1 / §6）。
+fn subtitle_font(ui: &egui::Ui) -> egui::FontId {
+    egui::TextStyle::Name("AriaSubtitle".into()).resolve(ui.style())
 }
 
 /// 内联错误条的语气 → 落盘级别（task-58）。

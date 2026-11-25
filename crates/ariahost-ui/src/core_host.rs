@@ -1,4 +1,4 @@
-//! aria2c 运行时托管（面板侧，M2-2b）。
+//! aria2c 运行时托管（面板侧，M2）。
 //!
 //! [`ariahost_core::CoreRuntime`] 是**阻塞** API：`start` 会轮询到 RPC 就绪（上限 15s），
 //! `stop` 会等三段优雅停止（实测停止一次 4.2s，其中 4.1s 是 aria2c 自己的关闭延迟）。

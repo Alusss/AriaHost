@@ -1,7 +1,7 @@
 //! 状态区的最小视图模型（徽章 + 语气 + 错误码 + 主文案 + 详情 + 下一步）。
 //!
 //! M2-1 时它长在 `worker.rs` 里（那时只有 aria2 RPC 与服务两条线）；
-//! M2-2b 起 `core_host`（本进程托管的 aria2c）也要产出同一形状，所以抽成独立模块，
+//! M2 起 `core_host`（本进程托管的 aria2c）也要产出同一形状，所以抽成独立模块，
 //! 避免「core_host 反过来 import worker」这种方向倒置。
 //!
 //! 硬约束：**这里永远不出现 aria2/SCM 的原始输出**（`RpcCallError::detail` 是 IO 原文，
