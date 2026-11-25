@@ -33,11 +33,14 @@
 ;
 ;  ---- M3 批次（2026-11-25）改了什么 --------------------------------------
 ;     A. 组件页新增可选「同时注册为 Windows 服务」：默认不勾；勾选后 per-user 包
-;        用 runas 调 --install-service（单次 UAC），**等真实退出码**，失败只提示
-;        不中止安装（Function RegisterServiceIfRequested）。
+;        用 runas 调 --install-service（单次 UAC），**成败以 SCM 为准**
+;        （`sc query AriaHost` 查到即成功；%TEMP% 回执只用来区分"取消 UAC"与
+;        "确定失败"，两者都没有时只能说"未确认"），失败只提示不中止安装。
 ;     B. 每个快捷方式建完都写 AUMID（!macro WriteAumidFor），失败只记日志。
 ;     C. 卸载顺序固定为：注销服务 → 停 ariahost（等 2s 收 aria2c）→ 删快捷方式/
 ;        注册表 → 删 $INSTDIR → 用户数据默认保留（问过才删）。
+;        残留的 aria2c 只在其映像路径位于 AriaHost 数据目录下时才 taskkill，
+;        否则只告警（可能是用户自己的 aria2 实例，杀了是数据损失）。
 ;     D. 升级停进程改成「--quit + 每 250ms 真实复查，最多约 10s」，不再 Sleep 假同步。
 ;     另：删除 A6 的 HidePerUserServiceSection（per-user 现在可以注册服务）。
 ;
@@ -213,6 +216,36 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
   ${EndIf}
 !macroend
 
+; ---- 通用：去掉字符串首尾的 CR/LF/空格 ------------------------------------
+; cmd 的 echo、sc/tasklist/wmic 的输出都带行尾换行（wmic 还会在前面空一行），
+; 比较前必须先裁掉。首部用 `StrCpy … 1024 1` 逐字符前移（NSIS 不支持"取剩余全部"）。
+; 入参：!macro 参数 VAR = **变量名**（例如 `$R7`，文本替换，不是值）
+; 副作用：使用 $R2 作临时字符（调用方不要同时依赖 $R2）
+!macro TrimEol VAR
+  ; 尾部
+  ${Do}
+    StrCpy $R2 ${VAR} 1 -1
+    ${If} $R2 == "$\r"
+    ${OrIf} $R2 == "$\n"
+    ${OrIf} $R2 == " "
+      StrCpy ${VAR} ${VAR} -1
+    ${Else}
+      ${ExitDo}
+    ${EndIf}
+  ${Loop}
+  ; 首部
+  ${Do}
+    StrCpy $R2 ${VAR} 1
+    ${If} $R2 == "$\r"
+    ${OrIf} $R2 == "$\n"
+    ${OrIf} $R2 == " "
+      StrCpy ${VAR} ${VAR} 1024 1
+    ${Else}
+      ${ExitDo}
+    ${EndIf}
+  ${Loop}
+!macroend
+
 ; ---- 通用：停掉正在运行的实例（不 Sleep 假同步）---------------------------
 ; MODE = "install"：安装/覆盖前调用。检测到在跑 → 提示 → --quit → **每 250ms
 ;        真实复查**最多约 10s；仍活着才 Abort（否则 File 必然失败）。
@@ -277,7 +310,54 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
     Sleep 2000
     !insertmacro ProcessIsRunning aria2c.exe 10
     ${If} $R7 == "1"
-      DetailPrint "警告：检测到仍在运行的 aria2c.exe，不做强制结束（可能是用户自己的 aria2 进程）。若 $INSTDIR 删除不完整，请结束该进程后手工删除。"
+      ; 残留的 aria2c 可能是用户自己的实例（甚至是别的下载器的），**不能无条件 kill**：
+      ; 只有能证明它的映像路径在 AriaHost 的两个数据目录下时才结束它。
+      ; 路径来源：wmic（Win10 1809+ 自带；Win11 24H2 起可能已移除 → 取不到就只告警）。
+      DetailPrint "检测到 aria2c.exe 仍在运行，正在判定它是否属于 AriaHost…"
+      nsExec::ExecToStack "wmic process where $\"name='aria2c.exe'$\" get ExecutablePath /value"
+      Pop $R6          ; wmic 退出码
+      Pop $R5          ; 输出，形如 "ExecutablePath=C:\…\aria2c.exe"（多个进程会有多行）
+      !insertmacro TrimEol $R5
+
+      ; 只处理单实例形态（首行 ExecutablePath=…）；多行/空/无 wmic 都算"不确定"
+      StrCpy $R8 $R5 15
+      ${If} $R8 != "ExecutablePath="
+        DetailPrint "警告：无法取得 aria2c.exe 的映像路径（wmic 不可用或存在多个实例），不做结束；若 $INSTDIR 删除不完整，请手工处理。"
+      ${Else}
+        StrCpy $R5 $R5 1024 15      ; 跳过 "ExecutablePath=" 前缀，$R5 = 纯路径
+        ; 用户平面：$LOCALAPPDATA\AriaHost\（当前上下文即当前用户）
+        StrCpy $R3 "$LOCALAPPDATA\${APP_NAME}\"
+        ; 服务平面：%ProgramData%\AriaHost\（SetShellVarContext all 时 $APPDATA 指向 ProgramData）
+        SetShellVarContext all
+        StrCpy $R4 "$APPDATA\${APP_NAME}\"
+        !ifdef PER_MACHINE
+          ; 全机变体本来就保持 all
+        !else
+          SetShellVarContext current
+        !endif
+
+        StrLen $R9 "$R3"
+        StrCpy $R8 $R5 $R9
+        ${If} $R8 == "$R3"
+          StrCpy $R7 1
+        ${Else}
+          StrLen $R9 "$R4"
+          StrCpy $R8 $R5 $R9
+          ${If} $R8 == "$R4"
+            StrCpy $R7 1
+          ${Else}
+            StrCpy $R7 0
+          ${EndIf}
+        ${EndIf}
+
+        ${If} $R7 == "1"
+          DetailPrint "结束本产品的 aria2c.exe（$R5）：taskkill /F /IM aria2c.exe"
+          nsExec::ExecToLog 'taskkill /F /IM aria2c.exe'
+          Sleep 500
+        ${Else}
+          DetailPrint "警告：aria2c.exe（$R5）不在 AriaHost 数据目录下，很可能是你自己启动的实例，不做结束。"
+        ${EndIf}
+      ${EndIf}
     ${Else}
       DetailPrint "aria2c.exe 已退出。"
     ${EndIf}
@@ -325,52 +405,71 @@ FunctionEnd
 ;   * `echo 0>file` 会把 0 当成句柄号重定向 → 用括号 `(echo !errorlevel!)>file`。
 ;   * 路径含空格 → 外层再包一层引号并加 `/S`（cmd /S 会恰好剥掉最外层引号）。
 ;   * 失败**绝不**中止安装：面板与 headless 形态仍可用。
+;
+; **成败以 SCM 为唯一事实来源**（2026-11-25 裁决）：
+;   回执文件只能证明"那个 cmd 跑完了并留下了 code"，证明不了服务到底建没建成——
+;   若 UAC 用了**另一个管理员账户**，提权进程的 %TEMP% 是另一个用户的，回执永远读不到，
+;   而服务其实可能已经注册成功。所以：
+;     · 每 500ms 跑一次 `sc query AriaHost`（**查询服务状态不需要管理员权限**），查到即成功；
+;     · 回执只用于区分确定的情况：1223 = 用户取消 UAC；其他非 0 = 确定失败；
+;     · 60s 内 SCM 查不到、回执也没读到 → 只能说"未确认"，**不能说"失败"**。
 Function RegisterServiceIfRequested
   StrCpy $R4 "$TEMP\ariahost-svc-install.rc"
   Delete "$R4"
   DetailPrint "请求提权注册 Windows 服务：$INSTDIR\${APP_EXE} --install-service（可能出现一次 UAC 确认）"
   ; 单行调用：NSIS 没有反斜杠续行（`\` 只在字符串里作字面量），长行必须保持一行。
   ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
-  ; 轮询回执文件（UAC 交互 + CreateService，给到 60s）；不预设它一定成功
-  StrCpy $R5 0
+
+  StrCpy $R5 0     ; 轮次
+  StrCpy $R7 ""    ; 回执内容（空 = 没读到）
+  StrCpy $R9 0     ; 1 = SCM 里已有该服务
   ${Do}
+    ; (1) SCM 是事实来源：查到即成功，立刻退出，不再等回执
+    nsExec::ExecToStack 'sc query ${SVC_NAME}'
+    Pop $R6        ; sc 退出码：0=存在；1060=不存在（sc 自己的退出码就是 1060）
+    Pop $R3        ; sc 输出（不使用，只为配平栈）
+    ${If} $R6 == "0"
+      StrCpy $R9 1
+      ${ExitDo}
+    ${EndIf}
+
+    ; (2) 回执只作提示：读到就停（1223=取消，其余非 0=确定失败，0 则继续等 SCM）
     ${If} ${FileExists} "$R4"
-      ${ExitDo}
+      FileOpen $R8 "$R4" r
+      FileRead $R8 $R7
+      FileClose $R8
+      Delete "$R4"
+      !insertmacro TrimEol $R7
+      ${If} $R7 != "0"
+        ${ExitDo}
+      ${EndIf}
     ${EndIf}
-    Sleep 400
+
+    Sleep 500
     IntOp $R5 $R5 + 1
-  ${LoopWhile} $R5 < 150
+  ${LoopWhile} $R5 < 120   ; 120 × 500ms = 60s
 
-  ${IfNot} ${FileExists} "$R4"
-    DetailPrint "警告：未拿到 --install-service 的回执（大概率是取消了 UAC），服务未注册。"
-    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，但**服务未注册**。$\r$\n$\r$\n可能原因：取消或拒绝了 UAC 授权。$\r$\nAriaHost 仍可正常使用（面板会以 headless 方式托管 aria2）；需要服务时，请打开面板 → 设置 → 「一键装服务」重试。"
-    Return
-  ${EndIf}
-
-  ; 读码并去掉行尾 CR/LF（cmd 的 echo 一定带换行）
-  FileOpen $R6 "$R4" r
-  FileRead $R6 $R7
-  FileClose $R6
-  Delete "$R4"
-  ${Do}
-    StrCpy $R8 $R7 1 -1
-    ${If} $R8 == "$\r"
-    ${OrIf} $R8 == "$\n"
-    ${OrIf} $R8 == " "
-      StrCpy $R7 $R7 -1
-    ${Else}
-      ${ExitDo}
+  ${If} $R9 == 1
+    DetailPrint "服务已注册（sc query ${SVC_NAME} 命中）。服务为手动触发：不会随开机自动运行 aria2。"
+    ${If} $R7 != ""
+    ${AndIf} $R7 != "0"
+      ; 极端情况：服务在，但回执说非 0（例如助手在创建后清理阶段返回失败）
+      DetailPrint "注意：--install-service 回执为 $R7，但 sc query 已能查到服务；以 SCM 为准判成功，建议在面板里确认服务状态。"
     ${EndIf}
-  ${Loop}
-
-  ${If} $R7 == "0"
-    DetailPrint "服务注册成功（--install-service 返回 0）。服务为手动触发：不会随开机自动运行 aria2。"
   ${ElseIf} $R7 == "1223"
     DetailPrint "服务注册被用户取消（Win32 1223 = ERROR_CANCELLED，AH-E5002）。"
-    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，但服务注册被取消。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。需要服务时，请打开面板 → 设置 → 「一键装服务」重试。"
-  ${Else}
-    DetailPrint "服务注册失败（--install-service 返回 $R7）。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，服务注册被取消。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。需要服务时，请打开面板 → 设置 → 「一键装服务」重试。"
+  ${ElseIf} $R7 == "0"
+    ; 助手说成功、但 60s 内 SCM 还没查到：不替用户下结论（分支必须排在 `!= ""` 之前）
+    DetailPrint "助手报告成功，但 sc query ${SVC_NAME} 在 60s 内未命中。"
+    MessageBox MB_OK|MB_ICONINFORMATION "${APP_NAME} 已安装完成。服务注册助手报告成功，但安装程序在 60 秒内没能在系统里查到 ${SVC_NAME} 服务。$\r$\n$\r$\n请在面板 → 设置 里确认「服务」状态；如果显示未安装，点「一键装服务」重试即可。"
+  ${ElseIf} $R7 != ""
+    DetailPrint "服务注册失败（--install-service 返回 $R7，且 sc query 查不到服务）。"
     MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，但服务注册失败（返回 $R7，参见 AH-E5003）。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。$\r$\n需要服务时，可用管理员权限执行：$\r$\n  $\"$INSTDIR\${APP_EXE}$\" --install-service$\r$\n或打开面板 → 设置 → 「一键装服务」。"
+  ${Else}
+    ; 60s 内既没查到服务、也没读到回执：无法判断是取消 UAC、换了账户还是真失败
+    DetailPrint "未确认到服务注册结果（sc query 未命中，且未读到 --install-service 回执）。"
+    MessageBox MB_OK|MB_ICONINFORMATION "${APP_NAME} 已安装完成，但**未能确认**服务是否注册成功。$\r$\n$\r$\n安装程序在 60 秒内既没在系统里查到 ${SVC_NAME} 服务，也没拿到注册助手的返回码（例如 UAC 用了另一个管理员账户时会出现这种情况）。$\r$\n$\r$\n请打开面板 → 设置，查看「服务」状态；需要时点「一键装服务」重试。这不影响 AriaHost 的正常使用。"
   ${EndIf}
 FunctionEnd
 
