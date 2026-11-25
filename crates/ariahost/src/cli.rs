@@ -26,6 +26,7 @@ AriaHost — aria2 Windows 服务管理器
   ariahost --service-status        打印服务状态（单行 JSON，机器可读；未安装也退出 0）
   ariahost --aria2-fetch [版本]    下载并安装 aria2 核心（省略版本 = 最新，如 1.37.0）
   ariahost --quit                  请求运行中的面板实例退出（没实例也算成功，安装器用）
+  ariahost --diagnose [--out 目录] 导出脱敏诊断包（zip；默认放 %LOCALAPPDATA%\\AriaHost\\diagnose）
   ariahost --version | -V          显示版本
   ariahost --help | -h             显示本帮助
 
@@ -92,6 +93,11 @@ pub enum Command {
     },
     /// `--quit`：请求已有实例退出（短命助手）。
     Quit,
+    /// `--diagnose [--out <dir>]`：导出脱敏诊断包（F11；纯只读 + 写一个 zip）。
+    Diagnose {
+        /// 输出目录；`None` = `%LOCALAPPDATA%\AriaHost\diagnose`。
+        out: Option<PathBuf>,
+    },
     /// `--version` / `-V`。
     Version,
     /// `--help` / `-h`。
@@ -233,6 +239,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "--install-service" => Command::InstallService,
         "--uninstall-service" => Command::UninstallService,
         "--service-status" => Command::ServiceStatus,
+        "--diagnose" => return parse_diagnose(rest),
         "--quit" => Command::Quit,
         "--version" | "-V" => Command::Version,
         "--help" | "-h" => Command::Help,
@@ -246,6 +253,34 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         )));
     }
     Ok(command)
+}
+
+/// 解析 `--diagnose [--out <dir>]`：唯一的可选参数是输出目录（两种写法都收）。
+fn parse_diagnose(rest: &[String]) -> Result<Command, UsageError> {
+    match rest {
+        [] => Ok(Command::Diagnose { out: None }),
+        [flag, dir] if flag == "--out" => {
+            if dir.trim().is_empty() {
+                return Err(UsageError::new("--out 的目录不能为空"));
+            }
+            Ok(Command::Diagnose {
+                out: Some(PathBuf::from(dir)),
+            })
+        }
+        [single] => match single.strip_prefix("--out=") {
+            Some(dir) if !dir.trim().is_empty() => Ok(Command::Diagnose {
+                out: Some(PathBuf::from(dir)),
+            }),
+            Some(_) => Err(UsageError::new("--out= 后面的目录不能为空")),
+            None => Err(UsageError::new(format!(
+                "--diagnose 只接受 --out <目录>，收到：{single}"
+            ))),
+        },
+        _ => Err(UsageError::new(format!(
+            "--diagnose 只接受 --out <目录>，收到：{}",
+            rest.join(" ")
+        ))),
+    }
 }
 
 /// 解析 `--aria2-runtime-selftest` 的尾部参数：`--seconds N`（默认 5，上限 3600）。
@@ -347,15 +382,17 @@ fn parse_selftest(rest: &[String]) -> Result<Command, UsageError> {
                 index = consumed;
             }
             "--drive" => {
-            // 隐藏入口（不进 --help）：用 egui 自己的 RawInput 注入事件跑设置页场景。
-            let Some(value) = rest.get(index + 1) else {
-                return Err(UsageError::new("--drive 需要一个场景名（目前只有 settings）"));
-            };
-            return Ok(Command::PanelDrive {
-                scenario: value.clone(),
-            });
-        }
-        "--seed-rows" => {
+                // 隐藏入口（不进 --help）：用 egui 自己的 RawInput 注入事件跑设置页场景。
+                let Some(value) = rest.get(index + 1) else {
+                    return Err(UsageError::new(
+                        "--drive 需要一个场景名（目前只有 settings）",
+                    ));
+                };
+                return Ok(Command::PanelDrive {
+                    scenario: value.clone(),
+                });
+            }
+            "--seed-rows" => {
                 let value = rest
                     .get(index + 1)
                     .ok_or_else(|| UsageError::new("--seed-rows 缺少行数"))?;
@@ -500,6 +537,7 @@ fn execute(command: &Command) -> i32 {
         Command::Aria2Fetch { version } => run_aria2_fetch(version.as_deref()),
         Command::RuntimeSelftest { seconds } => run_runtime_selftest(*seconds),
         Command::Quit => run_quit(),
+        Command::Diagnose { out } => run_diagnose(out.as_deref()),
         Command::Version => {
             println!("{BINARY_NAME} {VERSION}");
             EXIT_OK
@@ -525,27 +563,67 @@ const QUIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 /// 硬套 E1/E2/E5 会让排障时按码搜到错的文档；语义已经由退出码 0/1/2 承担。
 fn run_quit() -> i32 {
     let outcome = quit_running_panel();
-    match &outcome {
-        QuitOutcome::Refused(reason) => println!("quit: refused {reason}"),
-        other => println!("quit: {}", other.as_str()),
-    }
-    match &outcome {
-        QuitOutcome::NoInstance => {
-            println!("没有运行中的实例（安装器/升级流程视为成功）");
-        }
-        QuitOutcome::Signalled => {}
-        QuitOutcome::Refused(reason) => {
-            eprintln!("退出请求被拒绝：{reason}");
-            eprintln!("  → 面板与命令行版本可能不一致：装回同一版本后重试");
-        }
-        QuitOutcome::Timeout => {
-            eprintln!("与控制管道握手/等退出超时（{}s）", QUIT_BUDGET.as_secs());
-            eprintln!(
-                "  → 面板可能卡在保存会话：不动它会让下次启动自动降级；急的话在任务管理器结束它"
-            );
-        }
+    println!("{}", quit_stdout_line(&outcome));
+    for line in quit_stderr_lines(&outcome) {
+        eprintln!("{line}");
     }
     outcome.exit_code()
+}
+
+/// `--quit` 的 stdout **只放这一行**：稳定键 + 可选对端应答，纯 ASCII、单行、可全等比对。
+///
+/// 为什么要这条纪律：安装器 `nsExec::ExecToStack` 抓到 stdout 后会经 codepage 转换，
+/// 中文在非 UTF-8 控制台下变成乱码字节；脚本又爱写 `$out -eq 'quit: no-instance'`。
+/// 人看的解释一律走 stderr（与 git 把进度写 stderr 同一个道理）。
+fn quit_stdout_line(outcome: &QuitOutcome) -> String {
+    match outcome {
+        QuitOutcome::Refused(reason) => format!("quit: refused {reason}"),
+        other => format!("quit: {}", other.as_str()),
+    }
+}
+
+/// `--quit` 的中文解释（**全部走 stderr**，四态一致）。
+fn quit_stderr_lines(outcome: &QuitOutcome) -> Vec<String> {
+    match outcome {
+        QuitOutcome::NoInstance => {
+            vec!["没有运行中的实例（安装器/升级流程视为成功）".to_owned()]
+        }
+        QuitOutcome::Signalled => Vec::new(),
+        QuitOutcome::Refused(reason) => vec![
+            format!("退出请求被拒绝：{reason}"),
+            "  → 面板与命令行版本可能不一致：装回同一版本后重试".to_owned(),
+        ],
+        QuitOutcome::Timeout => vec![
+            format!("与控制管道握手/等退出超时（{}s）", QUIT_BUDGET.as_secs()),
+            "  → 面板可能卡在保存会话：不动它会让下次启动自动降级；急的话在任务管理器结束它"
+                .to_owned(),
+        ],
+    }
+}
+
+/// `--diagnose [--out <dir>]`：导出脱敏诊断包（需求 F11）。
+///
+/// 失败**不带 AH 码**：错误码注册表里没有「诊断包导出」段，硬套 E1/E3 会让排障时按码搜到
+/// 错的文档；`--quit` 同此处理。成功时打印绝对路径 + 字节数 + 包内清单（脚本要能拿到路径）。
+fn run_diagnose(out: Option<&Path>) -> i32 {
+    match crate::diagnose::run(out) {
+        Ok(report) => {
+            println!("诊断包已导出：{}", report.path.display());
+            println!("大小：{} 字节", report.bytes);
+            println!("包含 {} 个文件：", report.entries.len());
+            for name in &report.entries {
+                println!("  {name}");
+            }
+            EXIT_OK
+        }
+        Err(detail) => {
+            eprintln!("导出诊断包失败：{detail}");
+            eprintln!(
+                "排查：--out 指到一个存在且可写的目录；不给 --out 时默认放 %LOCALAPPDATA%\\AriaHost\\diagnose。"
+            );
+            EXIT_ERR
+        }
+    }
 }
 
 /// 连控制管道、发 `quit`、等目标进程消失（平台分派）。
@@ -826,7 +904,7 @@ fn run_service_status() -> i32 {
 ///
 /// 取值一律 **kebab-case**：与 `InstallOutcome`（`created`/`already-existed`）、
 /// `UninstallOutcome`（`removed`/`not-installed`）同一套风格，消费者不用猜大小写。
-fn service_status_json(report: &ariahost_svc::ServiceStatusReport) -> String {
+pub(crate) fn service_status_json(report: &ariahost_svc::ServiceStatusReport) -> String {
     let start_type = match report.start_type {
         Some(mode) => format!("\"{}\"", mode.as_str()),
         None => "null".to_owned(),
@@ -1481,6 +1559,81 @@ mod tests {
         );
         // 路径不存在 → 必须**明确失败**（AH-E1001），不能假装写过。
         assert_eq!(run_args(&["--write-aumid", path]), EXIT_ERR);
+    }
+
+    #[test]
+    fn diagnose_takes_an_optional_out_dir() {
+        assert_eq!(
+            parse_args(&["--diagnose"]),
+            Ok(Command::Diagnose { out: None })
+        );
+        assert_eq!(
+            parse_args(&["--diagnose", "--out", r"F:\tmp\diag"]),
+            Ok(Command::Diagnose {
+                out: Some(PathBuf::from(r"F:\tmp\diag"))
+            })
+        );
+        assert_eq!(
+            parse_args(&["--diagnose", "--out=F:/tmp/diag2"]),
+            Ok(Command::Diagnose {
+                out: Some(PathBuf::from("F:/tmp/diag2"))
+            })
+        );
+        // 缺目录值 / 空值 / 不认识的尾参：一律 AH-E1001
+        for bad in [
+            vec!["--diagnose", "--out"],
+            vec!["--diagnose", "--out", "  "],
+            vec!["--diagnose", "--out="],
+            vec!["--diagnose", "extra"],
+            vec!["--diagnose", "--out", "a", "b"],
+        ] {
+            let error = parse_args(&bad).expect_err(&format!("应报用法错误：{bad:?}"));
+            assert_eq!(error.code(), "AH-E1001");
+        }
+    }
+
+    /// `--quit` 的两条通道分工：stdout 只有一行纯 ASCII 稳定键，中文解释一律 stderr。
+    ///
+    /// 这条测试钉的是**通道**而不是文案：安装器抓 stdout 后会经 codepage 转换，
+    /// 中文落到 stdout 会让「全等比对」的脚本永远假红。
+    #[test]
+    fn quit_stdout_is_one_ascii_key_line_and_chinese_goes_to_stderr() {
+        let outcomes = [
+            QuitOutcome::NoInstance,
+            QuitOutcome::Signalled,
+            QuitOutcome::Refused("version-mismatch".to_owned()),
+            QuitOutcome::Timeout,
+        ];
+        for outcome in &outcomes {
+            let line = quit_stdout_line(outcome);
+            assert!(
+                line.starts_with("quit: "),
+                "stdout 行必须以 `quit: ` 开头：{line:?}"
+            );
+            assert!(!line.contains('\n'), "stdout 只能是单行：{line:?}");
+            assert!(
+                line.is_ascii(),
+                "stdout 只放稳定键（中文会让安装器 codepage 转换变乱码）：{line:?}"
+            );
+            let stderr = quit_stderr_lines(outcome);
+            match outcome {
+                QuitOutcome::Signalled => assert!(stderr.is_empty(), "成功且无需解释"),
+                _ => assert!(
+                    stderr.iter().any(|text| !text.is_ascii()),
+                    "中文解释必须走 stderr：{stderr:?}"
+                ),
+            }
+        }
+        // 四态的键值本身也是契约（安装器按它判断）。
+        assert_eq!(
+            quit_stdout_line(&QuitOutcome::NoInstance),
+            "quit: no-instance"
+        );
+        assert_eq!(quit_stdout_line(&QuitOutcome::Signalled), "quit: accepted");
+        assert_eq!(quit_stdout_line(&QuitOutcome::Timeout), "quit: timeout");
+        assert!(
+            quit_stdout_line(&QuitOutcome::Refused("x".to_owned())).starts_with("quit: refused ")
+        );
     }
 
     /// JSON 形状是面板/安装器/脚本的契约：字段顺序、取值、缺值写法都不能变。

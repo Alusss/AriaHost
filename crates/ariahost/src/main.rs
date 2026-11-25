@@ -21,6 +21,7 @@
 mod aumid;
 mod cli;
 mod console;
+mod diagnose;
 
 use ariahost_common::logfile::{self, Level, LOG_FILE_NAME};
 use ariahost_common::paths::{logs_dir, Plane};

@@ -16,7 +16,7 @@ pub mod time;
 
 pub use config::{Aria2Source, Config, ConfigError, ConfigErrorKind, RpcListen, ServiceMode};
 pub use error::{ErrorCategory, ErrorCode};
-pub use logfile::{Level, LOG_FILE_NAME};
+pub use logfile::{parse_line, Level, LogLine, LOG_FILE_NAME};
 pub use paths::Plane;
 pub use redact::{redact, redact_uri, REDACTED};
 pub use time::{utc_stamp, STAMP_LEN};

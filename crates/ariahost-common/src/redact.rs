@@ -31,7 +31,11 @@ const VALUE_END: &[char] = &[
 pub fn redact(message: &str) -> String {
     let text = with_values_redacted(message, "token:", |ch| !VALUE_END.contains(&ch));
     let text = with_values_redacted(&text, "token=", |ch| !VALUE_END.contains(&ch));
-    let text = with_values_redacted(&text, "rpc-secret=", |ch| !VALUE_END.contains(&ch));
+    // `secret:` / `secret=` 同时覆盖 `rpc-secret=`、`rpc_secret=`、`--secret=`
+    // 以及 aria2 自己回显命令行时写出的 `secret=<值>`（真实日志里就出现过这种形状）。
+    let text = with_values_redacted(&text, "secret:", |ch| !VALUE_END.contains(&ch));
+    let text = with_values_redacted(&text, "secret=", |ch| !VALUE_END.contains(&ch));
+    let text = with_values_redacted(&text, "passkey=", |ch| !VALUE_END.contains(&ch));
     let text = with_values_redacted(&text, "urn:btih:", |ch| ch.is_ascii_alphanumeric());
     redact_url_password(&text)
 }
@@ -140,6 +144,24 @@ mod tests {
             "aria2c --rpc-secret=*** --enable-rpc"
         );
         assert_eq!(redact("rpc-secret=another"), "rpc-secret=***");
+    }
+
+    #[test]
+    fn redacts_bare_secret_and_passkey_forms() {
+        // aria2 自己的日志里出现过这种「没有 token:/rpc- 前缀」的回显。
+        assert_eq!(redact("上游 secret=abc123"), "上游 secret=***");
+        assert_eq!(redact("--secret=deadbeef"), "--secret=***");
+        assert_eq!(
+            redact("https://tracker.example/announce?passkey=KEY123&info_hash=x"),
+            "https://tracker.example/announce?passkey=***&info_hash=x"
+        );
+        // 空值 / 后面直接是分隔符：不插入占位符，避免把正常句子改花。
+        assert_eq!(redact("读取 secret 失败"), "读取 secret 失败");
+        assert_eq!(redact("secret="), "secret=");
+        // **已知限制**：`secret:` 后面隔一个空格的值不在这里脱敏——本规则只认「标记紧随值」，
+        // 否则 `secret: 失败` 这种正常句子也会被打码。带空格的形态由调用方按**已知字面值**
+        // 兜底（诊断包的 `scrub` 就是这么做的）。
+        assert_eq!(redact("secret: abc123"), "secret: abc123");
     }
 
     #[test]

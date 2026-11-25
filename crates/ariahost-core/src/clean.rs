@@ -46,6 +46,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ariahost_aria2::parse_version_number;
 use ariahost_common::config::{expand_user_path, CleanSection, Config};
+use ariahost_common::logfile::rotated_index;
 use ariahost_common::paths::{self, Plane};
 
 use crate::store::{ActivePointer, ACTIVE_FILE};
@@ -85,9 +86,6 @@ const MAX_WARNINGS: usize = 8;
 
 /// 安装暂存目录前缀（与 [`crate::store`] 的 `STAGING_PREFIX` 必须一致）。
 const STAGING_PREFIX: &str = ".staging-";
-
-/// 日志轮转标记：`ariahost.log.3` 里的 `.log.`。
-const LOG_ROTATION_MARKER: &str = ".log.";
 
 /// 孤儿控制文件后缀。
 const ORPHAN_SUFFIX: &str = ".aria2";
@@ -1369,15 +1367,6 @@ fn staging_pid(name: &str) -> Option<u32> {
     parts.get(1)?.parse::<u32>().ok()
 }
 
-/// `ariahost.log.3` → `Some(3)`；不是轮转文件返回 `None`。
-fn rotated_index(name: &str) -> Option<u32> {
-    let (_, suffix) = name.rsplit_once(LOG_ROTATION_MARKER)?;
-    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    suffix.parse::<u32>().ok()
-}
-
 /// 是不是孤儿控制文件的候选名（`*.aria2`，大小写不敏感）。
 fn is_orphan_control(path: &Path) -> bool {
     path.file_name()
@@ -2296,10 +2285,14 @@ mod tests {
 
     #[test]
     fn parsed_helpers_are_pinned() {
-        assert_eq!(rotated_index("ariahost.log.3"), Some(3));
-        assert_eq!(rotated_index("ariahost.log"), None);
-        assert_eq!(rotated_index("ariahost.log.abc"), None);
-        assert_eq!(rotated_index("ariahost.log."), None);
+        // 轮转序号**只有一份实现**（`arihost_common::logfile`）：本断言钉的是那一份。
+        // 语义与 M2-6 初版逐字相同（按最后一个 `.log.` 切，后缀非空纯数字），
+        // 换实现不换断言——删掉的只是副本，不是「语义没变」的证明。
+        use ariahost_common::logfile::rotated_index as rotation_index;
+        assert_eq!(rotation_index("ariahost.log.3"), Some(3));
+        assert_eq!(rotation_index("ariahost.log"), None);
+        assert_eq!(rotation_index("ariahost.log.abc"), None);
+        assert_eq!(rotation_index("ariahost.log."), None);
         assert_eq!(staging_pid(".staging-1.38.0-4242-0"), Some(4242));
         assert_eq!(staging_pid(".staging-broken"), None);
         assert!(is_orphan_control(Path::new("a/movie.mkv.aria2")));

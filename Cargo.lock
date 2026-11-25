@@ -211,13 +211,17 @@ dependencies = [
 name = "ariahost"
 version = "0.1.1"
 dependencies = [
+ "ariahost-aria2",
  "ariahost-common",
  "ariahost-core",
  "ariahost-svc",
  "ariahost-ui",
  "ariahost-web",
+ "serde_json",
+ "toml 1.2.2+spec-1.1.0",
  "windows-sys 0.61.2",
  "winresource",
+ "zip",
 ]
 
 [[package]]

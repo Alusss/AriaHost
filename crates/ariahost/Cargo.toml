@@ -23,6 +23,14 @@ ariahost-svc = { path = "../ariahost-svc" }
 ariahost-web = { path = "../ariahost-web" }
 # 面板入口：M2 起「无参数启动」真的开窗（含 --panel-selftest 隐藏自测入口）。
 ariahost-ui = { path = "../ariahost-ui" }
+# M3-e `--diagnose`：直接探一次 RPC（getVersion，2s 超时），不经过 core 的托管层。
+ariahost-aria2 = { path = "../ariahost-aria2" }
+# 诊断包的 state.json / env.json 是机器可读结构：用 serde_json 生成、toml 渲染脱敏配置。
+# 两者都已在 workspace 依赖里（core/common 用过），不新增 crate。
+serde_json = { workspace = true }
+toml = { workspace = true }
+# 诊断包就是 zip：`zip` 已在 workspace 依赖里（core 的 M1-3 解包用），不新增 crate。
+zip = { workspace = true }
 
 # `--write-aumid` 的 COM 调用（`SHGetPropertyStoreFromParsingName` + 手写 IPropertyStore
 # vtable）：只有 Windows 目标需要。特性按需单独开，不摊到其它 crate 上。
@@ -37,4 +45,7 @@ windows-sys = { workspace = true, features = [
     # M3-f `--quit` 客户端：OpenProcess(SYNCHRONIZE) + WaitForSingleObject 等面板真的退出。
     "Win32_System_Threading",
     "Win32_UI_Shell_PropertiesSystem",
+    # M3-e `--diagnose`：TokenElevation（是否管理员）+ GetVersionExW（OS 版本，仅供参考）。
+    "Win32_Security",
+    "Win32_System_SystemInformation",
 ] }

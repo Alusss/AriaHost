@@ -826,6 +826,19 @@ pub fn resolve_secret(config: &mut Config, secret_path: &Path) -> Result<String,
     Ok(generated)
 }
 
+/// 读「当前生效的 RPC secret」，**但绝不生成**（诊断包/只读工具用）。
+///
+/// 与 [`resolve_secret`] 只差一条：secret 既不在配置里、也解不开 `secret.bin` 时返回 `None`，
+/// 而不是造一个新的。诊断包是纯读操作——「导个包把用户的 secret 换掉」会让正在运行的
+/// aria2c（拿着旧 secret）从此全部鉴权失败，属于典型的小工具造成大故障。
+pub fn peek_secret(config: &Config, secret_path: &Path) -> Option<String> {
+    let explicit = config.aria2.rpc.secret.trim();
+    if !explicit.is_empty() {
+        return Some(explicit.to_owned());
+    }
+    read_secret_file(secret_path)
+}
+
 /// 生成 16 字节密码学随机 → 32 位小写 hex。
 pub fn random_secret_hex() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
