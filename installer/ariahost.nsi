@@ -65,11 +65,15 @@
 ;    ariahost.exe --write-aumid <lnk>        自写 IPropertyStore 写 System.AppUserModel.ID
 ;                                            （AUMID 值 AriaHost.Desktop，实现在 exe 内）
 ;    ariahost.exe --quit                     通知已运行实例退出（停止链内完成）
-;  本脚本假设的 --quit 退出码（M1 定稿时确认，若不同只改 QuitRunningInstance）：
-;    0=目标实例已退出 / 1=没有运行中的实例 / 2=超时未退出（其余非 0 同样按失败处理）
+;  本脚本假设的 --quit 退出码（M3 定稿；实测见 docs/dev/release.md §11）：
+;    0=目标实例已退出 **或** 本来就没有运行中的实例（安装器/升级流程视为成功）
+;    1=管道在但请求被拒 / 2=握手或等退出超时（其余非 0 同样按失败处理）
 ;
-;  注意：本脚本**不弹** aria2 来源页（v2.0 决定），也不分发 aria2c.exe；
-;  dist\<arch>\ 里存在 aria2c.exe 时才会一并安装（打包口径见 docs/dev/release.md §7）。
+;  注意：本脚本**不弹** aria2 来源页（v2.0 决定）。**自 task-54（M3-j）起发布包随包分发
+;  aria2c.exe**（在线双线路在真实用户网络不可用）：release.yml 下载官方 zip、硬校验
+;  SHA-256、把 aria2c.exe 放进 dist\<arch>\；本脚本见 ${SRCDIR}\aria2c.exe 即一并安装，
+;  并把 GPLv2 许可文本与 THIRD-PARTY-NOTICES.md 装进 $INSTDIR\licenses\（同进同退）。
+;  发布构建传 /DBUNDLED_ARIA2_REQUIRED 时缺核心即编译失败。口径见 docs/dev/release.md §7。
 ;
 ;  图标管线（2026-11-25 落地）：installer\ariahost.ico 是 7 尺寸
 ;  （16/24/32/48/64/128/256）、32bpp、**非 PNG 压缩**（BMP 条目）的 ICO，由
@@ -296,6 +300,12 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
 ; 为什么等待预算是 15s（原为 40×250ms=10s）：`--quit` 客户端自己的握手/等退出
 ; 预算就是 10s（cli.rs 的 QUIT_TIMEOUT），10s 等于和客户端同刻赛跑——先到的
 ; 那一方随机，属于设计缺陷。加 5s 余量。
+;
+; 已知边界（不改数，仅登记）：面板侧最坏链路约 19s —— 2s 等 UI 线程消费 quit
+; 请求 + 15s 优雅停止（saveSession → shutdown）+ 2s 宽限（见 ariahost-ui/ctl.rs 与
+; app.rs 的退出档）。即「面板有未完成任务且 aria2c 拒不退出」时，15s 预算会先到，
+; 安装器判超时中止（这是**期望**行为：宁可不覆盖也别撞占用）。把预算抬到 19s+
+; 会拉长一切失败路径的静默等待，改数需权衡，故留作单独议题，不在这批里动。
 ;
 ; **2026-11-25 实测修：预算按"墙钟 15s"算，不按轮次算。** 每轮都要 spawn 一次
 ; tasklist（非控制台上下文一次约 100–150ms），所以「N 轮 × 250ms」必然低估真实
@@ -614,9 +624,32 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   ; 图标：与安装器自己、开始菜单/桌面快捷方式、exe 资源共用同一份 ICO
   File "${SRCDIR}\ariahost.ico"
 
-  ; 可选：dist 中存在 aria2c.exe 时一并安装（默认不随包分发，见 docs/dev/release.md §7）
+  ; 内置 aria2c（task-54 A 条）：release.yml 把「已按 SHA-256 硬校验」的 aria2c.exe
+  ; 放进 ${SRCDIR}，用户机器上双击即用，不再依赖首次运行的在线下载（双线路在真实
+  ; 用户网络下不可用，见 docs/dev/known-limitations.md L6）。
+  ; 本地/CI 编译不带该文件也能过（/FileExists 为假 → 不装、不报错）；发布流水线额外
+  ; 传 /DBUNDLED_ARIA2_REQUIRED，此时缺失即编译失败——挡住「忘了放载荷却照样出包」。
 !if /FileExists "${SRCDIR}\aria2c.exe"
   File "${SRCDIR}\aria2c.exe"
+
+  ; 第三方许可与来源说明（GPLv2 二进制分发义务，见 docs/dev/release.md §7）。
+  ;
+  ; 两份文件都**直接取自仓库**（相对本 .nsi 所在目录），不经 release.yml 暂存：
+  ; - `installer\licenses\aria2-COPYING.txt`：GPL-2.0 全文，取自 aria2 release
+  ;   `release-1.37.0` 的 win-64bit zip 内 `COPYING`（18092 字节，sha256
+  ;   8177f975…）——即「随该二进制一起分发的那份」，未删节、未改写。
+  ; - 仓库根 `THIRD-PARTY-NOTICES.md`：组件/版本/来源 URL/SHA-256/GPLv2/源码获取。
+  ; 二者与 aria2c.exe **同进同退**：没有核心就没有许可文件，不留孤儿声明；
+  ; 有核心就必然有全文——「二进制在、许可丢」这种组合在结构上不可能出现。
+  !insertmacro TraceWrite "[install] 装第三方许可：COPYING + THIRD-PARTY-NOTICES.md"
+  SetOutPath "$INSTDIR\licenses"
+  File "licenses\aria2-COPYING.txt"
+  SetOutPath "$INSTDIR"
+  File "..\THIRD-PARTY-NOTICES.md"
+!else
+  !ifdef BUNDLED_ARIA2_REQUIRED
+    !error "BUNDLED_ARIA2_REQUIRED 已定义，但 ${SRCDIR}\aria2c.exe 不存在：先跑 release.yml 的下载+校验步骤"
+  !endif
 !endif
 
   ; 静默模式必须让失败可见（task-55 C 条）：/S 下 MessageBox 被抑制、DetailPrint
@@ -801,7 +834,19 @@ Section "Uninstall"
   Delete "$INSTDIR\ariahost.ico"
   Delete "$INSTDIR\uninst.exe"
   Delete "$INSTDIR\uninstall.exe"   ; 旧版本（改名前的产物）
+  ; 第三方来源说明放在**顶层**（用户一眼能看到，见安装段注释）；它由本脚本 New 出来，
+  ; 卸载必须自己删——漏了就会让 RMDir "$INSTDIR" 失败，只在目录里留一个孤儿 md。
+  Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
+  ; 内置核心的许可是我们放的目录（aria2c.exe 与它同生共死），整目录删。
+  RMDir /r "$INSTDIR\licenses"
   RMDir "$INSTDIR"
+  ; RMDir 只删空目录：目录还在 = 有我们没列到的残留（旧版多放的 dll、用户手放的文件）。
+  ; 静默卸载必须能看见（真机实证：task-54 首版漏删顶层 NOTICES，目录就留了下来）。
+  ${If} ${FileExists} "$INSTDIR\*.*"
+    DetailPrint "警告：安装目录仍有残留文件：$INSTDIR"
+    !insertmacro TraceWrite "[uninstall] 安装目录仍有残留，记 $R0=2"
+    StrCpy $R0 2
+  ${EndIf}
 
   ; === 5) 服务平面数据 %ProgramData%\AriaHost\（仅管理员可删）==============
   ; 服务平面 = aria2.conf/session/logs/secret/aria2\versions\<ver>\ + staging\（架构 §4.11）

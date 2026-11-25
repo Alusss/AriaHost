@@ -125,9 +125,19 @@ Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知
 
 ## 7. aria2 核心的分发口径
 
-默认**不打包** `aria2c.exe`（体积 + GPL 分发义务，见 README 免责声明）。`release.yml` 的暂存步骤注释里留了钩子：只要 `dist/<arch>/aria2c.exe` 存在，`ariahost.nsi` 里的 `!if /FileExists` 就会把它一并装进安装目录。
+**自 task-54 起改为随包分发**（定版变更）：`release.yml` 在打包前用 `scripts/fetch-aria2.ps1`（或等价步骤）下载 **aria2 1.37.0 win-64bit build1** 的官方 zip，**硬校验 zip 的 SHA-256**，解出 `aria2c.exe` 放到 `dist/<arch>/`，并把 `installer/licenses/aria2-COPYING.txt` 与仓库根 `THIRD-PARTY-NOTICES.md` 一起装进安装目录的 `licenses\`。
 
-若改为随包分发，必须同时：附 aria2 的 GPLv2 许可文本、提供对应源码获取路径、在面板「关于」里标注其版本与来源。这条属于法务口径，**改之前先确认**。
+为什么改：双线路在线下载在真实用户网络下**不可用**（镜像全 404、直连 GitHub 抖断），首次运行引导必然失败 —— 装机即带核心是唯一可靠路径。
+
+法务口径（三条必须同时满足，缺一不可）：
+
+1. **许可全文**：`installer/licenses/aria2-COPYING.txt`（GPL-2.0 全文，取自官方 zip 内的 `COPYING`，18092 B，未删节）随包安装到 `<安装目录>\licenses\`；
+2. **源码获取路径**：`THIRD-PARTY-NOTICES.md` 里写明上游仓库、release tag、与「上游同版本源码即对应源码」的说明（分发的就是上游构建产物，SHA-256 已记录）；
+3. **版本与来源标注**：面板「关于」/诊断包 `env.json` 的 `core.origin` 标注 `bundled|managed|external` 与版本号（`core.origin` 已落地；「关于」页文案属 UI 批）。
+
+`ariahost.nsi` 的 `!if /FileExists "${SRCDIR}\aria2c.exe"` 钩子保留（无核心时仍可编译出不含核心的包），但**发布包一律带核心**：`release.yml` 的 makensis 调用带 `/DBUNDLED_ARIA2_REQUIRED=1`，缺核心时编译期直接失败，避免发出「装完没核心」的包。
+
+改这条口径（尤其是去掉核心或去掉许可文件）**必须先确认**。
 
 ## 8. 重发与回滚
 

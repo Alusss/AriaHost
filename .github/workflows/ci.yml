@@ -395,6 +395,38 @@ jobs:
           & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x64 "/DSRCDIR=$src" "/DOUTFILE=$outTrace" "/DTRACE=$PWD\dist\ariahost-trace.txt" "installer\ariahost.nsi"
           if ($LASTEXITCODE -ne 0) { Write-Error "makensis（/DTRACE 变体）失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
           Write-Host "OK：/DTRACE 变体编译通过（$((Get-Item $outTrace).Length) 字节）"
+          # 第三道：带内置核心的编译（/DBUNDLED_ARIA2_REQUIRED + 假 aria2c.exe）。
+          # 为什么必须编这一次（task-54）：随包核心那段整块在 `!if /FileExists` 里，
+          # 默认载荷下这条分支**永远不被解析**，于是「发布时缺载荷 → !error 兜底」这条
+          # 关键路径既没有编译覆盖也没有执行覆盖。这里用一个 4 字节的假核心把分支点着，
+          # 证明：① 有载荷时能编译；② /DBUNDLED_ARIA2_REQUIRED 的 !error 分支语法正确
+          # （无载荷时的失败行为由下一条负向断言直接验证）。
+          $srcB = Join-Path $PWD "dist\x64-bundled"
+          New-Item -ItemType Directory -Force $srcB | Out-Null
+          Copy-Item (Join-Path $src "ariahost.exe") (Join-Path $srcB "ariahost.exe") -Force
+          Copy-Item (Join-Path $src "ariahost.ico") (Join-Path $srcB "ariahost.ico") -Force
+          Set-Content -Path (Join-Path $srcB "aria2c.exe") -Value "stub-core" -Encoding ascii
+          New-Item -ItemType Directory -Force (Join-Path $srcB "licenses") | Out-Null
+          Copy-Item "installer/licenses/aria2-NOTICE.txt" (Join-Path $srcB "licenses/aria2-NOTICE.txt") -Force
+          $outB = Join-Path $PWD "dist\AriaHost-0.0.0-ci-x64-setup-bundled.exe"
+          & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x64 "/DSRCDIR=$srcB" "/DOUTFILE=$outB" /DBUNDLED_ARIA2_REQUIRED "installer\ariahost.nsi"
+          if ($LASTEXITCODE -ne 0) { Write-Error "makensis（内置核心变体）失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
+          Write-Host "OK：内置核心变体编译通过（$((Get-Item $outB).Length) 字节）"
+          # 负向断言：定义了 BUNDLED_ARIA2_REQUIRED 但载荷缺失时，必须**编译失败**。
+          # 这是 fail-closed 的唯一可信证明——否则「忘了放载荷」会静静出一个
+          # 首次运行还要联网的包（L6 那个形态），而 CI 全绿。
+          $srcNoCore = Join-Path $PWD "dist\x64-nocore"
+          New-Item -ItemType Directory -Force $srcNoCore | Out-Null
+          Copy-Item (Join-Path $src "ariahost.exe") (Join-Path $srcNoCore "ariahost.exe") -Force
+          Copy-Item (Join-Path $src "ariahost.ico") (Join-Path $srcNoCore "ariahost.ico") -Force
+          $outNo = Join-Path $PWD "dist\AriaHost-0.0.0-ci-x64-setup-nocore.exe"
+          & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x64 "/DSRCDIR=$srcNoCore" "/DOUTFILE=$outNo" /DBUNDLED_ARIA2_REQUIRED "installer\ariahost.nsi" 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "负向断言失败：缺内置核心却编译成功（exit 0）。fail-closed 已失效——发布可能出「无核心」的包。"
+            exit 1
+          }
+          if (Test-Path $outNo) { Write-Error "负向断言失败：缺核心时仍生成了 $outNo"; exit 1 }
+          Write-Host "OK：缺核心时按预期编译失败（fail-closed 生效）"
       - name: 上传调试产物（7 天）
         uses: actions/upload-artifact@v4
         with:
