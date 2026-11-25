@@ -41,7 +41,7 @@
 ;        注册表 → 删 $INSTDIR → 用户数据默认保留（问过才删）。
 ;        残留的 aria2c 只在其映像路径位于 AriaHost 数据目录下时才 taskkill，
 ;        否则只告警（可能是用户自己的 aria2 实例，杀了是数据损失）。
-;     D. 升级停进程改成「--quit + 每 250ms 真实复查，最多约 10s」，不再 Sleep 假同步。
+;     D. 升级停进程改成「--quit + 每 250ms 真实复查，墙钟上限 15s」，不再 Sleep 假同步。
 ;     另：删除 A6 的 HidePerUserServiceSection（per-user 现在可以注册服务）。
 ;
 ;     历史修复（2026-11-23 独立审计 .scratch/wasm-design/review-exec-v2.md，静态）：
@@ -199,15 +199,24 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
 ; 而"是否在跑"这件事只需要映像名。tasklist 找不到进程时**退出码仍为 0**，
 ; 所以只能看输出文本：/FO TABLE /NH 命中时首行就是 "<image>  <pid> ..."。
 ;
+; **2026-11-25 修（v0.1.1 真机事故的根因）：非控制台上下文里 tasklist 输出以 CRLF 开头。**
+; 实测前 16 字节 = 0D 0A 61 72 69 61 68 6F 73 74 2E 65 78 65 20 20，即
+; "\r\nariahost.exe  "。修之前这里直接 `StrCpy $R4 $R5 ${LEN}`，得到
+; "\r\nariahost.e"，**永不等于**映像名 → 探测恒判"没在跑" → 安装/覆盖/卸载
+; 全都跳过关闭步骤：安装不 --quit 直接 File 覆盖被占用的 exe；卸载/升级
+; 既不 --quit 也不复查 aria2c，删文件失败还当成功。
+; 修法：先 TrimEol 再取前 LEN 个字符比较；**不做列解析**（列宽与本地化都会变）。
+;
 ; 入参：!macro 参数 IMAGE（映像名）、LEN（映像名字符数，用于截取比较）
 ;       **传参不要带引号**（引号一律写在宏体内），避免"引号是否算参数一部分"的歧义：
 ;       调用写 `!insertmacro ProcessIsRunning ariahost.exe 12`。
 ; 出参：$R7 = "1" 在跑 / "0" 不在跑；$R4 首段文本、$R5 原始输出、$R6 退出码
-; 约束：宏体不写 label（宏会被多处置入），也不改 $R0–$R3/$0–$9（调用方在用）。
+; 约束：宏体不写 label（宏会被多处置入）；除上述出参外只借用 $R2（TrimEol 的临时字符）。
 !macro ProcessIsRunning IMAGE LEN
   nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq ${IMAGE}" /FO TABLE /NH'
   Pop $R6
   Pop $R5
+  !insertmacro TrimEol $R5
   StrCpy $R4 $R5 ${LEN}
   ${If} $R4 == "${IMAGE}"
     StrCpy $R7 1
@@ -215,6 +224,34 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
     StrCpy $R7 0
   ${EndIf}
 !macroend
+
+; ---- 可选：运行期取证 TRACE（编译期 /DTRACE=<绝对路径>）-------------------
+; 为什么需要：/S 静默安装看不到 DetailPrint，而"到底有没有探测到实例、--quit
+; 返回几、复查了几轮、最后为什么没删掉"只有安装器自己知道。这是安装器唯一
+; 能自证黑盒行为的通道（task-55 的验收要求）。
+; 规则（刻意做到最小、可审计）：
+;   · **只写不读、不改任何判定**：任何分支都不以 TRACE 是否成功为条件；
+;   · 不给 /DTRACE 时宏体为空（无文件、无变量、零开销），CI 只编译不运行；
+;   · 路径写死在编译期，**不读环境变量**（安装器/助手可能被提权到别的账户）。
+; 用法：makensis /DTRACE="F:\tmp\ariahost-trace.txt" ...
+; 取证人：$EXEDIR（当前 exe 所在目录——卸载器通常先自我复制到 %TEMP% 再运行，
+;         这一项直接回答"卸载器到底从哪儿跑的"）、$TEMP、$INSTDIR。
+; 实现细节（2026-11-25 实测修）：① 追加前显式 `FileSeek 0 END`——同一进程里
+; 多次 FileOpen/FileClose 交替时，仅靠 "a" 模式的指针语义曾出现**两次写入互相
+; 覆盖**（真机跑出「后一行盖掉前一行前缀」的残缺文件）；② 每行写完立即
+; FileClose，不留悬挂句柄；③ 路径必须用**反斜杠**形态（正斜杠形态 FileOpen
+; 静默失败，一个字节都不会落盘——实测 F:/… 与 F:\… 的对照）。
+!ifdef TRACE
+  !macro TraceWrite TEXT
+    FileOpen $9 "${TRACE}" a
+    FileSeek $9 0 END
+    FileWrite $9 "${TEXT}$\r$\n"
+    FileClose $9
+  !macroend
+!else
+  !macro TraceWrite TEXT
+  !macroend
+!endif
 
 ; ---- 通用：去掉字符串首尾的 CR/LF/空格 ------------------------------------
 ; cmd 的 echo、sc/tasklist/wmic 的输出都带行尾换行（wmic 还会在前面空一行），
@@ -248,19 +285,33 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
 
 ; ---- 通用：停掉正在运行的实例（不 Sleep 假同步）---------------------------
 ; MODE = "install"：安装/覆盖前调用。检测到在跑 → 提示 → --quit → **每 250ms
-;        真实复查**最多约 10s；仍活着才 Abort（否则 File 必然失败）。
-; MODE = "uninstall"：卸载时调用。不提示、不 Abort；停完按 C 步要求等 2s
-;        让 Job Object 收掉 aria2c 子进程，再复查 aria2c 是否残留。
+;        真实复查、墙钟上限 15s**；仍活着才 Abort（否则 File 必然失败）。
+; MODE = "uninstall"：卸载时调用。不提示、不 Abort；停完等 2s 让 Job Object
+;        收掉 aria2c 子进程，再复查 aria2c 是否残留。
 ;
 ; 为什么必须是「复查」而不是「Sleep 若干秒后当它已退出」：run 45451494558 与
 ; 早期 A4 实现都吃过这个亏——睡眠时长与真实退出时间无关，睡完照样占用文件。
 ; 这里的 Sleep 只用作两次探测之间的间隔（250ms），判定依据始终是 tasklist 结果。
 ;
+; 为什么等待预算是 15s（原为 40×250ms=10s）：`--quit` 客户端自己的握手/等退出
+; 预算就是 10s（cli.rs 的 QUIT_TIMEOUT），10s 等于和客户端同刻赛跑——先到的
+; 那一方随机，属于设计缺陷。加 5s 余量。
+;
+; **2026-11-25 实测修：预算按"墙钟 15s"算，不按轮次算。** 每轮都要 spawn 一次
+; tasklist（非控制台上下文一次约 100–150ms），所以「N 轮 × 250ms」必然低估真实
+; 等待时长，且随机器快慢漂移——静默安装的失败反馈时间会被无声放大。改法：用
+; kernel32!GetTickCount 夹住墙钟，轮次只作为取证计数。实测（面板始终不让出）：
+; 15204ms 触发中止、39 轮、退出码 2。
+;
 ; 入参：$INSTDIR 必须已就位（--quit 要用 $INSTDIR\ariahost.exe）
-; 出参：$R7 最后一次探测结果（"1"：还在跑）
+; 出参：$R7 最后一次探测结果（"1"：还在跑）；$R9 实际轮次；$R1 实际等待毫秒
+; 借用：$R0（起始 tick）、$R1（已等毫秒）——调用方不要依赖这两个寄存器
 ; 复用：安装器（Function StopAppForInstall）、卸载器（Function un.StopAppForUninstall）
+!define STOP_APP_BUDGET_MS 15000
 !macro StopAppBody MODE
+  !insertmacro TraceWrite "[${MODE}] StopAppBody 进入；exedir=$EXEDIR temp=$TEMP instdir=$INSTDIR"
   !insertmacro ProcessIsRunning ${APP_EXE} 12
+  !insertmacro TraceWrite "[${MODE}] 探测 ${APP_EXE} 结果=$R7"
   ${If} $R7 == "0"
     DetailPrint "没有检测到运行中的 ${APP_EXE}，跳过关闭步骤。"
   ${Else}
@@ -270,45 +321,65 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
     DetailPrint "通知 ${APP_NAME} 优雅退出：$INSTDIR\${APP_EXE} --quit"
     ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
       nsExec::ExecToStack '"$INSTDIR\${APP_EXE}" --quit'
-      Pop $R8   ; 退出码（契约：0=已退出 1=无实例 2=超时；失败也可能是 error/timeout 字符串）
+      Pop $R8   ; 退出码（契约：0=accepted 或 no-instance；1=refused（对端不认识 --quit，
+                ; 通常是版本不匹配）；2=timeout（连上了但等退出超时）；失败也可能是
+                ; error/timeout 字符串。判据只用 tasklist 复查，本退出码只进日志）
       Pop $R3   ; 标准输出
       DetailPrint "--quit 返回：$R8"
+      !insertmacro TraceWrite "[${MODE}] 已调用 $INSTDIR\${APP_EXE} --quit，退出码=$R8 输出=$R3"
     ${Else}
       ; 进程在跑但当前安装目录没有 exe（例如从别处跑的便携版）：无法代为退出，
       ; 直接给出可执行提示，不要空转 10 秒轮询。
       !if "${MODE}" == "install"
-        MessageBox MB_OK|MB_ICONSTOP "检测到 ${APP_EXE} 正在运行，但它不在本次安装目录 $INSTDIR 下，安装程序无法代为关闭。$\r$\n$\r$\n请先从托盘菜单「退出」${APP_NAME}（或在任务管理器结束 ${APP_EXE}），然后重新运行安装程序。"
+        !insertmacro TraceWrite "[${MODE}] 进程在跑但 $INSTDIR\${APP_EXE} 不存在，Abort"
+        MessageBox MB_OK|MB_ICONSTOP "检测到 ${APP_EXE} 正在运行，但它不在本次安装目录 $INSTDIR 下，安装程序无法代为关闭。$\r$\n$\r$\n请先从托盘菜单「退出」${APP_NAME}（或在任务管理器结束 ${APP_EXE}），然后重新运行安装程序。" /SD IDOK
         Abort
       !else
         DetailPrint "警告：$INSTDIR\${APP_EXE} 不存在，且仍有 ${APP_EXE} 在运行（可能来自其他目录）；后续删除可能部分失败。"
       !endif
     ${EndIf}
-    ; 真实等待：最多 40 次 × 250ms ≈ 10s，每轮都以 tasklist 结果判定
+    ; 真实等待：**墙钟上限 15s**（`STOP_APP_BUDGET_MS`），每轮都以 tasklist 结果判定。
+    ; 停机判定只认 tasklist；Sleep 只是两轮之间的间隔，不参与判定。
     StrCpy $R9 0
+    ; **大小写是语义**：System 插件里 `.r0` 写的是**用户变量 $0**，`.R0` 才是**寄存器 $R0**。
+    ; 2026-11-25 实测：写成 `.r0` 而读 `$R0` → 差值恒为 0，15s 墙钟永不触发，
+    ; 等待循环只能靠进程自己退出（实测跑到第 226 轮）。探针对照：`.R1-.R0` 得 1203ms ✓。
+    System::Call 'kernel32::GetTickCount()i .R0'
     ${Do}
       !insertmacro ProcessIsRunning ${APP_EXE} 12
       ${If} $R7 == "0"
+        !insertmacro TraceWrite "[${MODE}] 复查第 $R9 轮：已退出"
         ${ExitDo}
       ${EndIf}
       Sleep 250
       IntOp $R9 $R9 + 1
-    ${LoopWhile} $R9 < 40
+      System::Call 'kernel32::GetTickCount()i .R1'
+      IntOp $R1 $R1 - $R0
+      ${If} $R1 >= ${STOP_APP_BUDGET_MS}
+        ${ExitDo}
+      ${EndIf}
+    ${Loop}
     ${If} $R7 == "1"
+      !insertmacro TraceWrite "[${MODE}] 等待结束：仍在运行（轮次=$R9，实测=$R1 ms）"
       !if "${MODE}" == "install"
-        MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 10 秒），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从托盘菜单「退出」${APP_NAME}，或在任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）"
+        MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 15 秒），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从托盘菜单「退出」${APP_NAME}，或在任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
         Abort
       !else
         DetailPrint "警告：${APP_NAME} 仍在运行，后续删除可能因文件占用失败；请退出后手工删除残留目录。"
       !endif
     ${Else}
+      !insertmacro TraceWrite "[${MODE}] 等待结束：已退出（轮次=$R9，实测=$R1 ms）"
       DetailPrint "${APP_NAME} 已退出。"
     ${EndIf}
   ${EndIf}
   !if "${MODE}" == "uninstall"
     ; C-2：先停 ariahost，再等 2 秒让 Job Object 收掉 aria2c 子进程，然后复查。
     ; 这 2 秒是"给子进程收尾的缓冲"，判定依据仍然是随后的 tasklist 结果。
+    ; 注意：这两步在 ${If} $R7 == "0" 之外，**无论刚才有没有探测到实例都会执行**
+    ; （历史上曾误以为它在条件块里，实测 TRACE 已证伪）。
     Sleep 2000
     !insertmacro ProcessIsRunning aria2c.exe 10
+    !insertmacro TraceWrite "[uninstall] 停 ariahost 后 2s 复查 aria2c → $R7"
     ${If} $R7 == "1"
       ; 残留的 aria2c 可能是用户自己的实例（甚至是别的下载器的），**不能无条件 kill**：
       ; 只有能证明它的映像路径在 AriaHost 的两个数据目录下时才结束它。
@@ -322,6 +393,7 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
       ; 只处理单实例形态（首行 ExecutablePath=…）；多行/空/无 wmic 都算"不确定"
       StrCpy $R8 $R5 15
       ${If} $R8 != "ExecutablePath="
+        !insertmacro TraceWrite "[uninstall] wmic 取路径失败，不做结束；原样输出=$R5"
         DetailPrint "警告：无法取得 aria2c.exe 的映像路径（wmic 不可用或存在多个实例），不做结束；若 $INSTDIR 删除不完整，请手工处理。"
       ${Else}
         StrCpy $R5 $R5 1024 15      ; 跳过 "ExecutablePath=" 前缀，$R5 = 纯路径
@@ -351,10 +423,12 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
         ${EndIf}
 
         ${If} $R7 == "1"
+          !insertmacro TraceWrite "[uninstall] aria2c 属于本产品（$R5），taskkill"
           DetailPrint "结束本产品的 aria2c.exe（$R5）：taskkill /F /IM aria2c.exe"
           nsExec::ExecToLog 'taskkill /F /IM aria2c.exe'
           Sleep 500
         ${Else}
+          !insertmacro TraceWrite "[uninstall] aria2c 不属于本产品（$R5），不结束"
           DetailPrint "警告：aria2c.exe（$R5）不在 AriaHost 数据目录下，很可能是你自己启动的实例，不做结束。"
         ${EndIf}
       ${EndIf}
@@ -458,26 +532,28 @@ Function RegisterServiceIfRequested
     ${EndIf}
   ${ElseIf} $R7 == "1223"
     DetailPrint "服务注册被用户取消（Win32 1223 = ERROR_CANCELLED，AH-E5002）。"
-    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，服务注册被取消。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。需要服务时，请打开面板 → 设置 → 「一键装服务」重试。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，服务注册被取消。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。需要服务时，请打开面板 → 设置 → 「一键装服务」重试。" /SD IDOK
   ${ElseIf} $R7 == "0"
     ; 助手说成功、但 60s 内 SCM 还没查到：不替用户下结论（分支必须排在 `!= ""` 之前）
     DetailPrint "助手报告成功，但 sc query ${SVC_NAME} 在 60s 内未命中。"
-    MessageBox MB_OK|MB_ICONINFORMATION "${APP_NAME} 已安装完成。服务注册助手报告成功，但安装程序在 60 秒内没能在系统里查到 ${SVC_NAME} 服务。$\r$\n$\r$\n请在面板 → 设置 里确认「服务」状态；如果显示未安装，点「一键装服务」重试即可。"
+    MessageBox MB_OK|MB_ICONINFORMATION "${APP_NAME} 已安装完成。服务注册助手报告成功，但安装程序在 60 秒内没能在系统里查到 ${SVC_NAME} 服务。$\r$\n$\r$\n请在面板 → 设置 里确认「服务」状态；如果显示未安装，点「一键装服务」重试即可。" /SD IDOK
   ${ElseIf} $R7 != ""
     DetailPrint "服务注册失败（--install-service 返回 $R7，且 sc query 查不到服务）。"
-    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，但服务注册失败（返回 $R7，参见 AH-E5003）。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。$\r$\n需要服务时，可用管理员权限执行：$\r$\n  $\"$INSTDIR\${APP_EXE}$\" --install-service$\r$\n或打开面板 → 设置 → 「一键装服务」。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${APP_NAME} 已安装完成，但服务注册失败（返回 $R7，参见 AH-E5003）。$\r$\n$\r$\n这不影响使用：面板会以 headless 方式托管 aria2。$\r$\n需要服务时，可用管理员权限执行：$\r$\n  $\"$INSTDIR\${APP_EXE}$\" --install-service$\r$\n或打开面板 → 设置 → 「一键装服务」。" /SD IDOK
   ${Else}
     ; 60s 内既没查到服务、也没读到回执：无法判断是取消 UAC、换了账户还是真失败
     DetailPrint "未确认到服务注册结果（sc query 未命中，且未读到 --install-service 回执）。"
-    MessageBox MB_OK|MB_ICONINFORMATION "${APP_NAME} 已安装完成，但**未能确认**服务是否注册成功。$\r$\n$\r$\n安装程序在 60 秒内既没在系统里查到 ${SVC_NAME} 服务，也没拿到注册助手的返回码（例如 UAC 用了另一个管理员账户时会出现这种情况）。$\r$\n$\r$\n请打开面板 → 设置，查看「服务」状态；需要时点「一键装服务」重试。这不影响 AriaHost 的正常使用。"
+    MessageBox MB_OK|MB_ICONINFORMATION "${APP_NAME} 已安装完成，但**未能确认**服务是否注册成功。$\r$\n$\r$\n安装程序在 60 秒内既没在系统里查到 ${SVC_NAME} 服务，也没拿到注册助手的返回码（例如 UAC 用了另一个管理员账户时会出现这种情况）。$\r$\n$\r$\n请打开面板 → 设置，查看「服务」状态；需要时点「一键装服务」重试。这不影响 AriaHost 的正常使用。" /SD IDOK
   ${EndIf}
 FunctionEnd
 
 ; ---- 初始化 ---------------------------------------------------------------
 Function .onInit
+  ; 第一行就留痕：/DTRACE 未定义时该宏为空，不产生任何文件与变量。
+  !insertmacro TraceWrite "[init] 安装器启动；exedir=$EXEDIR temp=$TEMP instdir=$INSTDIR"
   !if "${ARCH}" == "x64"
     ${IfNot} ${RunningX64}
-      MessageBox MB_ICONSTOP "这是 64 位安装包，请在 64 位 Windows 上运行。"
+      MessageBox MB_ICONSTOP "这是 64 位安装包，请在 64 位 Windows 上运行。" /SD IDOK
       Abort
     ${EndIf}
   !endif
@@ -489,7 +565,7 @@ Function .onInit
   ; 因此改用构建号比较 ${AtLeastBuild} 17763（WinVer.nsh）。
   ${IfNot} ${AtLeastBuild} 17763
     ${WinVerGetBuild} $0
-    MessageBox MB_ICONSTOP "AriaHost 需要 Windows 10 1809（内部版本 17763）或更高版本，或 Windows Server 2019 及以上。$\r$\n$\r$\n当前系统内部版本：$0$\r$\n被拒绝：Windows 10 1803 及更早、Windows Server 2016（14393）。$\r$\n错误码：AH-E1001"
+    MessageBox MB_ICONSTOP "AriaHost 需要 Windows 10 1809（内部版本 17763）或更高版本，或 Windows Server 2019 及以上。$\r$\n$\r$\n当前系统内部版本：$0$\r$\n被拒绝：Windows 10 1803 及更早、Windows Server 2016（14393）。$\r$\n错误码：AH-E1001" /SD IDOK
     Abort
   ${EndIf}
 
@@ -527,6 +603,10 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   SetOutPath "$INSTDIR"
   SetOverwrite on
   ; 编译期路径必须用 "\"，且优先绝对路径（见文件头「编译期路径规则」的实测结论）。
+  ; 清错误标志再 File：`${Errors}` 反映的是**最近一次**相关操作的错误标志，若不先清，
+  ; 前面任何一次失败（例如 TRACE 文件打不开、CreateDirectory 失败）都会被误判成
+  ; "File 失败"——真机实测过这条假阳性（exit 1 而文件其实装好了）。
+  ClearErrors
   File "${SRCDIR}\${APP_EXE}"
   ; 图标：与安装器自己、开始菜单/桌面快捷方式、exe 资源共用同一份 ICO
   File "${SRCDIR}\ariahost.ico"
@@ -535,6 +615,27 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
 !if /FileExists "${SRCDIR}\aria2c.exe"
   File "${SRCDIR}\aria2c.exe"
 !endif
+
+  ; 静默模式必须让失败可见（task-55 C 条）：/S 下 MessageBox 被抑制、DetailPrint
+  ; 没人看，于是"复制失败"会以 exit 0 收场——automation 以为装好了，实际没有 exe。
+  ; 两道判定：${Errors} 捕获 File 的运行时写失败；FileExists 是最终事实（唯一可信）。
+  ; 失败一律 SetErrorLevel 1 再 Abort：静默=安静退出但非 0，交互=弹框。
+  StrCpy $R8 0
+  ${If} ${Errors}
+    StrCpy $R8 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\${APP_EXE}"
+    StrCpy $R8 1
+  ${EndIf}
+  ${If} $R8 == "1"
+    DetailPrint "错误：主程序未落盘：$INSTDIR\${APP_EXE}"
+    !insertmacro TraceWrite "[install] 主程序未落盘，SetErrorLevel 1；instdir=$INSTDIR"
+    ${IfNot} ${Silent}
+      MessageBox MB_OK|MB_ICONSTOP "安装失败：未能写入 $INSTDIR\${APP_EXE}。$\r$\n$\r$\n常见原因：目标目录无写权限、磁盘空间不足、安全软件拦截。$\r$\n请换一个安装目录或清理磁盘后重试。" /SD IDOK
+    ${EndIf}
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
 
   ; 文件名与架构 §4.10 安装包清单一致（uninst.exe）
   WriteUninstaller "$INSTDIR\uninst.exe"
@@ -582,7 +683,7 @@ Section /o "同时注册为 Windows 服务（Aria2 随系统服务运行）" SEC
   nsExec::ExecToLog '"$INSTDIR\${APP_EXE}" --install-service'
   Pop $0
   ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONEXCLAMATION "服务注册失败（--install-service 返回 $0，参见 AH-E5003）。$\r$\n$\r$\n${APP_NAME} 已安装，仍可用 headless 形态运行；可在面板设置页重试「一键装服务」。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "服务注册失败（--install-service 返回 $0，参见 AH-E5003）。$\r$\n$\r$\n${APP_NAME} 已安装，仍可用 headless 形态运行；可在面板设置页重试「一键装服务」。" /SD IDOK
   ${EndIf}
 !else
   ; per-user：不能在本进程内调 SCM（非管理员），走单次 UAC 助手并等真实退出码
@@ -621,7 +722,12 @@ Section "Uninstall"
   ReadRegStr $1 HKLM "${SVC_REG_KEY}" "ImagePath"
   ${If} $1 != ""
     ${IfNot} ${FileExists} "$INSTDIR\${APP_EXE}"
-      MessageBox MB_OK|MB_ICONEXCLAMATION "检测到服务 ${SVC_NAME}，但 $INSTDIR\${APP_EXE} 已不存在，无法自动注销。$\r$\n$\r$\n请以管理员身份执行：sc delete ${SVC_NAME}"
+      ; 静默卸载下不能让 MessageBox 卡住 automation（task-55 C 条）：弹框只在交互模式出现，
+      ; 静默模式靠"服务残留 → 末尾 SetErrorLevel 1 + Abort"让调用方看见失败。
+      !insertmacro TraceWrite "[uninstall] 服务在但主程序缺失，无法自动注销"
+      ${IfNot} ${Silent}
+        MessageBox MB_OK|MB_ICONEXCLAMATION "检测到服务 ${SVC_NAME}，但 $INSTDIR\${APP_EXE} 已不存在，无法自动注销。$\r$\n$\r$\n请以管理员身份执行：sc delete ${SVC_NAME}" /SD IDOK
+      ${EndIf}
       StrCpy $R0 2
     ${Else}
       !ifdef PER_MACHINE
@@ -632,7 +738,10 @@ Section "Uninstall"
         ${If} $1 == "0"
           StrCpy $R0 1
         ${Else}
-          MessageBox MB_OK|MB_ICONEXCLAMATION "服务注销失败（--uninstall-service 返回 $1，AH-E5003）。$\r$\n$\r$\n请以管理员身份手工执行：sc delete ${SVC_NAME}"
+          !insertmacro TraceWrite "[uninstall] --uninstall-service 返回 $1"
+          ${IfNot} ${Silent}
+            MessageBox MB_OK|MB_ICONEXCLAMATION "服务注销失败（--uninstall-service 返回 $1，AH-E5003）。$\r$\n$\r$\n请以管理员身份手工执行：sc delete ${SVC_NAME}" /SD IDOK
+          ${EndIf}
           StrCpy $R0 2
         ${EndIf}
       !else
@@ -651,7 +760,10 @@ Section "Uninstall"
         ${If} $1 == ""
           StrCpy $R0 1
         ${Else}
-          MessageBox MB_OK|MB_ICONEXCLAMATION "服务 ${SVC_NAME} 仍在注册（可能取消了 UAC 授权，AH-E5003）。$\r$\n$\r$\n服务残留不影响卸载，但下次开机仍可能拉起 aria2；请以管理员身份执行：sc delete ${SVC_NAME}"
+          !insertmacro TraceWrite "[uninstall] 提权注销后服务仍在注册（可能取消了 UAC）"
+          ${IfNot} ${Silent}
+            MessageBox MB_OK|MB_ICONEXCLAMATION "服务 ${SVC_NAME} 仍在注册（可能取消了 UAC 授权，AH-E5003）。$\r$\n$\r$\n服务残留不影响卸载，但下次开机仍可能拉起 aria2；请以管理员身份执行：sc delete ${SVC_NAME}" /SD IDOK
+          ${EndIf}
           StrCpy $R0 2
         ${EndIf}
       !endif
@@ -674,6 +786,14 @@ Section "Uninstall"
 
   ; === 4) 删安装目录 ========================================================
   Delete "$INSTDIR\${APP_EXE}"
+  ; 卸载要尽力而为（不 Abort），但**静默下也必须能看见失败**（task-55 C 条）：
+  ; 删不掉 = 文件仍被占用或权限不足；若照旧 exit 0，automation 会以为卸干净了，
+  ; 下次安装直接撞上被占用的旧 exe（v0.1.1 的事故形态）。
+  ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
+    DetailPrint "错误：主程序删除失败（仍存在）：$INSTDIR\${APP_EXE}"
+    !insertmacro TraceWrite "[uninstall] 主程序删除失败（仍存在），记 $R0=2"
+    StrCpy $R0 2
+  ${EndIf}
   Delete "$INSTDIR\aria2c.exe"
   Delete "$INSTDIR\ariahost.ico"
   Delete "$INSTDIR\uninst.exe"
@@ -711,7 +831,19 @@ Section "Uninstall"
 
   !ifndef PER_MACHINE
     ${If} $R1 == 1
-      MessageBox MB_OK|MB_ICONINFORMATION "服务平面数据仍在：$R3$\r$\n$\r$\n它属于 %ProgramData% 作用域，需要管理员权限才能删除。$\r$\n保留它可以在下次「一键装服务」时复用（推荐）；要立即删除请以管理员身份执行：$\r$\nrmdir /s /q $\"$R3$\""
+      !insertmacro TraceWrite "[uninstall] 服务平面数据保留（需管理员）：$R3"
+      ${IfNot} ${Silent}
+        MessageBox MB_OK|MB_ICONINFORMATION "服务平面数据仍在：$R3$\r$\n$\r$\n它属于 %ProgramData% 作用域，需要管理员权限才能删除。$\r$\n保留它可以在下次「一键装服务」时复用（推荐）；要立即删除请以管理员身份执行：$\r$\nrmdir /s /q $\"$R3$\"" /SD IDOK
+      ${EndIf}
     ${EndIf}
   !endif
+
+  ; ---- 静默下的失败必须可见（task-55 C 条）------------------------------------
+  ; 卸载要「尽力而为」：不中途 Abort（否则可能注册表已删、文件全留的半成品状态），
+  ; 但调用方（升级流程 / 脚本 / 用户）必须能区分「卸干净」与「文件还在」——所以把
+  ; 上面各处记下的失败统一折算成非零退出码（1）。交互模式下前面已弹过具体原因。
+  ${If} $R0 == "2"
+    !insertmacro TraceWrite "[uninstall] 有残留，退出码置 1"
+    SetErrorLevel 1
+  ${EndIf}
 SectionEnd

@@ -387,6 +387,14 @@ jobs:
           # 下限守卫：空包/极小包通常说明 File 没把载荷打进去（正是本次事故的形态）。
           if ($item.Length -lt 100000) { Write-Error "安装包异常小（$($item.Length) B），载荷疑似未打入"; exit 1 }
           Write-Host "OK：安装脚本编译通过，安装包 $($item.Name) / $($item.Length) 字节"
+          # 第二道：带 /DTRACE 的编译（只编译、不运行）。
+          # 为什么要在 CI 里编一次：TRACE 是运行期取证设施（/S 下唯一能自证行为的通道），
+          # 它整段被 !ifdef TRACE 包住，默认编译**碰不到**这段代码——只在本地手验过就等于
+          # 没门禁。这里只证明"带 TRACE 的脚本仍能编译"，取证内容仍由人跑真机产出。
+          $outTrace = Join-Path $PWD "dist\AriaHost-0.0.0-ci-x64-setup-trace.exe"
+          & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x64 "/DSRCDIR=$src" "/DOUTFILE=$outTrace" "/DTRACE=$PWD\dist\ariahost-trace.txt" "installer\ariahost.nsi"
+          if ($LASTEXITCODE -ne 0) { Write-Error "makensis（/DTRACE 变体）失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
+          Write-Host "OK：/DTRACE 变体编译通过（$((Get-Item $outTrace).Length) 字节）"
       - name: 上传调试产物（7 天）
         uses: actions/upload-artifact@v4
         with:

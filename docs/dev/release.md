@@ -148,3 +148,18 @@ Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知
   1. `--quit` 的退出码（脚本假设 0=已退出、1=无实例、2=超时，其余非 0 即中止）——由 M1 的 `ariahost-cli` 实现，实际返回以代码为准；
   2. per-user 卸载时服务注销只能 `runas` 发起，**拿不到提权进程退出码**（`nsExec` 不能提权），所以改用「轮询 `HKLM\SYSTEM\CurrentControlSet\Services\AriaHost` 是否消失 ≤30s」判成败。
 - 静态 CRT（验收 #15a）的落点是 `.cargo/config.toml` 的 `[target.x86_64-pc-windows-msvc] rustflags = ["-C","target-feature=+crt-static"]`（文件已建）。**已在 CI 证实**：run **45453817683** 的 `windows` job 里 `dumpbin /dependents`（`…\VC\Tools\MSVC\14.52.37025\bin\Hostx64\x64\dumpbin.exe`）输出 `OK：dumpbin 未发现 VCRUNTIME140 / MSVCP140 依赖（#15a 本次通过）`。注意这是**每次构建都会重跑**的门禁，不是一次性结论；「proc-macro 不受 target rustflags 影响」仍属【推断】。
+
+## 10. 安装器运行期取证（`/DTRACE`）
+
+安装器在 `/S` 静默模式下的判定（是否检测到进程、`--quit` 退出码、等了多少毫秒、为何中止）**没有 UI 可看**，所以脚本里内建了一条只在编译期开启的取证通道：`!macro TraceWrite`（`installer/ariahost.nsi`）。
+
+- **默认构建不产生任何文件**：整段宏体被 `!ifdef TRACE` 包住，不给 `/DTRACE` 时宏展开为空。
+- **开启方式**：`makensis … "/DTRACE=<绝对路径>" installer\ariahost.nsi`。CI 的 `makensis` 门禁里有一条**只编译不运行**的 `/DTRACE` 变体，用来保证这段代码不会腐烂。
+- **路径规矩（都是实测教训，别改）**：
+  1. 必须是 **Windows 绝对路径**，且**绝不指向仓库内**。2026-11-25 真实事故：`/DTRACE=F:\git_project\…\trace.txt` 经 bash/WSL 传参时反斜杠被吃掉，值退化成相对路径 `git_projectwasm…trace.txt`，白白落在仓库根。`.gitignore` 里 `/git_project*` 只是兜底。
+  2. 文件内容是 **ANSI（中文系统为 GBK）**，不是 UTF-8。按 UTF-8 读会看到形如「锟斤拷」的替换字符与乱码——不代表取证失败，按 GBK 重读即可。
+- **三个必须记住的 NSIS 坑（本次真机踩出来的，症状都很像"脚本没问题但行为不对"）**：
+  1. `System::Call 'kernel32::GetTickCount()i .R0'` 的 **`.R0` 大写**才写 `$R0`；写成 `.r0` 写的是用户变量 `$0`，`$R0` 恒为空字符串 —— 预算比较 `$R1 >= 15000` 永不成立，等待循环变成死循环（实测卡 180s+）。隔离探针：大写差值 1203ms ≈ 1200ms ✓，小写读回为空。
+  2. `nsExec::ExecToStack`（tasklist）的 stdout **以 CRLF 开头**（实测首字节 `0D 0A`），不 TrimEol 就永远比不中进程名 —— 修前「升级时检测不到正在运行的面板」，覆盖安装必然失败。
+  3. `MessageBox` **不带 `/SD` 时静默安装也会弹窗并阻塞**（NSIS 语义），自动化里表现为"安装器挂了"。所有 MessageBox 都必须给 `/SD IDOK` / `/SD IDNO`。
+- **实测口径（2026-11-25，`/S` 全静默）**：面板不退让（替身永不让出）时，升级中止耗时 **15204 ms**、退出码 **2**、TRACE 记 `等待结束：仍在运行（轮次=39，实测=15204 ms）`，且**一个文件都没覆盖**（先判后写）。
