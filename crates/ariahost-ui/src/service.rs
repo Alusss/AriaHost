@@ -17,28 +17,82 @@ pub const STOP_BUDGET: Duration = Duration::from_secs(25);
 /// 优雅停止段落的长度（架构 §4.6 第一段）。
 pub const STOP_GRACEFUL: Duration = Duration::from_secs(15);
 
-/// 六态的中文短标签（卡片标题行）。
-pub const fn state_label(state: ServiceState) -> &'static str {
+/// 一个状态对应的**整行**事实：标题标签 + 一句说明 + 四个按钮的可用性。
+///
+/// **单一数据源**（M3-b 验收要求）：六态的「说什么 / 能点什么」只在 [`row`] 的同一个
+/// `match` 里决定，[`state_label`] / [`state_hint`] / [`buttons`] 都只是它的取字段包装。
+/// 这样新增状态或改文案时，不可能出现「标签说已停止、按钮却给了停止」这类各说一套。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateRow {
+    /// 卡片标题行的短标签。
+    pub label: &'static str,
+    /// 标题下一句话的说明（这意味着什么 / 下一步能干什么）。
+    pub hint: &'static str,
+    /// 四个按钮各自能不能点。
+    pub buttons: Buttons,
+}
+
+/// 六态的**唯一**事实表：状态 → （标签, 说明, 按钮）。
+///
+/// 过渡态与未知态一律不给可点按钮：避免用户把 SCM 搅成竞态，也不让界面替用户猜状态。
+pub const fn row(state: ServiceState) -> StateRow {
     match state {
-        ServiceState::NotInstalled => "未安装",
-        ServiceState::Stopped => "已停止",
-        ServiceState::StartPending => "启动中",
-        ServiceState::Running => "运行中",
-        ServiceState::StopPending => "停止中",
-        ServiceState::Unknown => "未知",
+        ServiceState::NotInstalled => StateRow {
+            label: "未安装",
+            hint: "还没有把 aria2 装成 Windows 服务：装好后可以开机自启、面板关掉也能继续下载。",
+            buttons: Buttons {
+                install: true,
+                uninstall: false,
+                start: false,
+                stop: false,
+            },
+        },
+        ServiceState::Stopped => StateRow {
+            label: "已停止",
+            hint: "服务已注册但当前没在跑：点「启动服务」由 SCM 拉起它（面板可以关）。",
+            buttons: Buttons {
+                install: false,
+                uninstall: true,
+                start: true,
+                stop: false,
+            },
+        },
+        ServiceState::StartPending => StateRow {
+            label: "启动中",
+            hint: "SCM 正在拉起服务，稍等一下（一般 1–2 秒）。",
+            buttons: Buttons::NONE,
+        },
+        ServiceState::Running => StateRow {
+            label: "运行中",
+            hint: "服务正在运行，aria2 监听本机 RPC；面板关不关都不影响下载。",
+            buttons: Buttons {
+                install: false,
+                uninstall: true,
+                start: false,
+                stop: true,
+            },
+        },
+        ServiceState::StopPending => StateRow {
+            label: "停止中",
+            hint: "SCM 正在停止服务；aria2 会先把会话与队列落盘再退出。",
+            buttons: Buttons::NONE,
+        },
+        ServiceState::Unknown => StateRow {
+            label: "未知",
+            hint: "SCM 报了一个本产品不该出现的状态（如暂停系列）：请刷新，或用 `sc query AriaHost` 核对。",
+            buttons: Buttons::NONE,
+        },
     }
 }
 
-/// 状态行下面的补充说明（一句话解释「这意味着什么」）。
+/// 六态的中文短标签（卡片标题行）。等价于 [`row`]`(state).label`。
+pub const fn state_label(state: ServiceState) -> &'static str {
+    row(state).label
+}
+
+/// 状态行下面的补充说明。等价于 [`row`]`(state).hint`。
 pub const fn state_hint(state: ServiceState) -> &'static str {
-    match state {
-        ServiceState::NotInstalled => "还没有把 aria2 装成 Windows 服务：装好后可以开机自启、面板关掉也能继续下载。",
-        ServiceState::Stopped => "服务已注册但当前没在跑：点「启动服务」由 SCM 拉起它（面板可以关）。",
-        ServiceState::StartPending => "SCM 正在拉起服务，稍等一下（一般 1–2 秒）。",
-        ServiceState::Running => "服务正在运行，aria2 监听本机 RPC；面板关不关都不影响下载。",
-        ServiceState::StopPending => "SCM 正在停止服务；aria2 会先把会话与队列落盘再退出。",
-        ServiceState::Unknown => "SCM 报了一个本产品不该出现的状态（如暂停系列）：请刷新，或用 `sc query AriaHost` 核对。",
-    }
+    row(state).hint
 }
 
 /// 启动方式的中文标签（`None` = 未安装）。
@@ -130,32 +184,9 @@ impl Buttons {
     };
 }
 
-/// 按六态决定按钮可用性。**过渡态一律不点**，避免用户把 SCM 搅成竞态。
+/// 按六态决定按钮可用性。等价于 [`row`]`(state).buttons`——**不再单独维护一份 match**。
 pub const fn buttons(state: ServiceState) -> Buttons {
-    match state {
-        ServiceState::NotInstalled => Buttons {
-            install: true,
-            uninstall: false,
-            start: false,
-            stop: false,
-        },
-        ServiceState::Stopped => Buttons {
-            install: false,
-            uninstall: true,
-            start: true,
-            stop: false,
-        },
-        ServiceState::Running => Buttons {
-            install: false,
-            uninstall: true,
-            start: false,
-            stop: true,
-        },
-        // 过渡态与未知态：只让用户刷新，不提供会撞车/靠猜的操作。
-        ServiceState::StartPending | ServiceState::StopPending | ServiceState::Unknown => {
-            Buttons::NONE
-        }
-    }
+    row(state).buttons
 }
 
 /// 卡片当前处在什么阶段。
@@ -443,25 +474,47 @@ mod tests {
         assert_eq!(seen.len(), 6);
     }
 
+    /// 六态 × 四按钮 = 24 条断言：逐态逐键把「能点什么」钉死在表里。
+    ///
+    /// 期望值集中写在这张表里，改行为就必须改表——这正是「单一数据源」的验收形态：
+    /// 标签与按钮出自同一个 [`row`]，不可能各说一套。
     #[test]
-    fn buttons_follow_the_state_machine() {
-        // 未安装：只能装。
-        let b = buttons(ServiceState::NotInstalled);
-        assert!(b.install && !b.uninstall && !b.start && !b.stop);
-        // 已停止：可卸可启，不能再装。
-        let b = buttons(ServiceState::Stopped);
-        assert!(!b.install && b.uninstall && b.start && !b.stop);
-        // 运行中：可停可卸，不能再启。
-        let b = buttons(ServiceState::Running);
-        assert!(!b.install && b.uninstall && !b.start && b.stop);
-        // 过渡态/未知：什么都不给点（避免把 SCM 搅成竞态）。
-        for state in [
-            ServiceState::StartPending,
-            ServiceState::StopPending,
-            ServiceState::Unknown,
-        ] {
-            assert_eq!(buttons(state), Buttons::NONE, "{state:?} 不该给可点按钮");
+    fn row_pins_six_states_and_four_buttons() {
+        // (状态, 安装, 卸载, 启动, 停止)
+        let table: [(ServiceState, bool, bool, bool, bool); 6] = [
+            (ServiceState::NotInstalled, true, false, false, false),
+            (ServiceState::Stopped, false, true, true, false),
+            (ServiceState::StartPending, false, false, false, false),
+            (ServiceState::Running, false, true, false, true),
+            (ServiceState::StopPending, false, false, false, false),
+            (ServiceState::Unknown, false, false, false, false),
+        ];
+        assert_eq!(table.len(), 6, "六态一个都不能漏");
+        for (state, install, uninstall, start, stop) in table {
+            let r = row(state);
+            assert_eq!(r.buttons.install, install, "{state:?} 的「安装」可用性");
+            assert_eq!(r.buttons.uninstall, uninstall, "{state:?} 的「卸载」可用性");
+            assert_eq!(r.buttons.start, start, "{state:?} 的「启动」可用性");
+            assert_eq!(r.buttons.stop, stop, "{state:?} 的「停止」可用性");
+            assert!(!r.label.is_empty(), "{state:?} 缺标签");
+            assert!(!r.hint.is_empty(), "{state:?} 缺说明");
         }
+    }
+
+    /// 便利函数必须逐字段等于 [`row`]，且六态标签集合大小 == 6。
+    ///
+    /// 这条是防回归的钉子：日后若有人再写一份独立的 `match` 决定按钮或文案，这里会红。
+    #[test]
+    fn wrappers_delegate_to_row_and_labels_are_unique() {
+        let mut labels = std::collections::BTreeSet::new();
+        for state in ALL_STATES {
+            let r = row(state);
+            assert_eq!(state_label(state), r.label, "{state:?} 标签没走 row");
+            assert_eq!(state_hint(state), r.hint, "{state:?} 说明没走 row");
+            assert_eq!(buttons(state), r.buttons, "{state:?} 按钮没走 row");
+            labels.insert(r.label);
+        }
+        assert_eq!(labels.len(), 6, "六态标签有重复：{labels:?}");
     }
 
     #[test]

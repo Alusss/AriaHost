@@ -3539,30 +3539,54 @@ struct ElevateTarget {
     args: Vec<String>,
 }
 
+/// 提权时拉哪个可执行文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    /// 面板自己的 CLI 子命令（`--install-service` / `--uninstall-service`，契约已定版）。
+    Helper,
+    /// 系统自带的 `sc.exe`（启/停没有对应的 CLI 子命令）。
+    Sc,
+}
+
 /// 四个动作各自该拉谁：
 /// - 装/卸：面板自己的 CLI 子命令（`--install-service` / `--uninstall-service`，契约已定版）；
 /// - 启/停：**没有**对应的 CLI 子命令（cli.rs 不在本批写作用域），用系统自带的 `sc.exe`。
 ///
-/// `sc start/stop` 只是「把请求交给 SCM」，真正的状态变化靠 SCM 轮询观察——
-/// 这也正好让「启动中…/停止中…」反映真实状态，而不是我们自己编的进度条。
+/// **两条硬约束（M3-b 验收，来自 `sc.exe` 的实际行为，别再踩）：**
+///
+/// 1. **只认退出码，绝不解析 `sc` 的 stdout。** `sc query` 的输出是随系统语言本地化的
+///    人话（中文系统印「服务名称:」、英文系统印「SERVICE_NAME:」），拿文本做判断必然脆。
+///    本项目里 `sc` 的退出码**只**用于「助手进程失败」的提示，**不参与**服务状态判定——
+///    状态一律以 `status_report()` 的 SCM 查询为准。
+/// 2. **`sc start/stop` 是异步的。** 它把请求交给 SCM 就返回，此刻服务多半还在
+///    `START_PENDING`。所以等待态**只认**轮询到的真实状态，**不许**把 `sc` 的返回码
+///    当成「已运行 / 已停止」。
 fn elevate_target(op: service::Op) -> Option<ElevateTarget> {
+    let (kind, args) = service_args(op);
+    let file = match kind {
+        TargetKind::Helper => crate::elevate::helper_exe()?,
+        TargetKind::Sc => crate::elevate::sc_exe()?,
+    };
+    Some(ElevateTarget { file, args })
+}
+
+/// 动作 → （拉谁, 参数）。
+///
+/// 参数构造单独抽成纯函数，就是为了让「只交请求、不解析输出」这条约束**可被单测钉住**：
+/// 这里出现的动词只能是 `start` / `stop`，任何需要读 `sc` 输出的动词（`query`/`qc`/
+/// `config`…）都不属于这里。
+fn service_args(op: service::Op) -> (TargetKind, Vec<String>) {
     match op {
-        service::Op::Install => Some(ElevateTarget {
-            file: crate::elevate::helper_exe()?,
-            args: vec!["--install-service".to_owned()],
-        }),
-        service::Op::Uninstall => Some(ElevateTarget {
-            file: crate::elevate::helper_exe()?,
-            args: vec!["--uninstall-service".to_owned()],
-        }),
-        service::Op::Start => Some(ElevateTarget {
-            file: crate::elevate::sc_exe()?,
-            args: vec!["start".to_owned(), ariahost_svc::SERVICE_NAME.to_owned()],
-        }),
-        service::Op::Stop => Some(ElevateTarget {
-            file: crate::elevate::sc_exe()?,
-            args: vec!["stop".to_owned(), ariahost_svc::SERVICE_NAME.to_owned()],
-        }),
+        service::Op::Install => (TargetKind::Helper, vec!["--install-service".to_owned()]),
+        service::Op::Uninstall => (TargetKind::Helper, vec!["--uninstall-service".to_owned()]),
+        service::Op::Start => (
+            TargetKind::Sc,
+            vec!["start".to_owned(), ariahost_svc::SERVICE_NAME.to_owned()],
+        ),
+        service::Op::Stop => (
+            TargetKind::Sc,
+            vec!["stop".to_owned(), ariahost_svc::SERVICE_NAME.to_owned()],
+        ),
     }
 }
 
@@ -3587,6 +3611,43 @@ mod tests {
         let title = title_text();
         assert!(title.starts_with(PRODUCT_NAME), "{title}");
         assert!(title.contains(VERSION), "{title}");
+    }
+
+    /// 装/卸走**我们自己的** CLI 契约（定版参数，别改名）。
+    #[test]
+    fn install_and_uninstall_use_our_own_cli_contract() {
+        assert_eq!(
+            service_args(service::Op::Install),
+            (TargetKind::Helper, vec!["--install-service".to_owned()])
+        );
+        assert_eq!(
+            service_args(service::Op::Uninstall),
+            (TargetKind::Helper, vec!["--uninstall-service".to_owned()])
+        );
+    }
+
+    /// 启/停只给 `sc.exe` 两个动词，且**只带服务名**：
+    /// 凡是「要读 sc 输出」的动词（query/qc/config/getdisplayname…）一律不许出现在这里。
+    /// 这条把「不解析 stdout」的约束钉成可执行断言。
+    #[test]
+    fn sc_gets_only_start_or_stop_and_nothing_to_parse() {
+        for (op, verb) in [(service::Op::Start, "start"), (service::Op::Stop, "stop")] {
+            let (kind, args) = service_args(op);
+            assert_eq!(kind, TargetKind::Sc, "{op:?} 应该走 sc.exe");
+            assert_eq!(
+                args.len(),
+                2,
+                "{op:?} 只能带 (动词, 服务名)，实际：{args:?}"
+            );
+            assert_eq!(args[0], verb, "{op:?} 的动词");
+            assert_eq!(args[1], ariahost_svc::SERVICE_NAME, "{op:?} 的服务名");
+            for forbidden in ["query", "qc", "config", "getdisplayname", "wait"] {
+                assert!(
+                    !args.iter().any(|a| a == forbidden),
+                    "{op:?} 出现了需要解析输出的动词 {forbidden}：{args:?}"
+                );
+            }
+        }
     }
 
     #[test]
