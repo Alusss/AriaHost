@@ -71,6 +71,13 @@ pub const CONSUME_WAIT: Duration = Duration::from_secs(2);
 /// 与 `core_host::STOP_EXPECTED_SECS` 的口径一致——**不缩短**，缩短会在慢盘上丢掉会话保存。
 pub const FALLBACK_STOP_WAIT: Duration = Duration::from_secs(15);
 
+/// 仅取证用的强制兜底开关（环境变量名）。
+///
+/// 真机 1/6 的「不出帧」是随机态，验收要求**可重复地**证明兜底路径走得通，所以留一个
+/// 显式的注入点：设了它，ctl 线程就当作「回执没等到」，直接走兜底。
+/// 它只改变**退出走哪条路**，不改任何业务状态；设了会写一条显眼的 WARN 日志，不会静默生效。
+pub const SIMULATE_FALLBACK_ENV: &str = "ARIAHOST_QUIT_FALLBACK_SIMULATE";
+
 /// 客户端唯一支持的指令。
 pub const QUIT: &str = "quit";
 /// 单行请求上限：读到这里还没换行就按未知指令处理（防客户端半截请求把线程挂住）。
@@ -422,18 +429,32 @@ mod platform {
             // task-59：等 UI 回执。等到 = 帧路径接手（行为与以前一致）；
             // 等不到 = 那一帧没发生（实测 1/6），由 ctl 线程自己收尾，绝不把退出挂在出帧上。
             if quit {
-                if wait_quit_consumed(CONSUME_WAIT) {
+                let simulated = std::env::var_os(SIMULATE_FALLBACK_ENV).is_some();
+                if simulated {
+                    log.push_level(
+                        logfile::Level::Warn,
+                        FALLBACK_TARGET,
+                        format!(
+                            "ctl.fallback: 环境变量 {SIMULATE_FALLBACK_ENV} 已设置——强制走兜底（仅取证用）"
+                        ),
+                    );
+                }
+                if !simulated && wait_quit_consumed(CONSUME_WAIT) {
                     log.push_level(
                         logfile::Level::Info,
                         FALLBACK_TARGET,
                         format!("ctl.fallback: 未启用（帧路径已在 {CONSUME_WAIT:?} 内接手）"),
                     );
                 } else {
-                    log.push_level(
-                        logfile::Level::Warn,
-                        FALLBACK_TARGET,
-                        format!("ctl.fallback: {CONSUME_WAIT:?} 内没有出帧回执，改由 ctl 线程收尾"),
-                    );
+                    if !simulated {
+                        log.push_level(
+                            logfile::Level::Warn,
+                            FALLBACK_TARGET,
+                            format!(
+                                "ctl.fallback: {CONSUME_WAIT:?} 内没有出帧回执，改由 ctl 线程收尾"
+                            ),
+                        );
+                    }
                     fallback_quit(&log);
                 }
             }
