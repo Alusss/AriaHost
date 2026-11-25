@@ -43,6 +43,13 @@ const SIZE_TOLERANCE: i64 = 2;
 /// 「通道里有没有新结果」。500ms 足够跟手（刷新本身是 2s 一次），又不会烧 CPU。
 const IDLE_REPAINT: Duration = Duration::from_millis(500);
 
+/// 忙态的重绘周期（启动/停止/行操作期间）。
+///
+/// 停止链要等 aria2c 自己关闭（实测 4.1–4.3 秒），这段时间**必须**由帧循环自己
+/// 排下一帧：后台线程只能往 `mpsc` 里塞结果，推不醒 egui。若沿用 500ms 闲时定时器，
+/// 任何一次漏排都会让界面停在「已等待 N 秒」的旧帧上，看起来就是「停止卡住了」。
+const BUSY_REPAINT: Duration = Duration::from_millis(100);
+
 /// 恢复窗口几何后最多检查多少帧：首帧窗口位置可能还没上报（部分平台先给 None），
 /// 不能因为第一次拿不到就永久放弃校正，也不能无限等。
 const MAX_GEOMETRY_CHECKS: u32 = 30;
@@ -477,7 +484,19 @@ impl PanelApp {
             }
             let was_running = self.core.is_running();
             let now_running = update.state.is_running();
+            let state_changed =
+                std::mem::discriminant(&self.core) != std::mem::discriminant(&update.state);
             self.core = update.state;
+            if state_changed {
+                // 状态机成功走到新一档：上一档留下的内联提示条一律作废，
+                // 否则「已停止」之后还挂着停止前的旧错误（缺陷 2 的前半）。
+                self.banner = None;
+                // 核心不在运行时，任务列表本来就连不上，这类「连接类」错误是噪音；
+                // 用户主动「立即刷新」的真错误仍由 worker 单独回，不受这里影响。
+                if !self.core.is_running() {
+                    self.tasks_error = None;
+                }
+            }
             if self.core.is_busy() {
                 if self.busy_since.is_none() {
                     self.busy_since = Some(Instant::now());
@@ -899,16 +918,20 @@ impl PanelApp {
         }
 
         if let Some(failure) = self.tasks_error {
-            ui.label(
-                RichText::new(format!(
-                    "任务列表读取失败：{} {}（{}）",
-                    failure.code().code(),
-                    failure.summary(),
-                    failure.next_step()
-                ))
-                .color(tone_color(Tone::Warn))
-                .small(),
-            );
+            // 核心没在跑时，刷新失败是「预期内的连不上」（停止后第一次轮询必然命中），
+            // 只在真在跑（或错误不是连接类）时才打扰用户。
+            if !tasks_error_is_noise(self.core.is_running(), failure.code()) {
+                ui.label(
+                    RichText::new(format!(
+                        "任务列表读取失败：{} {}（{}）",
+                        failure.code().code(),
+                        failure.summary(),
+                        failure.next_step()
+                    ))
+                    .color(tone_color(Tone::Warn))
+                    .small(),
+                );
+            }
         }
 
         if total == 0 {
@@ -1485,7 +1508,14 @@ impl eframe::App for PanelApp {
         }
 
         // 交互模式下通道是 mpsc，没有人能「推醒」egui，只能定时问一次（不是忙轮询）。
-        ui.ctx().request_repaint_after(IDLE_REPAINT);
+        // 忙态（启动/停止/行操作）必须自己驱动重绘：停止要等 aria2c 4 秒关闭，
+        // 期间若靠 500ms 闲时定时器，一旦某帧没排上就会停在「已等待 4.2 秒」的旧帧上。
+        let repaint_after = if self.core.is_busy() {
+            BUSY_REPAINT
+        } else {
+            IDLE_REPAINT
+        };
+        ui.ctx().request_repaint_after(repaint_after);
 
         ui.horizontal(|ui| {
             ui.heading(format!("{PRODUCT_NAME} {VERSION}"));
@@ -1516,6 +1546,20 @@ impl eframe::App for PanelApp {
 
         self.maybe_finish_selftest(ui);
     }
+}
+
+/// 任务列表读取失败是否只是噪音（核心没在跑时的连接类报错）。
+///
+/// 规则（Lead 缺陷 2）：`已停止` 之后不该继续挂着「连不上 aria2」；但用户主动刷新
+/// 撞上的真错误、以及核心在跑时的一切错误，都必须照实显示，不能被吞掉。
+fn tasks_error_is_noise(running: bool, code: ErrorCode) -> bool {
+    if running {
+        return false;
+    }
+    matches!(
+        code,
+        ErrorCode::RpcHandshakeFailed | ErrorCode::RpcReconnectFailed
+    )
 }
 
 /// 是否该写窗口几何：自测模式永不写，本进程只写一次。
@@ -1743,5 +1787,17 @@ mod tests {
         assert!(failure_next_step(Some(ErrorCode::Aria2NotFound)).contains("--aria2-fetch"));
         assert!(failure_next_step(Some(ErrorCode::Aria2StartTimeout)).contains("aria2.log"));
         assert!(!failure_next_step(None).is_empty());
+    }
+
+    #[test]
+    fn stopped_core_hides_connection_noise_but_keeps_real_errors() {
+        // 已停止时的连接类报错是预期内的噪音（缺陷 2）。
+        assert!(tasks_error_is_noise(false, ErrorCode::RpcHandshakeFailed));
+        assert!(tasks_error_is_noise(false, ErrorCode::RpcReconnectFailed));
+        // 核心在跑时一律照实显示。
+        assert!(!tasks_error_is_noise(true, ErrorCode::RpcHandshakeFailed));
+        // 非连接类（配置/权限/端口）什么状态下都不能吞。
+        assert!(!tasks_error_is_noise(false, ErrorCode::PortConflict));
+        assert!(!tasks_error_is_noise(false, ErrorCode::ConfigParseFailed));
     }
 }

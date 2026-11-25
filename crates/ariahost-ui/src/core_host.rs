@@ -954,4 +954,51 @@ mod tests {
         let crypto = install_hint(Some(ErrorCode::CredentialCryptoFailed));
         assert!(crypto.contains("secret.bin"), "{crypto}");
     }
+
+    /// 测试用 setup：不读配置、不碰 DPAPI，固定一条「前置条件不满足」。
+    fn setup_failed() -> HostSetup {
+        HostSetup {
+            inputs: None,
+            problem: Some((
+                Some(ErrorCode::Aria2NotFound),
+                "未安装 aria2 核心（测试桩）".to_owned(),
+            )),
+            probe: probe_ok(),
+            rpc_secret: None,
+        }
+    }
+
+    /// 回归防线（Lead 缺陷 1）：`Stop` 必须**每次**都回一条状态，且不能卡住不发。
+    ///
+    /// 曾经的症状：点「移除」后 30ms 点「停止」，界面冻在「已等待 4.2 秒」。
+    /// 托管线程是「命令进 → 事件出」的单线程循环，任何时候 `recv` 到 Stop 都必须
+    /// 走完并 emit；这条测试用 3 秒超时把「静默卡死」钉死在 CI 上。
+    #[test]
+    fn stop_always_answers_and_never_hangs() {
+        use std::time::{Duration, Instant};
+
+        let log = Arc::new(LogBuffer::new());
+        let host = CoreHost::spawn(Arc::clone(&log), setup_failed());
+        host.start(); // 前置条件不满足 → 必须回 Failed，而不是毫无反应
+        host.stop(); // 没有 runtime → 直接 Stopped
+        host.stop(); // 连点两次也必须各回一条
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (mut failed, mut stopped) = (0usize, 0usize);
+        while Instant::now() < deadline && stopped < 2 {
+            while let Some(update) = host.try_recv() {
+                match &update.state {
+                    HostState::Failed { .. } => failed += 1,
+                    HostState::Stopped { .. } => stopped += 1,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(failed, 1, "启动被拒必须有一条 Failed");
+        assert_eq!(
+            stopped, 2,
+            "每次 Stop 都必须回一条 Stopped；少一条就是 UI 忙态永远解不开"
+        );
+    }
 }
