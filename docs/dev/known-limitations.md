@@ -20,13 +20,15 @@
 
 ---
 
-## L2 面板内部行为日志不落盘（`task-51` 跟踪中）
+## L2 面板内部行为日志尚未落盘（写入器已就绪，**转发未接**）
 
-**现象**：`ariahost.log` 在需求 F11 里写了"按大小轮转 10MB×5 份"，但直到 M3 之前**全仓没有写入点**——清理引擎在轮转一个永不存在的文件。面板日志只在内存环形缓冲，进程一退就全丢。
+**现象**：需求 F11 要求 `ariahost.log` 按大小轮转 10MB×5 份，但直到 M3 之前**全仓没有写入点**——清理引擎在轮转一个永不存在的文件；面板日志只在内存环形缓冲，进程一退就全丢。
 
 **后果**：用户报"点 X 卡住"→ 导诊断包 → 包里只有 `aria2.log`，面板自己走到哪一步一行都没有。
 
-**状态**：`task-51` 已派（写入器 + 脱敏 + 轮转，复用 `common::time::utc_stamp` / `common::redact` / `clean.rs::rotated_index`，不另造规则）。**修掉后删本条。**
+**当前进度**：写入器已落地（`common/src/logfile.rs`：`init/write/Level`，写盘前 `redact`、轮转复用 `rotated_index`、失败降级不 panic），`main.rs` 已按平面初始化，`service.log` 的 `Level` 已统一。**缺的只有面板侧的 1 行转发**——挂在 `LogBuffer::push`（`crates/ariahost-ui/src/logbuf.rs:29`，唯一收口点），接完后本条可删。
+
+> 为什么不散着挂：`app.rs` 里 `self.log.push` 有几十处，逐个挂必漏，且以后新增的行会忘。
 
 ---
 
@@ -42,7 +44,30 @@
 
 ---
 
-## L4 上游 aria2 关闭本身需 ~4.1 秒（非本产品可控）
+## L4 egui 的 accesskit 只消费 `Click`：`SetValue` / `Toggle` / `SelectionItem` 显式驱动无效
+
+**现象**（源码级已定位，`egui 0.37`）：
+
+| 控件 | UIA 暴露 | 实际效果 |
+|---|---|---|
+| `Button`（含分组导航） | `Invoke` / `Toggle` | **可驱动** |
+| `TextEdit` | `ValuePattern.SetValue` | **不生效**：provider 回声新值，但 app 状态未变（铁证：`保存` 一直 `disabled`——`is_dirty()` 若为真必变亮） |
+| `RadioButton` | `SelectionItem.Select` | 空转（egui 不消费该动作） |
+| `CheckBox` | `TogglePattern.Toggle` | 空转 |
+
+根因：`egui-0.37.0/src/context.rs:1769` 只处理 `input.has_accesskit_action_request(id, Action::Click)`；`response.rs:1001/1004` 只注册 `Focus` 与 `Click`。`rich_text_editor/builder.rs:1128` 虽然 `add_action(Action::SetValue)`，但返回值没有被应用到文本状态。
+
+**影响**：屏幕阅读器 / 语音输入 / 自动化脚本只能"发现并点击"，**不能"程序化设置值"**。对只用键盘的用户不构成阻断（Tab + 打字可用），但比鼠标用户多一道门槛。
+
+**这直接影响我们的取证方式**：UIA 驱动不了改值类验收条目。已定的做法是在面板里加**隐藏自检驱动**（`--panel-selftest --drive …`：把合成事件灌进 `egui::RawInput` 跑真正的 `ui()`），**不碰 Win32 输入、不需要解锁、可在 CI 跑**。
+
+**为什么不现在修**：这是 egui 上游行为，改它要 fork/补丁整条输入链路；且修好也没有用户可见收益（键盘用户不受阻）。
+
+**该修的条件**：egui 上游支持；或有屏幕阅读器用户明确要求"用语音设置数值"。届时判据要一起改，别把"必须支持 `SetValue`"写成门禁。
+
+---
+
+## L5 上游 aria2 关闭本身需 ~4.1 秒（非本产品可控）
 
 **现象**：发 `aria2.shutdown` 或 `forceShutdown` 之后，`aria2c.exe` 进程**自身**要 **4.1 秒**才退出（空载、无任务也一样）。
 
