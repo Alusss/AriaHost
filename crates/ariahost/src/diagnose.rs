@@ -34,7 +34,7 @@
 //!       "user":    {"root": "...", "installed": ["1.37.0"], "active": "1.37.0", "previous": null, "error": null},
 //!       "service": {"root": "...", "installed": [], "active": null, "previous": null, "error": null}
 //!     },
-//!     "core": {"exe": "...", "exists": true},
+//!     "core": {"exe": "...", "origin": "bundled", "exists": true},
 //!     "rpc":  {"port": 6800, "reachable": true, "version": "1.37.0", "active_tasks": 2, "error": null}
 //!   },
 //!   "service": {"installed": false, "state": "not-installed", "start_type": null, "pid": null},
@@ -419,14 +419,24 @@ fn plane_versions(plane: Plane) -> Value {
     })
 }
 
-/// 当前生效的核心 exe（不启动、只解析路径 + 看存在性）。
+/// 当前生效的核心 exe（不启动、只解析路径 + 来源 + 存在性）。
+///
+/// `origin` 必须报：内置/托管/外部是三种**不同的故障归因**——「找不到核心」时，
+/// 是安装包没带（发布事故）、版本库没激活（用户操作）、还是外部路径写错，
+/// 全靠这一个字段区分；只给路径的话，用户报障时我们仍要反问一轮。
 fn core_status(config: &Config) -> Value {
-    match ariahost_core::resolve_core_exe(config) {
-        Ok(path) => json!({
-            "exe": path.display().to_string(),
-            "exists": path.is_file(),
+    match ariahost_core::resolve_core(config) {
+        Ok(core) => json!({
+            "exe": core.path.display().to_string(),
+            "origin": core.origin.as_str(),
+            "exists": core.path.is_file(),
         }),
-        Err(error) => json!({"exe": null, "exists": false, "error": error.to_string()}),
+        Err(error) => json!({
+            "exe": null,
+            "origin": null,
+            "exists": false,
+            "error": error.to_string(),
+        }),
     }
 }
 
