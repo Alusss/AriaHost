@@ -87,3 +87,52 @@ cargo test --workspace -- --include-ignored
 - 验收 #12 的「CI 出包」只能由 `release.yml` 证明：本地无法替代（本机无 makensis/工具链）。
 - `clippy -D warnings` 与 `fmt --check` 是同级门禁：测试过了但 clippy 红，PR 一样不能合。
 - **已跑绿的是自动化那部分**（2026-11-25）：`fmt` / `clippy` / `cargo test --workspace --locked` / 静态 CRT 快检（`dumpbin`）/ `makensis` 真实载荷编译 / `release.yml` 出包 + `SHA256SUMS.txt`。**验收本身按人工签字算**：#1、#19 待真机，#13 IME 待真机，#15b 待干净 VM——「CI 绿」不等于「验收通过」。
+
+## 6. 观测纪律（多 agent 共享同一工作区时的硬规则）
+
+这一节来自三次真实误判，不是预防性说教。
+
+### 6.1 「红/绿」必须声明观测对象
+
+报告里必须写清是哪一种：
+
+| 观测对象 | 可信度 | 写法 |
+|---|---|---|
+| **隔离 worktree @ `<sha>`** | 高（只含该提交） | `worktree @ dbde5b0：cargo check --workspace --all-targets --locked → exit 0` |
+| **CI runner @ `<sha>`** | 高（唯一真 MSVC） | `CI run 45542650461 @ c6e50bc → success` |
+| **当前工作区** | **低**（混着别人未提交的改动） | 只有在 `git status --short` **为空**时才可作为证据 |
+
+**只要工作区里有别人的未提交文件，任何"红"和"绿"都不作数。** 实例：`cargo test --workspace` 在脏工作区报 `E0515`，被归因到已提交的 `0344914`；隔离 worktree 复核该提交 **52 passed / 0 failed**，红的是别人正在改的 `logfile.rs`。
+
+### 6.2 长期不可编译的半成品放自己的 worktree
+
+共享工作区只允许**能编译的中间态**。一个未跟踪且编译不过的文件（如半成品 `diagnose.rs` 里三处 `ariyahost_*` 拼写）会让**所有人**无法编译，且错误信息指向"某个提交"，误导归因。
+
+> 超过 ~30 分钟仍无法编译的半成品 → `git worktree add` 到自己名下，别留在共享树。
+
+### 6.3 GUI 子系统程序取退出码必须用 `Start-Process -Wait`
+
+`ariahost.exe` 是 `Subsystem=2 (GUI)`。PowerShell 对 GUI 程序**不等待**：
+
+```powershell
+& $exe --quit          # ← $LASTEXITCODE 是空值！不是 0，也不是 1
+```
+
+正确写法：
+
+```powershell
+$p = Start-Process -FilePath $exe -ArgumentList '--quit' -NoNewWindow -Wait -PassThru `
+      -RedirectStandardOutput q.out -RedirectStandardError q.err
+$p.ExitCode            # ← 真退出码
+```
+
+**所有自检脚本统一这个写法**；`cmd /c` 也不可靠（同样不回填）。
+
+### 6.4 自检入口不得提供可变后门
+
+隐藏自检（`--panel-selftest`、`--log-selftest`、`--panel-selftest --drive …`）**只能读状态、只能注入输入事件**。
+
+- ✅ 允许：`settings_state()` 只读、`RawInput` 注入文本/点击（走真正的 `ui()` 路径）
+- ❌ 禁止：直接 `draft_mut()` 改值、直接调 `save()`
+
+理由：测试若能用后门改状态，它就**证明不了 UI 接线**——而 UI 接线正是这类测试存在的唯一目的。
