@@ -136,3 +136,29 @@ $p.ExitCode            # ← 真退出码
 - ❌ 禁止：直接 `draft_mut()` 改值、直接调 `save()`
 
 理由：测试若能用后门改状态，它就**证明不了 UI 接线**——而 UI 接线正是这类测试存在的唯一目的。
+
+### 6.5 安全与"错误值"类缺陷只认受控实验
+
+**"跑一遍看起来正常"证明不了脱敏、权限、路径解析、版本上报这几类是对的。** 必须人为构造最坏输入，再对**产物**做机械扫描。
+
+做法：构造一个受控环境（伪 `%APPDATA%` / `%LOCALAPPDATA%` / `%ProgramData%`），把凭据塞满所有可能的位置，然后：
+
+```powershell
+# 1) 跑一次真实操作（例如 --diagnose）
+# 2) 对产物逐文件机械扫描原始秘密串，而不是人眼看输出
+$zip = "AriaHost-diagnose-....zip"
+Expand-Archive $zip -DestinationPath $tmp -Force
+Get-ChildItem $tmp -Recurse -File | ForEach-Object {
+    $hit = Select-String -Path $_.FullName -Pattern 'SUPERSECRET1234567890','PROXYPASS99','TRACKERKEY777' -SimpleMatch
+    if ($hit) { "LEAK: $($_.Name):$($hit.LineNumber)" }
+}
+```
+
+**已经用这个方法抓到两条真实漏洞**（2026-11-25）：
+
+1. `aria2` 回显的 `secret=…` 形状**没被脱敏**——原有三种形态的单测全绿，漏的是第四种。修法：`common::redact` 补 `secret:` / `secret=` / `passkey=` 标记，诊断侧再按"已知字面值"scrub 一遍。
+2. `os_version` 报 **6.2/9200（Windows 8）**——`GetVersionExW` 读的是**进程 manifest**，本程序没声明就谎报。改动态解析 `ntdll!RtlGetVersion` 后报 `10.0.26200`。
+
+第 2 条值得单独记：**"错值"比"没值"更坏**——用户贴上来我们会被引向完全错误的方向。
+
+**适用范围**：脱敏/权限/路径解析/版本上报/环境探测。这几类改动**必须配一个受控实验**，单测不代替它。
