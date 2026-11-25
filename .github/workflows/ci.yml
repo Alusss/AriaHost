@@ -429,6 +429,13 @@ jobs:
           }
           if (Test-Path $outNo) { Write-Error "负向断言失败：缺核心时仍生成了 $outNo"; exit 1 }
           Write-Host "OK：缺核心时按预期编译失败（默认 fail-closed 生效）"
+
+          # ---- 收尾：把「预期失败」留下的退出码清掉。
+          # GitHub Actions 的 powershell 包装器在用户脚本末尾会执行 `exit $LASTEXITCODE`；
+          # 上面第 4 步刚跑的是一个**故意失败**的 makensis（退出码 1），不重置的话
+          # 整步会在「四条断言全过」的情况下以 1 退出——run 45598611141 正是这样红的：
+          # 日志里四条 OK 全在，最后却 `Process completed with exit code 1`。
+          $global:LASTEXITCODE = 0
       - name: 上传调试产物（7 天）
         uses: actions/upload-artifact@v4
         with:
