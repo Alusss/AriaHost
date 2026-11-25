@@ -301,4 +301,28 @@ Get-Counter '\Process(ariahost)\Working Set - Private'
 
 **操作含义**：写判据时把点名要看的那一段**原样贴进判据**；复验时先用 UI Automation 抓那一行文本做子串比对，再谈其它。
 
+### 6.15 自述型字段要「值对」+「来源对」，缺一不算过
+
+诊断类字段（`os_version`、后端选择、核心来源、权限态）自带 `source` / `branch` 这类**来源标记**。判据必须同时看两件：
+
+1. **值**是否符合预期；
+2. **来源**是否是你想走的那条路。
+
+只对值不对来源，会出现两种假绿：**碰巧对**（`GetVersionExW` 在某些系统上也报真实 build）与**没走新路**（改动没编进去 / 解析失败落回退，而回退值恰好与期望相同）。
+
+**实例（task-67，2026-11-25）**：`os_version` 在 MSVC 产物上报 `{6,2,9200, fallback-getversionex}`，真因是**我们自己把窄串当宽串传**（`c"ntdll.dll".as_ptr().cast::<u16>()`），`GetModuleHandleW` 恒失败 → 永远落回退。修复后在 MSVC 产物上验的是**两件事**：
+
+```json
+"os_version": { "major": 10, "minor": 0, "build": 26200, "source": "ntdll-rtlgetversion" }
+```
+
+```
+[osver-probe] handle=0x7ffa1ba40000 handle_err=Some(0) proc=Some(0x7ffa1baea620) proc_err=Some(0) rtl_status=0 branch=ntdll
+```
+
+`branch=ntdll` 而不是 `fallback`，才算过；只看 `build=26200` 无法证明走的不是碰巧报对的回退。
+
+**操作含义**：凡「多路回退 + 自述来源」的实现，**判据里必须点名来源值**；探针日志（哪怕是 stderr 一次性输出）要留在脚本里，别为了干净删掉——它是唯一能证伪「碰巧对」的东西。
+
 ---
+

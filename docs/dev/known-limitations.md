@@ -221,20 +221,4 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 
 ---
 
-## L12 诊断包 `os_version` 在 MSVC 产物上曾报假值（**已修 `e4c6c9c`，待 MSVC 产物复验**）
-
-**现象**：同一份源码，MSVC 产物报 `{6,2,9200, source:"fallback-getversionex…"}`（Win8 / 6.2），GNU 交叉产物报真实 `26200`。诊断包 `env.json` 里的 `os_version` 因此在 MSVC 产物上是假的。
-
-**真因（与最初的猜测不同，值得记下来）**：**不是 manifest**，也不是 `RtlGetVersion` 不可用，而是我们自己**把窄串当宽串传**：
-
-```rust
-GetModuleHandleW(c"ntdll.dll".as_ptr().cast::<u16>())   // ← c"" 是 [u8]，cast 后按 UTF-16 读模块名
-```
-
-`GetModuleHandleW` 于是恒返回空 → `GetProcAddress("RtlGetVersion")` 恒失败 → 落到 `GetVersionExW`（它没有 `supportedOS` 声明时按 Win8 谎报，属第二层错误）。**历史反差也由此解释**：`task-49` 时代用的是 `Vec<u16>` 宽串写法，所以 GNU 报得对；后来重构成 `c""` 才引入，于是连 GNU 也错。
-
-**修法与证据**：改成显式 `[u16; N]` 宽串（`e4c6c9c`）。同机同源码 A/B，`--diagnose` 的 `env.json`：修复前 `{6,2,9200, fallback-getversionex}` → 修复后 `{10,0,26200, ntdll-rtlgetversion}`。
-
-**仍未验证的部分（所以本条不删）**：A/B 是在 **GNU 交叉产物**上做的；**修后的 MSVC 产物尚未实测**（要等一次 CI 构建后跑 `--diagnose` 读 `env.json` 才能闭环）。另：Win10 / Windows Server 未验。
-
-**在此之前的行为约束**：报障时若拿到的是 `e4c6c9c` 之前的产物，**不要**把 `os_version` 当事实——用 `winver` 截图或直接问用户。
+> **已销账（2026-11-25，v2.11）**：原 `L12`「诊断包 `os_version` 在 MSVC 产物上报假值」已修并**在 MSVC 产物上复验通过**（`e4c6c9c`；`env.json` = `{10,0,26200, ntdll-rtlgetversion}`，TRACE `branch=ntdll`）。按本文写入规则整条删除，编号不回收，来龙去脉记在架构文档 §24。
