@@ -18,8 +18,9 @@
 mod app;
 mod backend;
 mod core_host;
-mod drive;
+mod core_setup;
 pub mod ctl;
+mod drive;
 mod fonts;
 mod instance;
 mod logbuf;

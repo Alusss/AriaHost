@@ -149,7 +149,7 @@ impl Default for CoreProbe {
 
 impl CoreProbe {
     /// 前置条件是否齐备（按钮可用性用它，但按钮本身不因它置灰——
-    /// 用户可能刚在另一个窗口 `--aria2-fetch` 装好，点击时线程会重新定位）。
+    /// 用户可能刚在引导卡里把核心装好，点击时线程会重新定位）。
     pub fn ready(&self) -> bool {
         self.missing.is_none()
     }
@@ -743,7 +743,7 @@ fn rpc_line(port: u16) -> String {
 fn install_hint(code: Option<ErrorCode>) -> String {
     match code {
         Some(ErrorCode::Aria2NotFound) => {
-            "先安装核心：`ariahost --aria2-fetch latest`（或指定版本如 1.37.0）；面板不代装。"
+            "先装下载核心：面板首屏的「下载核心未就绪」卡片可在线下载，也可指定你已有的 aria2c。"
                 .to_owned()
         }
         Some(ErrorCode::ConfigParseFailed) => {
@@ -766,7 +766,7 @@ fn install_hint(code: Option<ErrorCode>) -> String {
 fn failure_hint(code: Option<ErrorCode>) -> String {
     match code {
         Some(ErrorCode::Aria2NotFound) => {
-            "aria2c 找不到：`ariahost --aria2-fetch latest` 装一次，或把 aria2.source 改成 external 并填 external_path。"
+            "aria2c 找不到：用首屏「下载核心未就绪」卡片装一次，或在设置页把核心来源改成 external 并填路径。"
                 .to_owned()
         }
         Some(ErrorCode::Aria2StartTimeout) => {
@@ -836,7 +836,7 @@ mod tests {
         assert_eq!(view.tone, Tone::Warn);
         assert_eq!(view.code, Some("AH-E2001"));
         let next = view.next_step.unwrap_or_default();
-        assert!(next.contains("--aria2-fetch"), "{next}");
+        assert!(next.contains("下载核心未就绪"), "{next}");
     }
 
     #[test]

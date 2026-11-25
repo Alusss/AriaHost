@@ -87,10 +87,13 @@ impl Frame {
 
     /// 折成 `RawInput`（屏幕尺寸固定，避免 0 尺寸导致布局不可点）。
     pub fn into_raw(self) -> RawInput {
-        let mut raw = RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 760.0)));
-        raw.events = self.events;
-        raw
+        // clippy::field_reassign_with_default：字段直接在初始化器里给，不要 Default 后再赋值
+        // （`-D warnings` 下这是硬错误，M3 第一次 CI 就是栽在这条）。
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 760.0))),
+            events: self.events,
+            ..RawInput::default()
+        }
     }
 }
 
@@ -107,21 +110,18 @@ fn idle(ctx: &egui::Context, app: &mut PanelApp) {
 /// 点一个已记录键的控件：先跑一帧取矩形，再跑一帧注入点击。
 fn click(ctx: &egui::Context, app: &mut PanelApp, key: &str) -> Result<(), String> {
     idle(ctx, app);
-    let center = app
-        .drive_targets
-        .center(key)
-        .ok_or_else(|| format!("找不到控件「{key}」（已记录：{:?}）", app.drive_targets.keys()))?;
+    let center = app.drive_targets.center(key).ok_or_else(|| {
+        format!(
+            "找不到控件「{key}」（已记录：{:?}）",
+            app.drive_targets.keys()
+        )
+    })?;
     pump(ctx, app, Frame::default().click(center).into_raw());
     Ok(())
 }
 
 /// 往某个输入框里整体替换成 `text`（点焦点 → Ctrl+A → 输入）。
-fn type_into(
-    ctx: &egui::Context,
-    app: &mut PanelApp,
-    key: &str,
-    text: &str,
-) -> Result<(), String> {
+fn type_into(ctx: &egui::Context, app: &mut PanelApp, key: &str, text: &str) -> Result<(), String> {
     click(ctx, app, key)?;
     pump(ctx, app, Frame::default().select_all().into_raw());
     pump(ctx, app, Frame::default().text(text).into_raw());
@@ -157,7 +157,11 @@ pub fn run_settings(ctx: &egui::Context, app: &mut PanelApp) -> Vec<String> {
     out.push(format!(
         "0 打开设置页 : 设置页打开={} => {}",
         app.settings_page_open(),
-        if app.settings_page_open() { "PASS" } else { "FAIL" }
+        if app.settings_page_open() {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     ));
 
     // ---- 场景 1：改下载目录 ----
@@ -191,7 +195,11 @@ pub fn run_settings(ctx: &egui::Context, app: &mut PanelApp) -> Vec<String> {
             out.push(format!(
                 "2 非法数字被拦 : draft split={split} 有红字={errors} 磁盘 cfg 未变={} => {}",
                 after == before_invalid,
-                if split == 99 && errors && after == before_invalid { "PASS" } else { "FAIL" }
+                if split == 99 && errors && after == before_invalid {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
             ));
         }
     }
@@ -216,7 +224,12 @@ pub fn run_settings(ctx: &egui::Context, app: &mut PanelApp) -> Vec<String> {
 
     // ---- 场景 4：开机自启（勾选 → 保存 → 配置落盘；HKCU 由外部脚本核对） ----
     let before_sw = read_cfg();
-    let toggled = click(ctx, app, "开机自启（start_with_windows，写 HKCU Run，不用计划任务）").is_ok();
+    let toggled = click(
+        ctx,
+        app,
+        "开机自启（start_with_windows，写 HKCU Run，不用计划任务）",
+    )
+    .is_ok();
     idle(ctx, app);
     let draft_sw = app.settings_state().draft().ui.start_with_windows;
     let saved_sw = click(ctx, app, "保存").is_ok();

@@ -22,6 +22,7 @@ use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
 use crate::core_host::{self, CoreHost, CoreProbe, HostState};
+use crate::core_setup::{CoreGuide, GuideNotice};
 use crate::instance::InstanceLock;
 use crate::logbuf::LogBuffer;
 use crate::metrics;
@@ -57,6 +58,9 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 任何一次漏排都会让界面停在「已等待 N 秒」的旧帧上，看起来就是「停止卡住了」。
 const BUSY_REPAINT: Duration = Duration::from_millis(100);
 
+/// 核心安装期间的重绘间隔（M3-h）：`setup` 线程只能往 `mpsc` 里塞事件，
+/// 推不醒 egui；300ms 足够跟手，又不会把下载线程的 CPU 抢掉。
+const CORE_SETUP_REPAINT: Duration = Duration::from_millis(300);
 /// 恢复窗口几何后最多检查多少帧：首帧窗口位置可能还没上报（部分平台先给 None），
 /// 不能因为第一次拿不到就永久放弃校正，也不能无限等。
 const MAX_GEOMETRY_CHECKS: u32 = 30;
@@ -224,6 +228,10 @@ pub struct PanelApp {
     core: HostState,
     /// 启动前置条件探测（决定「未安装」文案与按钮提示）。
     core_probe: CoreProbe,
+    /// 首次运行「核心未就绪」引导（M3-h）：在线下载 / 指定本地 / 稍后。
+    guide: CoreGuide,
+    /// 刷新运行时用（核心刚装好时要按新配置重建 host 与 worker）。
+    worker_options: crate::worker::WorkerOptions,
     /// 忙态的起点（用来显示「已等待 X 秒」）。
     busy_since: Option<Instant>,
     /// 最近一轮 aria2 全局结果。
@@ -438,7 +446,11 @@ impl PanelApp {
             worker,
             host,
             core,
-            core_probe: probe,
+            core_probe: probe.clone(),
+            // M3-h：核心不可用就展开引导卡（判定用的是启动时那次探测，不做每帧 IO）。
+            // **只认 AH-E2001**：配置读不出来走它自己的错误路径，不让引导卡冒充。
+            guide: CoreGuide::new(crate::core_setup::guide_needed(&probe)),
+            worker_options: worker_options.clone(),
             busy_since: None,
             aria2: None,
             service: None,
@@ -793,8 +805,7 @@ impl PanelApp {
                     if save_response.clicked() {
                         self.save_settings();
                     }
-                    let undo_response =
-                        ui.add_enabled(dirty, egui::Button::new("撤销更改"));
+                    let undo_response = ui.add_enabled(dirty, egui::Button::new("撤销更改"));
                     self.drive_targets.note("撤销更改", undo_response.rect);
                     if undo_response.clicked() {
                         self.settings.undo();
@@ -803,6 +814,19 @@ impl PanelApp {
                     self.drive_targets.note("恢复默认", reset_response.rect);
                     if reset_response.clicked() {
                         self.settings.reset_defaults();
+                    }
+                    ui.separator();
+                    // M3-h：核心来源的**常驻入口**——卡片收掉（「稍后再说」）之后，
+                    // 用户还能从这里把引导叫回来，不必去找命令行。
+                    let core_response = ui.button("重新配置下载核心");
+                    if core_response
+                        .on_hover_text(
+                            "重新打开「下载核心未就绪」卡片（在线下载 / 指定已有 aria2c）",
+                        )
+                        .clicked()
+                    {
+                        self.guide.reopen();
+                        self.log.push("设置页：重新打开核心引导卡".to_owned());
                     }
                     ui.separator();
                     if dirty {
@@ -911,8 +935,7 @@ impl PanelApp {
                         // 用真 `Button`（`.selected()` 出高亮）而不是 `selectable_label`：
                         // 后者在 accesskit 里不作为可执行控件暴露，屏幕阅读器/UIA **点不动**，
                         // 等于用键盘或辅助技术的人无法切换分组（真机验收时正是卡在这里）。
-                        let response =
-                            ui.add(egui::Button::new(group.label()).selected(selected));
+                        let response = ui.add(egui::Button::new(group.label()).selected(selected));
                         self.drive_targets.note(group.label(), response.rect);
                         if response.clicked() {
                             self.settings.set_group(group);
@@ -1830,6 +1853,271 @@ impl PanelApp {
     /// **EG-2 硬约束**：本输入框只在第一帧请求一次焦点，之后永不调用
     /// `request_focus`（它会 `interrupt_ime()`，每帧调用等于每帧打断中文组合串，
     /// egui Issue #8813）。焦点之后完全由用户点击决定。
+    /// 核心是否可用：`core_probe` 是**启动快照**，刚装好的情形靠 `guide` 补上。
+    fn core_usable(&self) -> bool {
+        self.core_probe.ready() || self.guide.core_usable()
+    }
+
+    /// 消费核心安装事件 + 走看门狗（每帧一次，全非阻塞）。
+    fn pump_core_guide(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.guide.tick(now);
+        let out = self.guide.poll(now);
+        for line in out.logs {
+            self.log.push(line);
+        }
+        if out.refresh_runtime {
+            self.refresh_runtime_after_core_setup();
+        }
+        if self.guide.busy() {
+            ctx.request_repaint_after(CORE_SETUP_REPAINT);
+        }
+    }
+
+    /// 核心刚就绪（装好或切到 external）：按**新配置**重建 host 与 worker。
+    ///
+    /// 不重建会出现最气人的那种 bug：卡片说「已就绪」，点启动仍报「核心未安装」
+    /// ——因为 `HostSetup` 是启动时那一次 prepare 的快照。
+    fn refresh_runtime_after_core_setup(&mut self) {
+        if self.core.is_busy() {
+            self.log
+                .push("核心已装好，但 aria2 正在启停中，等这一轮结束再刷新运行时".to_owned());
+            return;
+        }
+        let setup = core_host::HostSetup::prepare(&self.log);
+        self.core_probe = setup.probe().clone();
+        let options = setup.worker_options(&self.log);
+        self.worker_options = options.clone();
+        self.core = HostState::Idle;
+        // 旧的 host 在这里被丢弃：`CoreHost::drop` 会发 `Shutdown`，线程自己收工。
+        self.host = Some(CoreHost::spawn(Arc::clone(&self.log), setup));
+        self.worker = Some(crate::worker::Worker::spawn(Arc::clone(&self.log), options));
+        self.log
+            .push("已按新核心重建运行时：点「启动 aria2」即可开始下载".to_owned());
+    }
+
+    /// 首屏引导卡：核心未就绪时才出现。
+    ///
+    /// 三条硬约束落在这一块上：
+    /// - 取消**不假装即时**（文案是「当前步骤完成后停止」）；
+    /// - 线路与回退显式可见（[`crate::core_setup::LineChoice::describe_hit`]）；
+    /// - 看门狗超时后给「换线路 / 稍后再说」两个出口，不留转圈到地老天荒的界面。
+    fn show_core_guide(&mut self, ui: &mut egui::Ui) {
+        if !self.guide.open {
+            return;
+        }
+        let mut start_online = false;
+        let mut start_external = false;
+        let mut cancel = false;
+        let mut dismiss = false;
+        let mut switch_line = false;
+        let mut reopen_settings = false;
+
+        egui::Frame::group(ui.style())
+            .fill(ui.style().visuals.faint_bg_color)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("下载核心未就绪").strong());
+                    ui.label(
+                        RichText::new("（AriaHost 需要一个 aria2c 才能下载东西）")
+                            .weak()
+                            .small(),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "第一次使用需要先准备好 aria2 核心。可以现在下载，也可以指定你已有的 aria2c。",
+                    )
+                    .small(),
+                );
+                ui.add_space(4.0);
+
+                // —— 上一轮的结论 ——
+                if let Some(notice) = &self.guide.notice {
+                    match notice {
+                        GuideNotice::Online {
+                            version,
+                            line_note,
+                            hash_note,
+                            warnings,
+                        } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "已就绪：aria2 {version}（{line_note}；{hash_note}）"
+                                ))
+                                .small(),
+                            );
+                            for warning in warnings {
+                                ui.label(RichText::new(format!("· {warning}")).weak().small());
+                            }
+                        }
+                        GuideNotice::External { version, path } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "已改用你指定的 aria2 {version}：{}",
+                                    path.display()
+                                ))
+                                .small(),
+                            );
+                        }
+                        GuideNotice::Failed {
+                            message,
+                            hint,
+                            retry_other,
+                        } => {
+                            // **不弹红条砸脸**：就地一行说明 + 可执行建议。
+                            ui.label(RichText::new(message).small());
+                            ui.label(RichText::new(format!("可以这样处理：{hint}")).small().weak());
+                            if *retry_other {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "下一步：换 {} 再试",
+                                        self.guide.line.other().label()
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        }
+                        GuideNotice::CancelledTooLate { step } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} 在取消前就已经完成，本轮结果仍然有效",
+                                    step.label()
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+
+                if self.guide.busy() {
+                    // —— 进行中 ——
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(self.guide.step.label()).small());
+                        ui.label(RichText::new(format!("· {}", self.guide.line.label())).weak().small());
+                    });
+                    if self.guide.cancel_requested {
+                        // 诚实：取消不是即时的。
+                        ui.label(
+                            RichText::new("已请求取消：当前步骤完成后停止（下载并校验是一整步，不能中途掐断）")
+                                .small()
+                                .weak(),
+                        );
+                    } else if ui
+                        .button("取消")
+                        .on_hover_text("当前步骤（下载并校验）跑完后停止")
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                    if self.guide.slow {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(
+                                "已经 45 秒没有任何进展：网络慢或被拦截（GitHub 在部分网络下不可达）",
+                            )
+                            .small(),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(format!("换 {} 再试", self.guide.line.other().label()))
+                                .clicked()
+                            {
+                                switch_line = true;
+                            }
+                            if ui.button("稍后再说").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    }
+                } else {
+                    // —— 三个入口 ——
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("在线下载（{}）", self.guide.line.label()))
+                            .on_hover_text("从 GitHub 下载官方 aria2；失败会自动换另一条线路重试")
+                            .clicked()
+                        {
+                            start_online = true;
+                        }
+                        if ui
+                            .button(format!("改用{}", self.guide.line.other().label()))
+                            .on_hover_text("把另一条线路排在前面（仍然保留自动回退）")
+                            .clicked()
+                        {
+                            self.guide.line = self.guide.line.other();
+                        }
+                        if ui.button("稍后再说").on_hover_text("先不装；面板可看，下载按钮暂时禁用").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("已有 aria2c：").small());
+                        let width = (ui.available_width() - 92.0).max(160.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.guide.external_path)
+                                .id_salt("ariahost_external_core")
+                                .hint_text("粘贴 aria2c.exe 的完整路径")
+                                .desired_width(width),
+                        );
+                        if ui
+                            .button("校验并使用")
+                            .on_hover_text("会跑一次 --version 确认它能用，然后写进配置")
+                            .clicked()
+                        {
+                            start_external = true;
+                        }
+                    });
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("去设置页配置核心")
+                        .on_hover_text("设置页「界面」组里有重新进入这块的入口")
+                        .clicked()
+                    {
+                        reopen_settings = true;
+                    }
+                });
+            });
+
+        if start_online && self.guide.start_online() {
+            self.log.push(format!(
+                "核心引导：开始在线下载（{}）",
+                self.guide.line.label()
+            ));
+        }
+        if start_external {
+            let raw = self.guide.external_path.trim().to_owned();
+            let path = ariahost_common::config::expand_user_path(&raw);
+            if self.guide.start_external(path) {
+                self.log.push(format!("核心引导：校验本地 aria2c（{raw}）"));
+            }
+        }
+        if cancel {
+            self.guide.request_cancel();
+            self.log
+                .push("核心引导：已请求取消（当前步骤完成后停止）".to_owned());
+        }
+        if switch_line {
+            self.log.push("核心引导：看门狗接管，换线路重试".to_owned());
+            self.guide.switch_line();
+        }
+        if dismiss {
+            self.guide.dismiss();
+            self.log
+                .push("核心引导：已收下这张卡；下载按钮暂时禁用，设置页可重新进入".to_owned());
+        }
+        if reopen_settings {
+            self.settings_open = true;
+        }
+    }
+
     fn show_new_task(&mut self, ui: &mut egui::Ui) {
         let mut submit = false;
         ui.horizontal(|ui| {
@@ -1850,12 +2138,15 @@ impl PanelApp {
             }
             let enter =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if ui
-                .button("开始")
-                .on_hover_text("加入下载队列（aria2.addUri）")
-                .clicked()
-                || enter
-            {
+            // M3-h：核心没就绪时「开始」置灰，并把同一句引导挂在悬浮提示上。
+            let core_ok = self.core_usable();
+            let start = ui.add_enabled(core_ok, egui::Button::new("开始"));
+            let hint = if core_ok {
+                "加入下载队列（aria2.addUri）"
+            } else {
+                "先准备好下载核心：见上方「下载核心未就绪」卡片"
+            };
+            if start.on_hover_text(hint).clicked() || (core_ok && enter) {
                 submit = true;
             }
         });
@@ -2542,6 +2833,8 @@ impl PanelApp {
         self.sample_memory();
         self.drain_worker();
         self.drain_core();
+        // M3-h：核心安装事件的消费 + 看门狗（线程侧不碰 UI，这里只 try_recv 与内存判断）。
+        self.pump_core_guide(ui.ctx());
         self.expire_optimistic();
         // M2-3：托盘 / 关闭三档 / 退出流程 / 启动检测（全部非阻塞）。
         self.pump_tray(ui.ctx());
@@ -2606,6 +2899,8 @@ impl PanelApp {
                 self.show_quit_line(ui);
                 self.show_session_bar(ui);
                 self.show_banner(ui);
+                // M3-h：首屏引导卡放在最上面（不是模态：它不挡托盘、不挡关闭，其余页照常可看）。
+                self.show_core_guide(ui);
                 if !self.seed_mode() {
                     self.show_new_task(ui);
                 }
@@ -2682,7 +2977,8 @@ fn short_name(uri: &str) -> String {
 fn failure_next_step(code: Option<ErrorCode>) -> String {
     match code {
         Some(ErrorCode::Aria2NotFound) => {
-            "先安装核心：`ariahost --aria2-fetch latest`（面板不代装）".to_owned()
+            "点面板上的「下载核心未就绪」卡片：可以就地在线下载，也可以指定你已有的 aria2c"
+                .to_owned()
         }
         Some(ErrorCode::Aria2StartTimeout) => {
             "看 %APPDATA%\\AriaHost\\logs\\aria2.log；端口被占时改 aria2.rpc.port".to_owned()
@@ -2918,7 +3214,7 @@ mod tests {
 
     #[test]
     fn failure_next_steps_are_actionable() {
-        assert!(failure_next_step(Some(ErrorCode::Aria2NotFound)).contains("--aria2-fetch"));
+        assert!(failure_next_step(Some(ErrorCode::Aria2NotFound)).contains("下载核心未就绪"));
         assert!(failure_next_step(Some(ErrorCode::Aria2StartTimeout)).contains("aria2.log"));
         assert!(!failure_next_step(None).is_empty());
     }
