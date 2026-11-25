@@ -21,21 +21,33 @@
 //! ## 免打扰（本批硬要求）
 //!
 //! - 同 `kind` 冷却 [`COOLDOWN`]（30 分钟）；
-//! - 同 `kind` 每天最多 [`DAILY_CAP`]（5）次，隔天（UTC 日界线）重置；
+//! - 同 `kind` **24 小时滚动窗口**内最多 [`RATE_CAP`]（5）条——**不是** UTC 日历日
+//!   （Lead 裁决 2026-11-25：用户理解的是「最近这段时间别烦我」，UTC+8 下按日历日会在
+//!   早 8 点前后各刷 5 条，与「每天」文案对不上；滚动窗口零依赖、零时区语义）；
 //! - [`Notifier::mute`]（面板「本次忽略」）= 本进程内该类静默直到退出。
 //!
 //! **配置来源的诚实说明**：定版 schema（52 键）里通知只有 `notify.on_complete`（默认 true）、
-//! `notify.on_error`（默认 true）、`notify.backend`（默认 `auto`）三个键，**没有**冷却/每日上限键。
-//! 所以冷却与上限在这里是常量，并通过 [`Notifier::set_policy`] 承接那两个真实存在的开关；
-//! 「要不要给 schema 加 `notify.cooldown_minutes`」已上报 Lead 裁决，**本模块不自造配置键**。
+//! `notify.on_error`（默认 true）、`notify.backend`（默认 `auto`）三个键，**没有**冷却/上限键
+//! （Lead 裁决：不加键，走常量；M4 评估是否开键）。所以冷却是常量，频率上限是常量，
+//! 真实存在的两个开关由 [`Notifier::set_policy`] 承接——**本模块不自造配置键**。
+//!
+//! ## 通道可用性（给关闭逻辑用）
+//!
+//! [`ChannelAvailability`] 是「气泡到底能不能发」的可查询状态：`tray-icon` 把
+//! `Shell_NotifyIconW(NIM_ADD)` 失败当成功（本仓实测：`build()` 返回 `Ok` 而托盘图标并不存在），
+//! 所以关闭逻辑**不能**假设「藏进托盘」一定能找回来——气泡通道不可用时要降级为
+//! 最小化到任务栏 / 提示后退出（M3-d 待办，本模块只提供判据）。
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 /// 同 `kind` 的通知冷却期（配置 schema 无对应键，见模块文档）。
 pub const COOLDOWN: Duration = Duration::from_secs(30 * 60);
 
-/// 同 `kind` 每天最多发几条（超限静默，只落日志）。
-pub const DAILY_CAP: u32 = 5;
+/// 频率上限的窗口长度：**滚动 24 小时**（不是日历日）。
+pub const RATE_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 同一 `kind` 在 [`RATE_WINDOW`] 内最多发几条（超限静默，只落日志）。
+pub const RATE_CAP: usize = 5;
 
 /// 通知类别。`as_str()` 的取值会出现在日志与抑制原因里，**是稳定契约**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,8 +127,8 @@ pub enum SuppressReason {
     Muted,
     /// 冷却期内。
     Cooldown,
-    /// 今天的次数用完了。
-    DailyCap,
+    /// 滚动 24 小时窗口内的次数用完了。
+    WindowCap,
 }
 
 impl SuppressReason {
@@ -125,7 +137,7 @@ impl SuppressReason {
             Self::Disabled => "disabled",
             Self::Muted => "muted",
             Self::Cooldown => "cooldown",
-            Self::DailyCap => "daily-cap",
+            Self::WindowCap => "window-cap",
         }
     }
 }
@@ -163,6 +175,60 @@ pub struct NotifyStats {
     pub suppressed: u32,
 }
 
+/// 通知通道的可用性（**给关闭逻辑用**，见模块文档最后一节）。
+///
+/// 为什么要这个类型：`tray-icon` 不把 `NIM_ADD` 失败当错误，所以「托盘建好了」
+/// 与「托盘真的在」是两件事。`ui.close_action=tray` 的「藏进托盘」必须排在
+/// `balloon == true` 之后，否则用户会连图标都找不到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChannelAvailability {
+    /// 托盘气泡是否可用（能拿到图标身份**且** `NIM_MODIFY` 被接受过）。
+    balloon: bool,
+    /// 不可用的原因（可用时为 `None`）：落日志与面板告警要能说清「为什么没通知」。
+    reason: Option<&'static str>,
+}
+
+impl ChannelAvailability {
+    /// 什么都不通且**说不出原因**（兜底；优先用 [`Self::unavailable`]）。
+    pub const fn none() -> Self {
+        Self::unavailable("no-channel")
+    }
+
+    /// 不可用 + 具体原因（`not-windows` / `tray-missing` / `shell-refused` …）。
+    pub const fn unavailable(reason: &'static str) -> Self {
+        Self {
+            balloon: false,
+            reason: Some(reason),
+        }
+    }
+
+    /// 气泡可用。
+    pub const fn balloon() -> Self {
+        Self {
+            balloon: true,
+            reason: None,
+        }
+    }
+
+    pub const fn is_balloon(self) -> bool {
+        self.balloon
+    }
+
+    /// 不可用的原因；可用时为 `None`。
+    pub const fn reason(self) -> Option<&'static str> {
+        self.reason
+    }
+
+    /// 稳定字符串（日志/面板告警用）：`balloon` 或 `none`。
+    pub const fn summary(self) -> &'static str {
+        if self.balloon {
+            "balloon"
+        } else {
+            "none"
+        }
+    }
+}
+
 /// 通知中心：只做**判定 + 排队**，不发系统调用（发由 UI 线程做）。
 ///
 /// 这样拆分的原因：判定逻辑必须能在 Linux/CI 上单测（托盘与 `Shell_NotifyIconW` 只在
@@ -173,10 +239,12 @@ pub struct Notifier {
     on_error: bool,
     /// 每个类别上次**真的**发出去的时间。
     last: HashMap<NotifyKind, SystemTime>,
-    /// 每个类别当日计数 + 当日编号（UTC 天）。
-    today: HashMap<NotifyKind, (u64, u32)>,
+    /// 每个类别在滚动窗口内**真的**发出去的时间戳（旧的会被裁掉）。
+    recent: HashMap<NotifyKind, Vec<SystemTime>>,
     /// 面板里点过「本次忽略」的类别。
     muted: HashSet<NotifyKind>,
+    /// 通道可用性（由 tray 层写入，关闭逻辑读）。
+    channel: ChannelAvailability,
     /// 待发队列（UI 线程每帧 `drain` 一次）。
     outbox: Vec<Notification>,
     stats: NotifyStats,
@@ -189,8 +257,9 @@ impl Notifier {
             on_complete: true,
             on_error: true,
             last: HashMap::new(),
-            today: HashMap::new(),
+            recent: HashMap::new(),
             muted: HashSet::new(),
+            channel: ChannelAvailability::none(),
             outbox: Vec::new(),
             stats: NotifyStats::default(),
         }
@@ -200,6 +269,16 @@ impl Notifier {
     pub fn set_policy(&mut self, on_complete: bool, on_error: bool) {
         self.on_complete = on_complete;
         self.on_error = on_error;
+    }
+
+    /// 写入通道可用性（托盘建成/失败时由 UI 侧调用）。
+    pub fn set_channel(&mut self, channel: ChannelAvailability) {
+        self.channel = channel;
+    }
+
+    /// 当前通道可用性（关闭逻辑：气泡不可用时不许「藏进托盘」）。
+    pub fn channel(&self) -> ChannelAvailability {
+        self.channel
     }
 
     /// 「本次忽略」：该类在本进程内静默。
@@ -232,13 +311,10 @@ impl Notifier {
             self.stats.suppressed += 1;
             return NotifyOutcome::Suppressed { kind, reason };
         }
-        let day = day_index(now);
-        let entry = self.today.entry(kind).or_insert((day, 0));
-        if entry.0 != day {
-            *entry = (day, 0);
-        }
-        entry.1 += 1;
         self.last.insert(kind, now);
+        let window = self.recent.entry(kind).or_default();
+        prune_window(window, now);
+        window.push(now);
         self.outbox.push(notice);
         self.stats.queued += 1;
         NotifyOutcome::Queued
@@ -258,9 +334,14 @@ impl Notifier {
                 return Some(SuppressReason::Cooldown);
             }
         }
-        if let Some((day, count)) = self.today.get(&kind).copied() {
-            if day == day_index(now) && count >= DAILY_CAP {
-                return Some(SuppressReason::DailyCap);
+        if let Some(window) = self.recent.get(&kind) {
+            // 窗口内还留着几条，就是「最近 24 小时真的发过几条」。
+            let in_window = window
+                .iter()
+                .filter(|sent| within_window(**sent, now))
+                .count();
+            if in_window >= RATE_CAP {
+                return Some(SuppressReason::WindowCap);
             }
         }
         None
@@ -292,11 +373,20 @@ impl Default for Notifier {
     }
 }
 
-/// UTC 天编号（`SystemTime` → 自 1970-01-01 起的整天数）。只用来做「每天」的桶，不涉及时区。
-fn day_index(now: SystemTime) -> u64 {
-    now.duration_since(SystemTime::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() / 86_400)
-        .unwrap_or(0)
+/// 该时间戳是否还在「现在往前 [`RATE_WINDOW`]」的窗口里。
+///
+/// 时钟回拨时（`sent` 在 `now` 之后）**算在窗口内**：宁可少发一条，也别因为系统时间
+/// 被改动而连发 5 条骚扰用户。
+fn within_window(sent: SystemTime, now: SystemTime) -> bool {
+    match now.duration_since(sent) {
+        Ok(elapsed) => elapsed < RATE_WINDOW,
+        Err(_) => true,
+    }
+}
+
+/// 裁掉窗口外的旧时间戳（防止 `Vec` 无限长）。
+fn prune_window(window: &mut Vec<SystemTime>, now: SystemTime) {
+    window.retain(|sent| within_window(*sent, now));
 }
 
 #[cfg(test)]
@@ -314,6 +404,17 @@ mod tests {
 
     fn at(minutes: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(minutes * 60)
+    }
+
+    /// 发满 5 条（每条错开 31 分钟避开冷却）。
+    fn fill_window(notifier: &mut Notifier) {
+        for index in 0..RATE_CAP as u64 {
+            assert_eq!(
+                notifier.offer_at(clean(), at(index * 31)),
+                NotifyOutcome::Queued,
+                "第 {index} 条应放行"
+            );
+        }
     }
 
     #[test]
@@ -364,27 +465,71 @@ mod tests {
     }
 
     #[test]
-    fn daily_cap_blocks_sixth_notice_then_resets_next_day() {
+    fn window_cap_blocks_sixth_within_24h() {
         let mut notifier = Notifier::new();
-        // 每次错开 31 分钟，避开冷却（5 条需要 4×31 = 124 分钟）
-        for index in 0..DAILY_CAP as u64 {
-            let outcome = notifier.offer_at(clean(), at(index * 31));
-            assert_eq!(outcome, NotifyOutcome::Queued, "第 {index} 条应放行");
-        }
-        let sixth = notifier.offer_at(clean(), at(DAILY_CAP as u64 * 31));
+        fill_window(&mut notifier);
+        // 第 6 条：仍在 24h 窗口内（5 条最老的是 t=0，隔了 155 分钟）
         assert_eq!(
-            sixth,
+            notifier.offer_at(clean(), at(RATE_CAP as u64 * 31)),
             NotifyOutcome::Suppressed {
                 kind: NotifyKind::Clean,
-                reason: SuppressReason::DailyCap
+                reason: SuppressReason::WindowCap
             }
         );
-        // 第二天（UTC 天界）重置
-        let next_day = at(24 * 60);
+    }
+
+    /// 配额是**滑动窗口**，不是「UTC 日历日计数」。
+    ///
+    /// 判据取在跨零点这一刻：把 5 条全塞在 23:xx（同一天末），零点后来一条。
+    /// - 日历日实现：计数器归零 → 放行（用户会在零点后 1 分钟被再骚扰一次）。
+    /// - 滚动窗口实现：5 条都还在 24h 内 → 拦。
+    ///
+    /// `UNIX_EPOCH` 正好是 UTC 零点，所以第 2 天的零点 = 2880 分钟。
+    /// 注意门的顺序是「开关 → 静默 → 冷却 → 配额」，所以探针要离最后一条 ≥30 分钟，
+    /// 否则先被 `Cooldown` 拦下，测不到配额。
+    #[test]
+    fn window_slides_instead_of_resetting_at_midnight() {
+        let midnight = 2880;
+        let mut notifier = Notifier::new();
+        for index in 0..RATE_CAP as u64 {
+            // 2730/2761/2792/2823/2854 —— 全部落在零点前的同一天末段
+            assert_eq!(
+                notifier.offer_at(clean(), at(midnight - 150 + index * 31)),
+                NotifyOutcome::Queued,
+                "零点前的第 {index} 条应放行"
+            );
+        }
+        // 零点后 31 分钟（冷却已过，配额未滑出）：日历日实现会归零放行，滚动窗口必须仍拦
         assert_eq!(
-            notifier.offer_at(clean(), next_day),
+            notifier.offer_at(clean(), at(midnight + 31)),
+            NotifyOutcome::Suppressed {
+                kind: NotifyKind::Clean,
+                reason: SuppressReason::WindowCap
+            },
+            "跨零点不该释放配额（那正是日历日实现的 bug）"
+        );
+        // 最老那条（2730）满 24h 出窗口：2730+1440=4170 分钟 → 窗口内剩 4 条 → 放行
+        assert_eq!(
+            notifier.offer_at(clean(), at(midnight - 150 + RATE_WINDOW.as_secs() / 60)),
             NotifyOutcome::Queued,
-            "隔天要重置计数"
+            "滑动窗口：最老条目滑出后应释放配额"
+        );
+    }
+
+    #[test]
+    fn window_cap_does_not_leak_across_kinds() {
+        let mut notifier = Notifier::new();
+        fill_window(&mut notifier);
+        let update = Notification::new(
+            NotifyKind::UpdateAvailable,
+            NotifyLevel::Info,
+            "有新版本",
+            "1.38.0",
+        );
+        assert_eq!(
+            notifier.offer_at(update, at(155)),
+            NotifyOutcome::Queued,
+            "配额是按类别算的"
         );
     }
 
@@ -454,6 +599,30 @@ mod tests {
     }
 
     #[test]
+    fn channel_availability_is_queryable_for_close_logic() {
+        // 关默认不可用：关闭逻辑若在托盘建不起来时仍「藏进托盘」，用户就找不回来了。
+        let mut notifier = Notifier::new();
+        assert!(!notifier.channel().is_balloon());
+        assert_eq!(notifier.channel().summary(), "none");
+        assert_eq!(
+            notifier.channel().reason(),
+            Some("no-channel"),
+            "兜底也要有原因"
+        );
+        notifier.set_channel(ChannelAvailability::balloon());
+        assert!(notifier.channel().is_balloon());
+        assert_eq!(notifier.channel().summary(), "balloon");
+        assert_eq!(notifier.channel().reason(), None, "可用时不该有原因");
+        notifier.set_channel(ChannelAvailability::unavailable("shell-refused"));
+        assert!(!notifier.channel().is_balloon(), "降级要能写回去");
+        assert_eq!(
+            notifier.channel().reason(),
+            Some("shell-refused"),
+            "原因要能一路传到面板与日志"
+        );
+    }
+
+    #[test]
     fn suppress_log_line_is_pinned() {
         assert_eq!(
             NotifyOutcome::Suppressed {
@@ -476,23 +645,24 @@ mod tests {
         assert_eq!(SuppressReason::Disabled.as_str(), "disabled");
         assert_eq!(SuppressReason::Muted.as_str(), "muted");
         assert_eq!(SuppressReason::Cooldown.as_str(), "cooldown");
-        assert_eq!(SuppressReason::DailyCap.as_str(), "daily-cap");
+        assert_eq!(SuppressReason::WindowCap.as_str(), "window-cap");
         assert_eq!(NotifyLevel::Info.as_str(), "info");
         assert_eq!(NotifyLevel::Warn.as_str(), "warn");
         assert_eq!(NotifyLevel::Error.as_str(), "error");
     }
 
     #[test]
-    fn cooldown_length_is_thirty_minutes() {
+    fn policy_constants_are_pinned() {
         assert_eq!(COOLDOWN, Duration::from_secs(1800));
-        assert_eq!(DAILY_CAP, 5);
+        assert_eq!(RATE_WINDOW, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(RATE_CAP, 5);
     }
 
     #[test]
     fn clock_going_backwards_does_not_panic() {
         let mut notifier = Notifier::new();
         assert_eq!(notifier.offer_at(clean(), at(120)), NotifyOutcome::Queued);
-        // 时钟被拨回：按 0 处理（视作刚发过），不能 panic、不能放行成重复打扰
+        // 时钟被拨回：按「还在窗口内」处理，不能 panic、不能放行成重复打扰
         assert_eq!(
             notifier.offer_at(clean(), at(0)),
             NotifyOutcome::Suppressed {

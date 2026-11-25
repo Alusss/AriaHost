@@ -40,8 +40,9 @@ pub use backend::Backend;
 pub use core_host::{CoreHost, CoreProbe, HostState};
 pub use logbuf::LogBuffer;
 pub use notify::{
-    Notification, Notifier, NotifyKind, NotifyLevel, NotifyOutcome, NotifyStats, SuppressReason,
-    COOLDOWN as NOTIFY_COOLDOWN, DAILY_CAP as NOTIFY_DAILY_CAP,
+    ChannelAvailability, Notification, Notifier, NotifyKind, NotifyLevel, NotifyOutcome,
+    NotifyStats, SuppressReason, COOLDOWN as NOTIFY_COOLDOWN, RATE_CAP as NOTIFY_RATE_CAP,
+    RATE_WINDOW as NOTIFY_RATE_WINDOW,
 };
 pub use settings::{Effect, Group, Notice, Settings};
 pub use tasks::{TaskAction, TaskRow, TaskStatus};

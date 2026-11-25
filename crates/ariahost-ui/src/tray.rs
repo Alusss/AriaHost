@@ -12,7 +12,7 @@
 //! 重建/释放：`TrayIcon` drop 即从托盘区移除；面板退出时随 `PanelApp` 一起销毁。
 use crate::logbuf::LogBuffer;
 #[cfg(windows)]
-use crate::notify::NotifyLevel;
+use crate::notify::{ChannelAvailability, NotifyLevel};
 
 #[cfg(windows)]
 use ariahost_common::{PRODUCT_NAME, VERSION};
@@ -21,7 +21,7 @@ use tray_icon::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem}
 #[cfg(windows)]
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{GetLastError, HWND};
 #[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_INFO, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_RESPECT_QUIET_TIME,
@@ -69,6 +69,10 @@ impl Tray {
     }
     pub fn can_notify(&self) -> bool {
         false
+    }
+    /// 非 Windows 永远没有托盘通道。
+    pub fn channel(&self) -> crate::notify::ChannelAvailability {
+        crate::notify::ChannelAvailability::unavailable("not-windows")
     }
 }
 
@@ -122,6 +126,8 @@ pub struct Tray {
     last_state: Option<(bool, bool)>,
     /// 气泡要用的图标身份；取不到就没法发气泡（只影响通知，不影响托盘本身）。
     shell: Option<ShellIcon>,
+    /// 通知通道可用性（建托盘时定下，之后只读）。
+    channel: ChannelAvailability,
 }
 
 #[cfg(windows)]
@@ -171,14 +177,23 @@ impl Tray {
                 // hWnd 由 crate 暴露（`window_handle()`），uID 没暴露——它来自 tray-icon 内部的
                 // 原子计数器（首个托盘 = 1），所以用「改一次同样的 tooltip」探出来，探不到就不发气泡。
                 let tooltip = format!("{} {}", PRODUCT_NAME, VERSION);
-                let shell = discover_shell_icon(icon.window_handle(), &tooltip);
-                log.push(match shell {
-                    Some(identity) => format!(
-                        "托盘已就绪（左键显示/隐藏，右键菜单；气泡身份 hwnd=0x{:X} uid={}）",
-                        identity.hwnd as usize, identity.uid
-                    ),
-                    None => "托盘已就绪，但气泡身份探测失败（通知将降级为只写日志）".to_owned(),
-                });
+                let discovered = discover_shell_icon(icon.window_handle(), &tooltip);
+                let (shell, channel) = match discovered {
+                    Ok(identity) => {
+                        log.push(format!(
+                            "托盘已就绪（左键显示/隐藏，右键菜单；气泡身份 hwnd=0x{:X} uid={}）",
+                            identity.hwnd as usize, identity.uid
+                        ));
+                        (Some(identity), ChannelAvailability::balloon())
+                    }
+                    Err((reason, code)) => {
+                        log.push(format!(
+                            "托盘已就绪，但气泡身份探测失败（{reason}，Win32 {code}；\
+                             通知降级为只写日志，关闭逻辑不得「藏进托盘」）"
+                        ));
+                        (None, ChannelAvailability::unavailable(reason))
+                    }
+                };
                 Some(Self {
                     icon,
                     show,
@@ -188,6 +203,7 @@ impl Tray {
                     quit,
                     last_state: None,
                     shell,
+                    channel,
                 })
             }
             Err(error) => {
@@ -228,6 +244,15 @@ impl Tray {
     /// 托盘身份是否可用于发气泡（自检与诊断用）。
     pub fn can_notify(&self) -> bool {
         self.shell.is_some()
+    }
+
+    /// 通道可用性：**关闭逻辑要用**——气泡/托盘不可用时不许「藏进托盘」。
+    ///
+    /// 这里已经包含 `NIM_MODIFY` 的实测结果（建托盘时探过一次 tooltip）：`shell-refused`
+    /// 说明图标可能压根没进托盘区，此时「藏进托盘」会让用户彻底找不到程序。
+    /// 之后 `balloon()` 的真实返回值仍以每次发送为准（系统策略可能临时静音）。
+    pub fn channel(&self) -> ChannelAvailability {
+        self.channel
     }
 
     /// 让菜单项的启用状态跟随 aria2 状态（`busy` = 启动/停止进行中，全禁）。
@@ -335,8 +360,13 @@ fn fallback_rgba() -> (Vec<u8>, u32, u32) {
 ///
 /// 为什么不用常量 1：`tray-icon` 的 `internal_id` 取自进程内原子计数器，理论上被别处
 /// 先建过一次图标就会错位。探测一次的成本是 8 次内核调用、零可见影响，比写死安全。
+///
+/// 失败返回 `(原因, 最后一个 Win32 错误码)`：只有「`NIM_MODIFY` 被拒」这一条能解释
+/// 「托盘图标在、气泡发不出」，把这个码写进日志才不至于下次又要从头排查
+/// （实测某环境 8 次全返回 0，`GetLastError`=5 拒绝访问）。
 #[cfg(windows)]
-fn discover_shell_icon(hwnd: HWND, tooltip: &str) -> Option<ShellIcon> {
+fn discover_shell_icon(hwnd: HWND, tooltip: &str) -> Result<ShellIcon, (&'static str, u32)> {
+    let mut last_error = 0u32;
     for uid in 1..=8u32 {
         let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -345,10 +375,11 @@ fn discover_shell_icon(hwnd: HWND, tooltip: &str) -> Option<ShellIcon> {
         data.uFlags = NIF_TIP;
         fill_wide(&mut data.szTip, tooltip);
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
-            return Some(ShellIcon { hwnd, uid });
+            return Ok(ShellIcon { hwnd, uid });
         }
+        last_error = unsafe { GetLastError() };
     }
-    None
+    Err(("shell-refused", last_error))
 }
 
 /// 把 UTF-8 文本按宽字符写进定长缓冲区（截断 + NUL 结尾）。

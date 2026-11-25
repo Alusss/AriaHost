@@ -30,6 +30,13 @@ fn main() -> ExitCode {
     println!("SELFTEST tray=ready can_notify={}", tray.can_notify());
 
     let mut notifier = Notifier::new();
+    // 托盘层把「气泡到底能不能发」写进通知中心，关闭逻辑将来据此决定能不能「藏进托盘」。
+    notifier.set_channel(tray.channel());
+    println!(
+        "SELFTEST channel={} reason={:?}（none 时关闭逻辑必须降级，不许藏进托盘）",
+        notifier.channel().summary(),
+        notifier.channel().reason()
+    );
     let notice = Notification::new(
         NotifyKind::Clean,
         NotifyLevel::Info,
