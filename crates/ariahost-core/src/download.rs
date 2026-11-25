@@ -285,17 +285,28 @@ mod tests {
         assert_eq!(lines[1].name, CDN_LINE_NAME);
     }
 
-    /// 旧镜像线路（`r.alusss.cn` 前缀模板）已删除，这条测试是**删除的守护**：
-    /// 谁把镜像线路加回任何一条默认线路里，这里会先红（而不是等用户装不上才发现）。
+    /// 线路集合的**结构性**守护（不靠记住某个域名）：只允许两种模板形态
+    /// （`{url}` 占位，或「CDN 前缀 + `{file}`」）与两个已钉死的线路名。
+    /// 旧镜像那种「前缀 + 完整 URL」的第三条线路只要被谁加回来，这里必然先红。
+    ///
+    /// 为什么不写成「模板里不含某旧域名」：那会把废弃域名重新写进源码，
+    /// 而 `grep -rn "旧域名" crates/` 必须只剩 core_setup 的那条路标说明。
     #[test]
-    fn no_legacy_mirror_line_is_generated() {
+    fn only_cdn_and_direct_line_shapes_are_generated() {
+        let base = "https://cdn.example.invalid/r/";
         for order in ["cdn,github", "github,cdn", "cdn", "github"] {
-            let (lines, _) = lines_from(order, "https://cdn.example.invalid/r/");
+            let (lines, _) = lines_from(order, base);
             assert!(!lines.is_empty(), "顺序 {order} 不该一条线路都没有");
+            assert!(lines.len() <= 2, "顺序 {order} 不该生出第三条线路");
             for line in &lines {
                 assert!(
-                    !line.template.contains("r.alusss.cn"),
-                    "顺序 {order}：旧镜像域名不得再出现在线路模板里（{} => {}）",
+                    line.name == DIRECT_LINE_NAME || line.name == CDN_LINE_NAME,
+                    "顺序 {order}：出现了未知线路名「{}」",
+                    line.name
+                );
+                assert!(
+                    line.template == URL_PLACEHOLDER || line.template.starts_with(base),
+                    "顺序 {order}：线路「{}」的模板既不是 {{url}} 也不是 CDN 前缀：{}",
                     line.name,
                     line.template
                 );
