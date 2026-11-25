@@ -472,6 +472,15 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace
     if let Some(trace) = probe_trace {
         println!("SELFTEST_NOTE probe={}", sanitize(trace));
     }
+    // task-71 判据 A：托盘通道与「点 X 动作」必须能从自测行里读出来。
+    // 用户报「点了 X 没进托盘」时，先看 `tray=unavailable:<原因>` 是否复现；
+    // `close_plan=ask(tray-blocked)` 表示「托盘档被降级成面板内询问」。
+    if let Some(tray) = facts.tray.as_deref() {
+        println!("SELFTEST_NOTE tray={}", sanitize(tray));
+    }
+    if let Some(plan) = facts.close_plan.as_deref() {
+        println!("SELFTEST_NOTE close_plan={}", sanitize(plan));
+    }
     if let Some(reason) = facts.reason.as_deref() {
         println!("SELFTEST_NOTE {reason}");
     }

@@ -109,6 +109,14 @@ pub struct RuntimeFacts {
     pub ok: bool,
     /// `ok=0` 时的中文原因（同时打到 `SELFTEST_NOTE` 行）。
     pub reason: Option<String>,
+    /// 托盘通道判定（`balloon` / `unavailable:<原因>`）。
+    ///
+    /// task-71 判据 A 要求「托盘注册结果可复现取证」：用户报「点了 X 没进托盘」时，
+    /// 第一条要问的就是「这台机器上托盘通道到底通不通」。自测把判定结果打出来，
+    /// 不必靠人眼看托盘区域。
+    pub tray: Option<String>,
+    /// 点 X 的实际动作（`hide` / `quit` / `ask` / `ask(tray-blocked)`）。
+    pub close_plan: Option<String>,
 }
 
 /// 内联错误条（面板内的一条，不弹窗）。
@@ -168,6 +176,87 @@ struct QuitFlow {
 struct ClosePrompt {
     /// 「记住我的选择」复选框。
     remember: bool,
+    /// 非 `None` = 这档是「托盘档降级而来」，值是不可用原因。对话框据此说明原因、
+    /// **藏掉**「最小化到托盘」按钮（藏起来也看不见，等于骗人）。
+    tray_blocked: Option<&'static str>,
+}
+
+/// 点 X 之后到底做什么（纯函数：`pump_close` 只负责执行，判定全在这里）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePlan {
+    /// 藏进托盘（**只在**托盘通道可用时允许）。
+    Hide,
+    /// 直接走退出流程。
+    Quit,
+    /// 面板内询问；`tray_blocked` 说明「托盘档为什么用不了」。
+    Ask { tray_blocked: Option<&'static str> },
+}
+
+impl ClosePlan {
+    /// 机器可读的标签（自测输出、日志与单测共用同一份，不各写一套）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hide => "hide",
+            Self::Quit => "quit",
+            Self::Ask { tray_blocked: None } => "ask",
+            Self::Ask {
+                tray_blocked: Some(_),
+            } => "ask(tray-blocked)",
+        }
+    }
+}
+
+/// 托盘通道的一行人话标签（`balloon` / `unavailable:<原因>`）。
+fn tray_channel_label(channel: crate::notify::ChannelAvailability) -> String {
+    if channel.is_balloon() {
+        "balloon".to_owned()
+    } else {
+        format!("unavailable:{}", channel.reason().unwrap_or("no-channel"))
+    }
+}
+
+/// 取证开关：把托盘通道强制判成不可用。
+///
+/// 为什么需要：托盘注册失败在这台机器上时好时坏（同一产物有成功也有失败），
+/// 光靠运气复现不了「点了 X 却找不到图标」。开关只改**判定输入**，不碰真实注册、
+/// 不改用户配置、不影响任何其他路径。
+const TRAY_SIMULATE_ENV: &str = "ARIAHOST_TRAY_SIMULATE";
+
+/// 开关是否要求「假装托盘不可用」。
+fn tray_simulated_unavailable() -> bool {
+    std::env::var(TRAY_SIMULATE_ENV)
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("unavailable"))
+}
+
+/// 托盘通道的最终判定（纯函数，可单测）。
+///
+/// `tray = None` 有两种可能：托盘对象没建出来（`tray-icon` 失败 / 非 Windows），
+/// 或面板在自测、灌行模式下压根没建托盘。两种都**不能**「藏进托盘」。
+fn tray_availability(
+    tray: Option<crate::notify::ChannelAvailability>,
+    simulated_unavailable: bool,
+) -> crate::notify::ChannelAvailability {
+    use crate::notify::ChannelAvailability;
+    if simulated_unavailable {
+        return ChannelAvailability::unavailable("simulated");
+    }
+    tray.unwrap_or_else(|| ChannelAvailability::unavailable("tray-missing"))
+}
+
+/// 三档策略 + 托盘可用性 → 动作（纯函数，可单测）。
+///
+/// 判据（v0.1.2 用户报障的根因）：`close_action = tray` 的语义是「还能从托盘叫回来」。
+/// 托盘图标没注册成功时藏窗口，等于面板人间蒸发——没有窗口、也没有图标可点，
+/// 用户只能当成「程序退了」。所以托盘档**必须**排在通道可用之后，不可用时降级为面板内询问。
+fn close_plan(action: CloseAction, tray: crate::notify::ChannelAvailability) -> ClosePlan {
+    match action {
+        CloseAction::Tray if tray.is_balloon() => ClosePlan::Hide,
+        CloseAction::Tray => ClosePlan::Ask {
+            tray_blocked: Some(tray.reason().unwrap_or("no-channel")),
+        },
+        CloseAction::Exit => ClosePlan::Quit,
+        CloseAction::Ask => ClosePlan::Ask { tray_blocked: None },
+    }
 }
 
 pub struct PanelInit {
@@ -725,23 +814,38 @@ impl PanelApp {
         }
         // 先撤销本次关闭，改由三档策略决定（进程内对话框也不能靠系统 MessageBox）。
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        match self.prefs.close_action {
-            CloseAction::Tray => {
+        match close_plan(self.prefs.close_action, self.tray_channel()) {
+            ClosePlan::Hide => {
                 self.log
-                    .push("关闭请求：ui.close_action = tray → 隐藏到托盘".to_owned());
+                    .push("关闭请求：ui.close_action = tray，托盘通道可用 → 隐藏到托盘".to_owned());
                 self.set_window_hidden(ctx, true);
             }
-            CloseAction::Exit => {
+            ClosePlan::Quit => {
                 self.log
                     .push("关闭请求：ui.close_action = exit → 直接退出".to_owned());
                 self.begin_quit(ctx, false);
             }
-            CloseAction::Ask => {
-                self.log
-                    .push("关闭请求：ui.close_action = ask → 面板内询问".to_owned());
-                self.close_prompt = Some(ClosePrompt { remember: false });
+            ClosePlan::Ask { tray_blocked } => {
+                self.log.push(match tray_blocked {
+                    Some(reason) => format!(
+                        "关闭请求：托盘不可用（{reason}）→ 降级为面板内询问（绝不静默藏窗）"
+                    ),
+                    None => "关闭请求：ui.close_action = ask → 面板内询问".to_owned(),
+                });
+                self.close_prompt = Some(ClosePrompt {
+                    remember: false,
+                    tray_blocked,
+                });
             }
         }
+    }
+
+    /// 托盘通道当前可用性（关闭判定的唯一输入；取证开关只在这里生效）。
+    fn tray_channel(&self) -> crate::notify::ChannelAvailability {
+        tray_availability(
+            self.tray.as_ref().map(crate::tray::Tray::channel),
+            tray_simulated_unavailable(),
+        )
     }
 
     // -------------------------------------------------------------------
@@ -2223,9 +2327,24 @@ impl PanelApp {
                         .weak()
                         .small(),
                 );
+                // A 的判据（task-71）：托盘真的不可用时，「藏进托盘」这一档必须当场面说清，
+                // 而不是点了没反应、让用户以为程序坏了。原因直接来自 `ChannelAvailability`。
+                let tray_ok = prompt.tray_blocked.is_none();
+                if let Some(reason) = prompt.tray_blocked {
+                    ui.label(
+                        RichText::new(format!(
+                            "托盘不可用（{reason}）：这一档藏不住窗口，请选退出或取消。"
+                        ))
+                        .color(crate::view::tone_color(Tone::Warn))
+                        .small(),
+                    );
+                }
                 ui.checkbox(&mut prompt.remember, "记住我的选择");
                 ui.horizontal(|ui| {
-                    if ui.button("最小化到托盘").clicked() {
+                    if ui
+                        .add_enabled(tray_ok, egui::Button::new("最小化到托盘"))
+                        .clicked()
+                    {
                         to_tray = true;
                     }
                     if ui.button("退出并停止下载").clicked() {
@@ -3270,6 +3389,10 @@ impl PanelApp {
             }
         };
         let ok = size_ok && wgpu_errors == 0;
+        let tray_label = tray_channel_label(self.tray_channel());
+        let plan_label = close_plan(self.prefs.close_action, self.tray_channel())
+            .label()
+            .to_owned();
         {
             let mut facts = facts_guard(&self.facts);
             facts.atlas_size = atlas_size;
@@ -3280,10 +3403,13 @@ impl PanelApp {
             facts.wgpu_errors = wgpu_errors;
             facts.ok = ok;
             facts.reason = reason.clone();
+            facts.tray = Some(tray_label.clone());
+            facts.close_plan = Some(plan_label.clone());
         }
         self.log.push(format!(
             "自测完成：{0} 帧，窗口 {1}×{2} px，图集 {3}×{4} px，任务行 {rows}，\
-             wgpu 错误 {wgpu_errors}，私有工作集 {private_kb} KB，ok={5}",
+             wgpu 错误 {wgpu_errors}，私有工作集 {private_kb} KB，ok={5}，\
+             托盘通道 {tray_label}，点 X 动作 {plan_label}",
             self.frames,
             window_physical.0,
             window_physical.1,
@@ -3572,14 +3698,48 @@ fn config_dir() -> Option<PathBuf> {
         .filter(|dir| !dir.as_os_str().is_empty())
 }
 
-/// 用默认浏览器打开 URL（不新增依赖：explorer/xdg-open 都能吃 URL）。
+/// 把路径或 URL 交给系统的「默认程序」打开（Windows：`ShellExecuteW`）。
+///
+/// 为什么不再 `Command::new("explorer").arg(...)`：`explorer.exe` 是外壳进程，
+/// 被当普通程序 `CreateProcess` 拉起时参数解析与退出码都不归调用方管——v0.1.2
+/// 真机反馈过「explorer 应用错误」的弹窗，而面板这边看到的是 `spawn` 成功，
+/// 等于把失败吞掉了。`ShellExecuteW` 是文档规定的「交给外壳」入口：不走
+/// `CreateProcess`、不开控制台，出错时以 `HINSTANCE <= 32` 的码返回，能如实上报。
+#[cfg(windows)]
+fn shell_open(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+        text.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let verb = wide(std::ffi::OsStr::new("open"));
+    let file = wide(target);
+    // SAFETY: 两个指针都指向本栈帧内、以 NUL 结尾的 UTF-16 缓冲，调用期间有效；
+    // 父窗口 / 参数 / 工作目录都给空（不需要借用面板窗口，也不改当前目录）。
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if result <= 32 {
+        return Err(std::io::Error::from_raw_os_error(result as i32));
+    }
+    Ok(())
+}
+
+/// 用默认程序打开 URL。
 fn open_url(url: &str) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        std::process::Command::new("explorer")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
+        shell_open(std::ffi::OsStr::new(url))
     }
     #[cfg(not(windows))]
     {
@@ -3608,14 +3768,21 @@ fn count_session_lines(text: &str) -> usize {
         .count()
 }
 
-/// 用系统文件管理器打开目录（只要求「进程起来了」；explorer 的退出码不可靠）。
+/// 用系统文件管理器打开目录。
+///
+/// 打开前先自己判「目录在不在」：`ShellExecuteW` 对不存在的路径会交给外壳弹
+/// 系统对话框（用户看到的正是「应用错误」这类文案），不如面板里直接给一句
+/// 能读懂的失败原因，把话说在前面。
 fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("目录不存在或不可访问：{}", dir.display()),
+        ));
+    }
     #[cfg(windows)]
     {
-        std::process::Command::new("explorer")
-            .arg(dir)
-            .spawn()
-            .map(|_child| ())
+        shell_open(dir.as_os_str())
     }
     #[cfg(not(windows))]
     {
@@ -3660,9 +3827,12 @@ fn facts_guard(facts: &Mutex<RuntimeFacts>) -> MutexGuard<'_, RuntimeFacts> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// 面板标题里用的完整版本字符串（`AriaHost 0.1.1`），供测试与日志复用。
+/// 窗口标题（任务栏 / Alt+Tab 上看到的那一行）。
+///
+/// 只放产品名：版本号归「关于」行与设置页。标题栏带版本既挤，又会让人以为
+/// 每次升级都换了程序（v0.1.2 用户反馈「标题去版本号」）。
 pub fn title_text() -> String {
-    format!("{PRODUCT_NAME} {VERSION}")
+    PRODUCT_NAME.to_owned()
 }
 
 /// 一次提权调用的目标（可执行文件 + 参数）。
@@ -3739,10 +3909,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn title_carries_product_and_version() {
+    fn title_is_product_name_only() {
         let title = title_text();
-        assert!(title.starts_with(PRODUCT_NAME), "{title}");
-        assert!(title.contains(VERSION), "{title}");
+        assert_eq!(title, PRODUCT_NAME);
+        // 版本号不许再进标题（它由「关于」行承载）。
+        assert!(!title.contains(VERSION), "{title}");
+    }
+
+    /// 关窗判定的唯一口径：**托盘没通就不许藏窗**（v0.1.2 用户报障的根因）。
+    #[test]
+    fn close_plan_never_hides_without_a_tray_channel() {
+        use crate::notify::ChannelAvailability;
+        let ok = ChannelAvailability::balloon();
+        let bad = ChannelAvailability::unavailable("nim-add-denied");
+        assert_eq!(close_plan(CloseAction::Tray, ok), ClosePlan::Hide);
+        assert_eq!(
+            close_plan(CloseAction::Tray, bad),
+            ClosePlan::Ask {
+                tray_blocked: Some("nim-add-denied")
+            }
+        );
+        // 显式 exit 档不受托盘影响；ask 档本来就问，不应带「降级」标记。
+        assert_eq!(close_plan(CloseAction::Exit, bad), ClosePlan::Quit);
+        assert_eq!(
+            close_plan(CloseAction::Ask, bad),
+            ClosePlan::Ask { tray_blocked: None }
+        );
+    }
+
+    /// 自测输出用的标签口径必须稳定：脚本按 `tray=` / `close_plan=` 取值判定。
+    #[test]
+    fn selftest_labels_are_stable() {
+        use crate::notify::ChannelAvailability;
+        assert_eq!(
+            tray_channel_label(ChannelAvailability::balloon()),
+            "balloon"
+        );
+        assert_eq!(
+            tray_channel_label(ChannelAvailability::unavailable("nim-add-denied")),
+            "unavailable:nim-add-denied"
+        );
+        assert_eq!(ClosePlan::Hide.label(), "hide");
+        assert_eq!(ClosePlan::Quit.label(), "quit");
+        assert_eq!(ClosePlan::Ask { tray_blocked: None }.label(), "ask");
+        assert_eq!(
+            ClosePlan::Ask {
+                tray_blocked: Some("nim-add-denied")
+            }
+            .label(),
+            "ask(tray-blocked)"
+        );
+    }
+
+    /// 没建出托盘对象（自测/灌行/非 Windows）与开关取证都算「不可用」。
+    #[test]
+    fn tray_availability_treats_missing_and_simulated_as_unavailable() {
+        use crate::notify::ChannelAvailability;
+        assert!(!tray_availability(None, false).is_balloon());
+        assert_eq!(
+            tray_availability(None, false).reason(),
+            Some("tray-missing")
+        );
+        assert!(!tray_availability(Some(ChannelAvailability::balloon()), true).is_balloon());
+        assert_eq!(
+            tray_availability(Some(ChannelAvailability::balloon()), true).reason(),
+            Some("simulated")
+        );
+        assert!(tray_availability(Some(ChannelAvailability::balloon()), false).is_balloon());
+    }
+
+    /// 打开目录前先自判存在性：不存在时给可读原因，不把外壳的系统弹窗甩给用户。
+    #[test]
+    fn missing_directory_reports_a_readable_error() {
+        let missing = std::env::temp_dir().join("ariahost-no-such-dir-7f3d");
+        let error = open_in_file_manager(&missing).expect_err("不存在的目录必须报错");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("目录不存在"), "{error}");
     }
 
     /// 「核心」一行在三种来源下都要如实写出来源与版本（task-54 C-UI 的可执行判据）。
