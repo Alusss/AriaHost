@@ -66,7 +66,7 @@ pub use worker::{
 };
 
 /// 面板单实例已被占用时的提示（中文，退出码 [`EXIT_ERR`]）。
-pub const DUPLICATE_INSTANCE_HINT: &str = "AriaHost 面板已在运行，本次不再重复开窗。";
+pub const DUPLICATE_INSTANCE_HINT: &str = "AriaHost 面板已在运行，本次不重复开窗。";
 
 /// 「在浏览器打开」的注入点：由 bin 提供实现（ui 不链 ariahost-web）。
 ///
@@ -301,17 +301,40 @@ fn run(
             Some(lock)
         }
         instance::LockOutcome::AlreadyRunning { path } => {
+            // M4-b：先请已有实例把窗口叫到前台，再退出——否则用户双击图标「什么都不发生」。
+            let attempt = ctl::request_show(ctl::SHOW_BUDGET);
             println!(
                 "{} {}",
                 ErrorCode::DuplicateInstance.code(),
                 DUPLICATE_INSTANCE_HINT
             );
-            // 明确告诉用户「发生了什么」：后起的这个进程会立刻退出，
-            // 现有面板在任务栏或托盘里（不给路径，用户看了也不知道要干什么）。
-            println!(
-                "已有面板持有单实例锁（{}）；本次启动的进程直接退出，不影响已运行的面板。",
-                path.display()
-            );
+            match &attempt {
+                ctl::ShowAttempt::Awakened => {
+                    println!(
+                        "已把正在运行的面板叫到前台（单实例锁：{}）。",
+                        path.display()
+                    );
+                }
+                ctl::ShowAttempt::Refused(detail) => {
+                    println!(
+                        "已有面板在运行（{}），但它拒接了「唤出」请求：{detail}。\
+                         面板可能在托盘里：点托盘图标即可显示。",
+                        path.display()
+                    );
+                }
+                ctl::ShowAttempt::Unreachable(detail) => {
+                    println!(
+                        "已有面板在运行（{}），但唤出请求没送达：{detail}。\
+                         面板可能在托盘里：点托盘图标即可显示。",
+                        path.display()
+                    );
+                }
+            }
+            log.push(format!(
+                "第二实例：单实例锁已在 {}，唤出结果 {}",
+                path.display(),
+                attempt.summary()
+            ));
             return EXIT_ERR;
         }
         instance::LockOutcome::Unavailable { path, reason } => {

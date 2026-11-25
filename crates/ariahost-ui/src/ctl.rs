@@ -149,8 +149,15 @@ pub fn simulating_close_swallowed() -> bool {
     simulate() == Some(Simulate::CloseSwallowed)
 }
 
-/// 客户端唯一支持的指令。
+/// 客户端支持的指令（M4-b 起两条：退出 / 唤出）。
 pub const QUIT: &str = "quit";
+/// 请已有面板把窗口唤到前台（第二实例用；**幂等**，没有副作用）。
+///
+/// 为什么需要它：用户点 X 进托盘后，再双击开始菜单/桌面图标会起第二个进程。
+/// 旧行为只是打印一句「已在运行」然后 exit 1 —— 屏幕上什么都不发生，
+/// 用户看到的现象就是「双击没反应」（task-77 的真机缺陷）。有了这条指令，
+/// 第二个进程能把已有面板叫到前台，然后正常退出。
+pub const SHOW: &str = "show";
 /// 单行请求上限：读到这里还没换行就按未知指令处理（防客户端半截请求把线程挂住）。
 pub const MAX_REQUEST_BYTES: usize = 64;
 
@@ -162,6 +169,8 @@ pub const PIPE_SDDL: &str = "D:(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)"
 pub enum Request {
     /// 通知面板退出。
     Quit,
+    /// 把已有面板的窗口唤到前台（第二实例）。
+    Show,
     /// 不认识的指令（原样带回，便于排障）。
     Unknown(String),
 }
@@ -170,14 +179,18 @@ pub enum Request {
 pub fn parse_request(line: &str) -> Request {
     match line.trim() {
         QUIT => Request::Quit,
+        SHOW => Request::Show,
         other => Request::Unknown(other.to_owned()),
     }
 }
 
 /// 构造应答行（纯函数）。`ok` 带服务端 pid，客户端据此等进程真的退出。
+///
+/// `show` 也回同样形状的 `ok pid=`：客户端只关心「服务端真的处理了这一条」，
+/// 复用一个形状比再发明一种应答更不容易漂移。
 pub fn ack_line(request: &Request, server_pid: u32) -> String {
     match request {
-        Request::Quit => format!("ok pid={server_pid}\n"),
+        Request::Quit | Request::Show => format!("ok pid={server_pid}\n"),
         Request::Unknown(command) => format!("refused unknown-command:{command}\n"),
     }
 }
@@ -187,6 +200,77 @@ pub fn parse_ack_pid(ack: &str) -> Option<u32> {
     ack.split_whitespace()
         .find_map(|part| part.strip_prefix("pid="))
         .and_then(|value| value.trim().parse::<u32>().ok())
+}
+
+/// 第二实例「唤出已有面板」的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShowAttempt {
+    /// 已有面板应答了 `ok`：窗口已被叫到前台。
+    Awakened,
+    /// 管道连上了、请求送到位，但服务端拒绝（或应答看不懂）。
+    Refused(String),
+    /// 没连上 / 连上了没有应答（超预算）。调用方据此写日志并给非零退出码。
+    Unreachable(String),
+}
+
+/// 第二实例唤出的结果——**一行可抄进日志/报障**的说法（纯函数，跨平台可测）。
+impl ShowAttempt {
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Awakened => "已唤出（服务端应答 ok）".to_owned(),
+            Self::Refused(detail) => format!("被拒绝：{detail}"),
+            Self::Unreachable(detail) => format!("未送达：{detail}"),
+        }
+    }
+
+    /// 是否算成功（成败口径只在这里定义，调用方不要各自 `matches!`）。
+    pub fn is_awakened(&self) -> bool {
+        matches!(self, Self::Awakened)
+    }
+}
+
+/// 第二实例等应答的预算。
+///
+/// 为什么是 1.5s：用户双击图标到窗口出现，超过 2s 的停顿就会被当成「卡死了」；
+/// 服务端处理 `show` 只做三次 Win32 调用（微秒级），1.5s 全是余量。
+pub const SHOW_BUDGET: Duration = Duration::from_millis(1500);
+
+/// 把「读到的应答」判成结果（纯函数）。
+///
+/// 单独拆出来的原因：**超时**与**ack 缺失**这两条分支在真机上很难稳定复现
+/// （要恰好赶上服务端在 `CreateNamedPipeW` 与 `ConnectNamedPipe` 之间），
+/// 做成纯函数才能用单测把两条分支钉死。
+pub fn classify_show_ack(ack: Option<&str>) -> ShowAttempt {
+    match ack {
+        None => ShowAttempt::Unreachable("没等到应答（连上了但服务端没回话）".to_owned()),
+        Some(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return ShowAttempt::Unreachable("应答为空（对端可能已退出）".to_owned());
+            }
+            match parse_ack_pid(text) {
+                Some(_) => ShowAttempt::Awakened,
+                None => ShowAttempt::Refused(text.to_owned()),
+            }
+        }
+    }
+}
+
+/// 客户端：请已有实例把面板唤到前台（第二实例的 `AlreadyRunning` 分支专用）。
+///
+/// 非 Windows：没有命名管道，直接报不可达（与 `quit` 客户端同一口径）。
+#[cfg(not(windows))]
+pub fn request_show(_budget: Duration) -> ShowAttempt {
+    classify_show_ack(None)
+}
+
+/// 客户端：请已有实例把面板唤到前台（Windows：连命名管道 → 发一行 → 读应答）。
+#[cfg(windows)]
+pub fn request_show(budget: Duration) -> ShowAttempt {
+    match platform::client_roundtrip(ariahost_common::paths::control_pipe_name(), SHOW, budget) {
+        Ok(ack) => classify_show_ack(Some(&ack)),
+        Err(detail) => ShowAttempt::Unreachable(detail),
+    }
 }
 
 /// 服务端 pending 的「收到过 quit」标记。
@@ -353,22 +437,27 @@ mod platform {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use ariahost_common::paths::control_pipe_name;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, BOOL, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{
-        FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PeekNamedPipe, WaitNamedPipeW,
+        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
     };
 
     /// 管道实例数量上限：串行处理足够，这里只保证「第二个客户端不被拒绝」。
@@ -452,6 +541,182 @@ mod platform {
         unsafe { FlushFileBuffers(handle) != 0 }
     }
 
+    /// 客户端：连上管道 → 发一行 → 读一行应答（总耗时不超过 `budget`）。
+    ///
+    /// 返回 `Ok(应答行)` / `Err(没送达的原因)`。**没送达**与**送达但被拒**必须分开：
+    /// 前者是「已有实例可能卡住了」，后者是「已有实例明确拒绝」，日志与排障口径不同。
+    pub fn client_roundtrip(
+        pipe_name: &str,
+        command: &str,
+        budget: Duration,
+    ) -> Result<String, String> {
+        let name = wide(pipe_name);
+        let deadline = Instant::now() + budget;
+        let handle = loop {
+            let handle = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                break handle;
+            }
+            let code = unsafe { GetLastError() };
+            // ERROR_PIPE_BUSY：所有实例都被占用（服务端正忙着上一次请求）。等一会儿再试。
+            if code != ERROR_PIPE_BUSY {
+                return Err(format!("连不上控制管道（Win32 {code}）"));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("控制管道忙，等不到空闲实例".to_owned());
+            }
+            let wait_ms = (left.as_millis().min(50) as u32).max(1);
+            unsafe { WaitNamedPipeW(name.as_ptr(), wait_ms) };
+        };
+        if !write_line(handle, &format!("{command}\n")) {
+            unsafe { CloseHandle(handle) };
+            return Err("请求写不进管道".to_owned());
+        }
+        // 读应答用「有界轮询」而不是直接 `ReadFile`：对端若已经卡死不出帧，
+        // 阻塞读会让第二个进程也挂住 —— 那正好是这条指令要修的病。
+        let mut ack = String::new();
+        loop {
+            let mut available = 0u32;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                break;
+            }
+            if available > 0 {
+                let mut buffer = [0u8; 128];
+                let mut read = 0u32;
+                let ok = unsafe {
+                    ReadFile(
+                        handle,
+                        buffer.as_mut_ptr(),
+                        buffer.len() as u32,
+                        &mut read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || read == 0 {
+                    break;
+                }
+                ack.push_str(&String::from_utf8_lossy(&buffer[..read as usize]));
+                if ack.contains('\n') {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { CloseHandle(handle) };
+        if ack.is_empty() {
+            Err("连上了但没有应答（对端可能已退出）".to_owned())
+        } else {
+            Ok(ack)
+        }
+    }
+
+    /// `show` 的实体结果（只用于写日志：说明这次唤出**改变了什么**）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WakeOutcome {
+        /// 唤出之前窗口是隐藏的（在托盘里）。
+        pub was_hidden: bool,
+        /// 唤出之前窗口是最小化的。
+        pub was_minimized: bool,
+    }
+
+    /// 枚举回调的入参（只带回本进程的面板窗口句柄）。
+    struct FindState {
+        pid: u32,
+        found: HWND,
+    }
+
+    /// `EnumWindows` 回调：只认「本进程 + 标题以产品名开头」的顶层窗口。
+    ///
+    /// 为什么要判标题：托盘也建了一个隐藏的顶层窗口（类名/标题是 `tray_icon_app`），
+    /// 若只按 pid 找，可能把托盘消息窗口当成面板去 `ShowWindow`，用户仍然看不到面板。
+    unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = unsafe { &mut *(lparam as *mut FindState) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid != state.pid {
+            return 1; // 继续枚举
+        }
+        let mut title = [0u16; 160];
+        let len = unsafe { GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32) };
+        let len = len.max(0) as usize;
+        let title = String::from_utf16_lossy(&title[..len]);
+        if title.starts_with(ariahost_common::PRODUCT_NAME) {
+            state.found = hwnd;
+            return 0; // 找到了，停
+        }
+        1
+    }
+
+    /// 找本进程的面板窗口（找不到返回 `None`）。
+    fn find_panel_window() -> Option<HWND> {
+        let mut state = FindState {
+            pid: std::process::id(),
+            found: std::ptr::null_mut(),
+        };
+        unsafe {
+            EnumWindows(
+                Some(enum_windows_cb),
+                &mut state as *mut FindState as LPARAM,
+            );
+        }
+        if state.found.is_null() {
+            None
+        } else {
+            Some(state.found)
+        }
+    }
+
+    /// 把本进程的面板窗口叫到前台（`show` 指令的实体）。
+    ///
+    /// 为什么用 Win32 而不是 egui 的 `ViewportCommand::Visible(true)`：
+    /// 1. 那条指令要等帧线程跑一帧才生效，而「第二实例唤出」恰恰要能对付
+    ///    「帧线程被系统挂住/没被叫醒」的场面（`--quit` 的两张网就是同一课）；
+    /// 2. 它改不了面板自己的 `window_hidden` 状态，本批不改 app.rs 的状态机。
+    ///
+    /// `ShowWindow(SW_SHOW)` 是幂等的：窗口本来就可见时不会闪烁。
+    pub fn wake_panel() -> Result<WakeOutcome, String> {
+        let hwnd = find_panel_window().ok_or_else(|| "找不到本进程的面板窗口".to_owned())?;
+        let was_minimized = unsafe { IsIconic(hwnd) } != 0;
+        let was_hidden = unsafe { IsWindowVisible(hwnd) } == 0;
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            if was_minimized {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            // 前台化是**尽力而为**：前台锁可能拒绝（返回 0），但窗口已可见，
+            // 这不代表唤出失败，所以不当作错误、也不写进返回值。
+            SetForegroundWindow(hwnd);
+        }
+        Ok(WakeOutcome {
+            was_hidden,
+            was_minimized,
+        })
+    }
+
     pub fn accept_loop(ctx: egui::Context, log: Arc<LogBuffer>) {
         let name = wide(control_pipe_name());
         let attributes = security_attributes();
@@ -515,6 +780,28 @@ mod platform {
                     );
                     // egui 空闲时不发帧：不叫醒的话这条请求要等用户动鼠标才被看见。
                     ctx.request_repaint();
+                }
+                Request::Show => {
+                    // 幂等：本来可见/在前台时什么都不变，也不打扰用户。
+                    match wake_panel() {
+                        Ok(outcome) => {
+                            let before = if outcome.was_hidden {
+                                "原本在托盘里"
+                            } else if outcome.was_minimized {
+                                "原本最小化"
+                            } else {
+                                "原本已可见"
+                            };
+                            log.push(format!(
+                                "控制管道：收到 show → 已把面板叫到前台（{before}）"
+                            ));
+                            // 帧线程若被挂住，这一步也顺手把它叫醒（尽力而为）。
+                            ctx.request_repaint();
+                        }
+                        Err(detail) => log.push(format!(
+                            "控制管道：收到 show，但唤不出窗口：{detail}（面板可能尚未建窗）"
+                        )),
+                    }
                 }
                 Request::Unknown(command) => {
                     log.push(format!("控制管道：未知指令 {command:?}，已拒绝"));
@@ -657,10 +944,13 @@ mod tests {
     }
 
     #[test]
-    fn quit_is_the_only_recognised_command() {
+    fn two_commands_are_recognised_and_nothing_else() {
         assert_eq!(parse_request("quit"), Request::Quit);
         assert_eq!(parse_request("quit\n"), Request::Quit);
         assert_eq!(parse_request("  quit  "), Request::Quit);
+        // M4-b：第二实例唤出已有面板。
+        assert_eq!(parse_request("show"), Request::Show);
+        assert_eq!(parse_request("show\r\n"), Request::Show);
         assert_eq!(
             parse_request("shutdown"),
             Request::Unknown("shutdown".to_owned())
@@ -668,8 +958,56 @@ mod tests {
     }
 
     #[test]
-    fn ack_carries_server_pid_for_quit() {
+    fn ack_carries_server_pid_for_quit_and_show() {
         assert_eq!(ack_line(&Request::Quit, 4321), "ok pid=4321\n");
+        // 同一个应答形状，客户端只关心「服务端真的处理了」。
+        assert_eq!(ack_line(&Request::Show, 4321), "ok pid=4321\n");
+    }
+
+    #[test]
+    fn show_ack_is_classified_into_three_honest_outcomes() {
+        // 正常：服务端应答 ok。
+        assert_eq!(
+            classify_show_ack(Some("ok pid=42\n")),
+            ShowAttempt::Awakened
+        );
+        // 送达但被拒：用于排障，原文要带回去。
+        assert_eq!(
+            classify_show_ack(Some("refused unknown-command:show\n")),
+            ShowAttempt::Refused("refused unknown-command:show".to_owned())
+        );
+        // 没应答 / 空应答：两种都得是 Unreachable，不能当成成功。
+        assert!(matches!(
+            classify_show_ack(None),
+            ShowAttempt::Unreachable(_)
+        ));
+        assert!(matches!(
+            classify_show_ack(Some("   \n")),
+            ShowAttempt::Unreachable(_)
+        ));
+    }
+
+    /// 判据 B 的口径：第二实例的预算必须**短于**用户感觉「卡住」的阈值。
+    #[test]
+    fn show_budget_stays_below_the_ux_threshold() {
+        assert!(SHOW_BUDGET <= Duration::from_millis(2000));
+        assert!(SHOW_BUDGET >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn show_attempt_summary_and_success_flag_agree_with_the_variant() {
+        let ok = ShowAttempt::Awakened;
+        assert!(ok.is_awakened());
+        assert!(ok.summary().contains("已唤出"));
+
+        let refused = ShowAttempt::Refused("refused unknown-command:show".to_owned());
+        assert!(!refused.is_awakened());
+        // 失败一定要把原文带出来，否则用户报障时无从下手。
+        assert!(refused.summary().contains("refused unknown-command:show"));
+
+        let unreachable = ShowAttempt::Unreachable("2s 内没有应答".to_owned());
+        assert!(!unreachable.is_awakened());
+        assert!(unreachable.summary().contains("2s 内没有应答"));
     }
 
     #[test]
