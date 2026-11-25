@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use ariahost_common::logfile::Level;
 use ariahost_common::{ErrorCode, PRODUCT_NAME, VERSION};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -24,7 +25,7 @@ use egui_extras::{Column, TableBuilder};
 use crate::core_host::{self, CoreHost, CoreProbe, HostState};
 use crate::core_setup::{CoreGuide, GuideNotice};
 use crate::instance::InstanceLock;
-use crate::logbuf::LogBuffer;
+use crate::logbuf::{LogBuffer, TARGET_PANEL};
 use crate::metrics;
 use crate::service::{self, ServiceCard};
 use crate::tasks::{self, TaskAction, TaskRow, TaskStatus};
@@ -1867,8 +1868,23 @@ impl PanelApp {
         self.notice = Some((text.into(), Instant::now()));
     }
 
-    /// 记一条内联错误条。
+    /// 记一条内联错误条。**错误/告警必须同时落盘**（task-58）：用户报障时磁盘上得有痕迹。
+    ///
+    /// `Bad` → `ERROR`、`Warn` → `WARN`；`Good`/`Idle` 不写——那类提示的调用点自己
+    /// 已经记过一条日志，再写一次只是噪音。
     fn set_banner(&mut self, banner: Banner) {
+        if let Some(level) = banner_level(banner.tone) {
+            let mut text = match banner.code {
+                Some(code) => format!("{code} {}", banner.headline),
+                None => banner.headline.clone(),
+            };
+            if let Some(next) = banner.next.as_deref() {
+                text.push_str("（建议：");
+                text.push_str(next);
+                text.push('）');
+            }
+            self.log.push_level(level, TARGET_PANEL, text);
+        }
         self.banner = Some((banner, Instant::now()));
     }
 
@@ -3377,6 +3393,18 @@ impl PanelApp {
     }
 }
 
+/// 内联错误条的语气 → 落盘级别（task-58）。
+///
+/// 只把**需要事后追责**的两档写到磁盘：`Bad` → `ERROR`、`Warn` → `WARN`。
+/// `Good`/`Idle` 不写：那类提示的调用点自己已经记过一条日志，再写一次只是噪音。
+fn banner_level(tone: Tone) -> Option<Level> {
+    match tone {
+        Tone::Bad => Some(Level::Error),
+        Tone::Warn => Some(Level::Warn),
+        Tone::Good | Tone::Idle => None,
+    }
+}
+
 /// 任务列表读取失败是否只是噪音（核心没在跑时的连接类报错）。
 ///
 /// 规则（Lead 缺陷 2）：`已停止` 之后不该继续挂着「连不上 aria2」；但用户主动刷新
@@ -3790,5 +3818,15 @@ mod tests {
         // 非连接类（配置/权限/端口）什么状态下都不能吞。
         assert!(!tasks_error_is_noise(false, ErrorCode::PortConflict));
         assert!(!tasks_error_is_noise(false, ErrorCode::ConfigParseFailed));
+    }
+
+    #[test]
+    fn banner_tone_maps_to_the_documented_disk_level() {
+        // task-58：只有「要事后追责」的两档落盘（M3-m）。
+        assert_eq!(banner_level(Tone::Bad), Some(Level::Error));
+        assert_eq!(banner_level(Tone::Warn), Some(Level::Warn));
+        // Good / Idle 不落盘：调用点自己已经记过，再写一次只是噪音。
+        assert_eq!(banner_level(Tone::Good), None);
+        assert_eq!(banner_level(Tone::Idle), None);
     }
 }

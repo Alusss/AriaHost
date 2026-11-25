@@ -37,13 +37,14 @@ mod worker;
 
 use std::sync::{Arc, Mutex};
 
+use ariahost_common::logfile::Level;
 use ariahost_common::{ErrorCode, EXIT_ERR, EXIT_OK, PRODUCT_NAME, VERSION};
 use egui::ViewportBuilder;
 
 pub use app::{Banner, PanelInit, RuntimeFacts};
 pub use backend::Backend;
 pub use core_host::{CoreHost, CoreProbe, HostState};
-pub use logbuf::LogBuffer;
+pub use logbuf::{LogBuffer, TARGET_PANEL, TARGET_PROBE};
 pub use notify::{
     ChannelAvailability, Notification, Notifier, NotifyKind, NotifyLevel, NotifyOutcome,
     NotifyStats, SuppressReason, COOLDOWN as NOTIFY_COOLDOWN, RATE_CAP as NOTIFY_RATE_CAP,
@@ -586,33 +587,47 @@ fn resolve_backends(backend: Backend, log: &LogBuffer) -> (eframe::wgpu::Backend
 
     match backend {
         Backend::Dx12 => {
-            log.push("后端：只允许 dx12（显式指定，不回退；起不来会如实报错）".to_owned());
+            log.push_level(
+                Level::Info,
+                TARGET_PROBE,
+                "后端：只允许 dx12（显式指定，不回退；起不来会如实报错）",
+            );
             (backend.backends(), Some("dx12:显式指定".to_owned()))
         }
         Backend::Vulkan => {
-            log.push("后端：只允许 vulkan（显式指定，不回退；起不来会如实报错）".to_owned());
+            log.push_level(
+                Level::Info,
+                TARGET_PROBE,
+                "后端：只允许 vulkan（显式指定，不回退；起不来会如实报错）",
+            );
             (backend.backends(), Some("vulkan:显式指定".to_owned()))
         }
         Backend::Auto => {
             if let Some(from_env) = wgpu::Backends::from_env() {
-                log.push(format!(
-                    "后端：auto 尊重 WGPU_BACKEND → 只开 {}",
-                    backend::bits_label(from_env)
-                ));
+                log.push_level(
+                    Level::Info,
+                    TARGET_PROBE,
+                    format!(
+                        "后端：auto 尊重 WGPU_BACKEND → 只开 {}",
+                        backend::bits_label(from_env)
+                    ),
+                );
                 return (from_env, Some("env:WGPU_BACKEND".to_owned()));
             }
             let mut lines = Vec::new();
             let (chosen, trace) =
                 backend::probe_in_order(&backend::AUTO_PROBE_ORDER, probe_once, &mut lines);
             for line in lines {
-                log.push(line);
+                // 探测轨迹单独一个 target：现场 grep `panel.probe:` 就能拿到「为什么选了这个后端」。
+                log.push_level(Level::Info, TARGET_PROBE, line);
             }
             match chosen {
                 Some(bits) => (bits, Some(trace)),
                 None => {
-                    log.push(
-                        "后端：退回 wgpu 默认全集（内存与性能都不是最优；建议用 --backend 指定）"
-                            .to_owned(),
+                    log.push_level(
+                        Level::Warn,
+                        TARGET_PROBE,
+                        "后端：退回 wgpu 默认全集（内存与性能都不是最优；建议用 --backend 指定）",
                     );
                     (
                         wgpu::Backends::default(),

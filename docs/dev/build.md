@@ -145,6 +145,24 @@ $s.CounterSamples | Measure-Object -Property CookedValue -Minimum -Maximum
 | 显式 `--backend vulkan`（单后端） | 51.6 MB（50.6–52.8） | 48 MB |
 | 显式 `--backend dx12` | **116.4 MB（116.3–116.6）** | **−16 MB（破闸门）** |
 
+**条件元数据（必带）**：本机该轮的条件是 `锁屏=否 / 主屏=OrayIddDriver 虚拟 IDD 1920×1080 / DPI=96 / 采样=30×60s / backend 实际=Vulkan`。同一个 `dx12` 在**锁屏**条件下读 **116.4 MB**、在「未锁屏 + 虚拟 IDD 主屏」条件下读 **88.8 MB**——**两条条件，绿红互换**。所以判定行一律写成：
+
+```
+PWS max = NNN,NNN KB（PID=NNNN，余量=NNN,NNN KB）→ PASS|FAIL|INCONCLUSIVE
+条件：锁屏=否 / 主屏=<名称, 分辨率, DPI> / 采样=N / backend 实际=<Vulkan|Dx12>
+```
+
+**缺元数据的读数按 INCONCLUSIVE 处理**——`auto`/`vulkan` 稳定不变、只有 `dx12` 随条件漂 27.6 MB 这件事说明：不带条件的读数不能跨轮次比较。
+
+**A（收窄枚举）生效的同会话 A/B 对照**（同机、同口径，唯一差别是产物）：
+
+| 产物 | `auto` | 显式 `vulkan`（对照组） |
+|---|---|---|
+| 无 A（`12db9ce2`） | 71.6 MB | 51.6 MB |
+| 有 A（`d8f11c33`） | **51.4 MB** | 51.6 MB |
+
+`auto` 降 20.2 MB 而显式 `vulkan` 纹丝不动 → 省下来的就是被砍掉的枚举范围，不是环境漂移。
+
 三条结论（都改代码，不是改文案）：
 
 1. **枚举范围本身是成本，约 20.4 MB**：全集 72.0 vs 单后端 51.6。所以 `auto` 不再一次给 `Backends::all()`，改为**串行探测、只开一个后端**（`crates/ariahost-ui/src/backend.rs` 的 `AUTO_PROBE_ORDER` + `probe_in_order`，同一时刻最多一个实例，有单测用 Drop 计数器证明）。
@@ -159,6 +177,21 @@ $s.CounterSamples | Measure-Object -Property CookedValue -Minimum -Maximum
 - **反面教训**：假 aria2 把 JSON-RPC `id` 回成数字时，客户端每轮 `getVersion` 失败并按 2s 退避重试。这**恰恰证明退避与失败归类在工作**——取证时要记录调用间隔（实测 **2.1s** = 2s 节流 + 30ms 往返），别把「一直失败」直接当缺陷。
 - **能力边界**：UI Automation 证明不了**字形正确、中文渲染正常、输入法能上屏**。`selftest` 里 `font=Microsoft_YaHei_UI` 只说明字体解析成功 ≠ 字形正确 ≠ 能输入——这三件事必须人眼 + 真机输入法，见验收 #13（**仍未通过**）。
 - **能验「关闭行为」**（2026-11-25 实测）：对窗口发 `WindowPattern.Close`（UIA）**确实会走到 eframe 的 `close_requested`**，不是被 winit 直接吞掉。判据是 `window.json` 被写盘——它只在 close 分支里写。因此 `ui.close_action` 三档（`tray`/`ask`/`exit`）可以在锁屏下真机验证：`tray` 之后进程仍在且窗口 `Visible=false`；`ask` 之后 UIA 树里出现对话框文本；`exit` 之后约 4 秒进程与 `aria2c` 都消失。
+
+### 4.4 面板日志落盘（M3-m / task-58）
+
+**面板的行为日志现在真的写到磁盘**，不再只活在内存环形缓冲里：
+
+- **路径**：用户平面 `%APPDATA%\AriaHost\logs\ariahost.log`（服务平面 `%ProgramData%\AriaHost\logs\`），按 10MB×5 份轮转。
+- **唯一收口点**：`LogBuffer::push` 一律转发（`crates/ariahost-ui/src/logbuf.rs`），所以 `app.rs` 里几十处 `self.log.push(...)` 不需要各自挂一遍——新增的行自动落盘。
+- **分级**：内联错误条按语气落盘，`Tone::Bad → ERROR`、`Tone::Warn → WARN`（`app.rs::banner_level`，有单测）；`Good`/`Idle` 不写，避免噪音。
+- **脱敏**：写入侧已有唯一实现 `logfile::format_line → redact`（`common/src/logfile.rs`），面板**不重复脱敏**；`token:`/`--rpc-secret=`/磁力 infohash 等模式在落盘前被替换。
+- **后端探测轨迹**：`auto` 的逐次尝试与最终选择写在 `panel.probe` 目标下，例：
+  `INFO panel.probe: 后端探测：尝试 vulkan → 可用；最终后端 = vulkan（只开这一个，不走全集）`
+  —— 诊断包里据此可直接判定「真的用了哪个后端」，不必再跑 selftest。
+- **边界**：`--panel-selftest` **不**初始化文件日志（短命自检不污染用户日志），要验写入器本身用 `--log-selftest`。
+
+**已实测（Linux 真面板、隔离 `APPDATA`、10 s）**：`ariahost.log` 22 行 / 2855 B，`main`×1 + `panel`×20 + `panel.probe`×1，`LEAK`/`SK-SHOULD-NOT-APPEAR` 命中 0。
 
 ## 5. 本地绿的边界（必读）
 
