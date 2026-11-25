@@ -330,10 +330,11 @@ jobs:
           # /INPUTCHARSET UTF8：installer/ariahost.nsi 是 UTF-8（无 BOM），含大量中文字面量
           # （MUI 文案 / VersionKey）。不显式声明输入字符集时，en-US runner 的 ANSI 代码页会
           # 把中文读成乱码（首次编译最容易在这里红）。也同样适用于 .nsh 头文件。
-          # /DBUNDLED_ARIA2_REQUIRED：发布包**必须**带内置核心（task-54）。若上一步的
-          # 载荷因任何原因没落到 dist/x64，这里编译期直接失败，而不是悄悄出一个
-          # 「首次运行还要联网下载」的包——那正是 L6 里用户装完就不可用的形态。
-          & $env:MAKENSIS /V2 /INPUTCHARSET UTF8 "/DVERSION=$env:VERSION" "/DVI_VERSION=$env:VI_VERSION" "/DARCH=x64" "/DSRCDIR=$src" "/DOUTFILE=$out" /DBUNDLED_ARIA2_REQUIRED "installer\ariahost.nsi"
+          # /DNO_BUNDLED_ARIA2 不传：**默认就是「必须带核心」**（task-54 B3 起，
+          # ariahost.nsi 里缺 ${SRCDIR}\aria2c.exe 直接 !error 编译失败）。所以这里
+          # 不需要额外的 /DBUNDLED_ARIA2_REQUIRED——少一个"发布时要记得传的 define"，
+          # 也就少一种「忘了传 → 悄悄出无核心包」的事故形态。
+          & $env:MAKENSIS /V2 /INPUTCHARSET UTF8 "/DVERSION=$env:VERSION" "/DVI_VERSION=$env:VI_VERSION" "/DARCH=x64" "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi"
           if ($LASTEXITCODE -ne 0) { Write-Error "makensis 失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
           if (-not (Test-Path $out)) { Write-Error "未生成 $out"; exit 1 }
           Copy-Item $out "dist/x64/" -Force

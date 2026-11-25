@@ -73,7 +73,8 @@
 ;  aria2c.exe**（在线双线路在真实用户网络不可用）：release.yml 下载官方 zip、硬校验
 ;  SHA-256、把 aria2c.exe 放进 dist\<arch>\；本脚本见 ${SRCDIR}\aria2c.exe 即一并安装，
 ;  并把 GPLv2 许可文本与 THIRD-PARTY-NOTICES.md 装进 $INSTDIR\licenses\（同进同退）。
-;  发布构建传 /DBUNDLED_ARIA2_REQUIRED 时缺核心即编译失败。口径见 docs/dev/release.md §7。
+;  **默认必带核心（fail-closed）**：${SRCDIR}\aria2c.exe 缺失即编译失败；确实要出
+;  无核心包必须显式 /DNO_BUNDLED_ARIA2=1。口径见 docs/dev/release.md §7。
 ;
 ;  图标管线（2026-11-25 落地）：installer\ariahost.ico 是 7 尺寸
 ;  （16/24/32/48/64/128/256）、32bpp、**非 PNG 压缩**（BMP 条目）的 ICO，由
@@ -154,7 +155,10 @@ BrandingText "${APP_NAME} ${VERSION} (${ARCH})"
 ; - LegalCopyright 已按 MIT OR Apache-2.0 双许可填写（架构 §13 S1 已定：2026-11）。
 ; - 首版安装包**不含许可页 / EULA 页**：双许可不需要用户先接受条款，属 Q13/S3 决定，
 ;   勿自行新增 MUI_LICENSEPAGE（加了会改变安装流程与验收 #1 口径）。
-; - 版权行只放所有者署名，不要拼 aria2 的 GPLv2 声明（aria2 不由本安装包分发，见 release.md §7）。
+; - 版权行只放所有者署名，**不**把 aria2 的 GPLv2 声明拼进来：本产品的许可是
+;   MIT OR Apache-2.0，aria2 是**并列的第三方组件**（自带时随附其 GPL-2.0 全文与
+;   THIRD-PARTY-NOTICES.md），两者的许可声明必须分开写，混在一起会让人误以为
+;   本产品整体是 GPL。口径见 release.md §7。
 VIProductVersion "${VI_VERSION}"
 VIAddVersionKey "ProductName"     "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} 安装程序"
@@ -184,6 +188,18 @@ VIAddVersionKey "LegalCopyright"  "Copyright (c) 2026 Alusss"
 !ifndef PER_MACHINE
   !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
   !define MUI_FINISHPAGE_RUN_TEXT "立即启动 ${APP_NAME}"
+!endif
+
+; Finish 页补一句第三方组件说明（task-54 B4）。
+; 为什么放 Finish 页而不是新增 MUI_LICENSEPAGE：许可页会改变安装流程与验收 #1 口径
+; （见上面 Q13/S3 的说明），而这里只是**告知**，不构成接受条款。
+; 两个分支必须都说实话：带核心的包说「含 aria2c 与许可见安装目录」；用
+; /DNO_BUNDLED_ARIA2=1 编出来的包必须明说「没带核心、首次启动要联网下」——否则
+; 用户装完看到「找不到 aria2c」会以为是坏包（那正是 L6 事故的用户视角）。
+!ifdef NO_BUNDLED_ARIA2
+  !define MUI_FINISHPAGE_TEXT "本安装包**未内置** aria2 核心：首次启动需要联网下载 aria2c，或在设置里指定本地的 aria2c.exe。$\r$\n$\r$\n${APP_NAME} 仅通过子进程与 RPC 调度 aria2，不修改其源码、不链接其二进制。"
+!else
+  !define MUI_FINISHPAGE_TEXT "本安装包内置第三方组件 aria2c 1.37.0（GPL-2.0）：许可全文与来源说明见安装目录下的 THIRD-PARTY-NOTICES.md 与 licenses\aria2-COPYING.txt。$\r$\n$\r$\n${APP_NAME} 仅通过子进程与 RPC 调度 aria2，不修改其源码、不链接其二进制。"
 !endif
 !insertmacro MUI_PAGE_FINISH
 
@@ -627,9 +643,17 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   ; 内置 aria2c（task-54 A 条）：release.yml 把「已按 SHA-256 硬校验」的 aria2c.exe
   ; 放进 ${SRCDIR}，用户机器上双击即用，不再依赖首次运行的在线下载（双线路在真实
   ; 用户网络下不可用，见 docs/dev/known-limitations.md L6）。
-  ; 本地/CI 编译不带该文件也能过（/FileExists 为假 → 不装、不报错）；发布流水线额外
-  ; 传 /DBUNDLED_ARIA2_REQUIRED，此时缺失即编译失败——挡住「忘了放载荷却照样出包」。
-!if /FileExists "${SRCDIR}\aria2c.exe"
+  ;
+  ; **默认 fail-closed**（task-54 B3 裁定）：没有核心就**编译失败**。
+  ; 为什么不是「release 才传 /DBUNDLED_ARIA2_REQUIRED」：那等于把事故责任押在
+  ; 「每个构建入口都记得加那个 define」上——task-61 之类改 15s→20s 的人顺手
+  ; makensis 一次就会产出无核心包，而失败要到用户首启才暴露。默认关死、
+  ; 想要无核心包必须显式写 /DNO_BUNDLED_ARIA2=1，写错方向才安全。
+!ifdef NO_BUNDLED_ARIA2
+  ; 显式声明「本包不带核心」：Finish 页文案会明说需要联网下载（见文件头界面段）。
+  !insertmacro TraceWrite "[install] NO_BUNDLED_ARIA2：本包不含 aria2c.exe（显式声明）"
+!else
+  !if /FileExists "${SRCDIR}\aria2c.exe"
   File "${SRCDIR}\aria2c.exe"
 
   ; 第三方许可与来源说明（GPLv2 二进制分发义务，见 docs/dev/release.md §7）。
@@ -646,9 +670,8 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   File "licenses\aria2-COPYING.txt"
   SetOutPath "$INSTDIR"
   File "..\THIRD-PARTY-NOTICES.md"
-!else
-  !ifdef BUNDLED_ARIA2_REQUIRED
-    !error "BUNDLED_ARIA2_REQUIRED 已定义，但 ${SRCDIR}\aria2c.exe 不存在：先跑 release.yml 的下载+校验步骤"
+  !else
+    !error "缺 ${SRCDIR}\aria2c.exe：本安装包默认**必须**带 aria2 核心（task-54 B3）。带核心：先跑 release.yml 的下载+SHA-256 校验步骤，或手工放入并核对 KNOWN_SHA256；确实要出无核心包：显式传 /DNO_BUNDLED_ARIA2=1（Finish 页会提示需联网下载）"
   !endif
 !endif
 
