@@ -742,6 +742,12 @@ mod platform_quit {
             .unwrap_or(QuitOutcome::Timeout(TimeoutPhase::Watchdog))
     }
 
+    /// 与**当前用户**的控制管道握手。
+    ///
+    /// 管道名按用户 SID 隔离（`ariahost_common::paths::control_pipe_name`）：
+    /// - 打不开 = 当前用户没有面板在跑 → [`QuitOutcome::NoInstance`]（退出码 0，安装器视为成功）；
+    /// - **绝不回退到旧固定名**：那个名字只可能属于别的会话/别的用户，回退就是误杀；
+    /// - OS 服务实例不走这条管道，所以服务模式与这套隔离无关。
     fn handshake(deadline: Instant) -> QuitOutcome {
         let name = ariahost_common::paths::control_pipe_name();
         let mut pipe = match std::fs::OpenOptions::new()

@@ -15,4 +15,10 @@ toml = { workspace = true }
 # 配置层：密码学随机（BCryptGenRandom）与 DPAPI（secret.bin）。
 # feature 清单与理由见 src/config.rs 模块文档；非 Windows 目标不编译这些代码。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
+# 控制管道名按用户 SID 隔离（paths.rs）：OpenProcessToken 在 Threading（workspace 已启用），
+# GetTokenInformation / TOKEN_USER 在 Win32_Security，ConvertSidToStringSidW 在
+# Win32_Security_Authorization —— 后两个 feature 只在这里追加，不动 workspace 根清单。
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
