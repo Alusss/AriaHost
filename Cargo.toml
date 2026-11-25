@@ -27,6 +27,9 @@ egui_system_font_provider = "0.37"
 # 只要 Table/Strip，不要 image/svg/syntect/datepicker 等加载器（那会把 image 与
 # syntect 拖进依赖树）。它没有额外传递依赖，除 egui 之外只多一个 `document-features` 宏。
 egui_extras = { version = "0.37", default-features = false }
+# 后端探测要 block_on `Instance::enumerate_adapters`（wgpu 30 是 async API）。
+# lock 里已有 1.0.3（eframe 传递依赖），这里只是显式引用，不新增供应链。
+pollster = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

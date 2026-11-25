@@ -338,7 +338,7 @@ fn run(
         UiPrefs::default()
     };
 
-    let options = native_options(&log, backend, saved_geometry);
+    let options = native_options(&log, resolve_backends(backend, &log), saved_geometry);
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
     let app_facts = Arc::clone(&facts);
@@ -528,7 +528,7 @@ fn atlas_max_side(log: &LogBuffer) -> u32 {
 /// `geometry` 是上次退出时保存的窗口几何（点）；为 `None` 时保持「默认尺寸 + 居中」。
 fn native_options(
     log: &LogBuffer,
-    backend: Backend,
+    backends: eframe::wgpu::Backends,
     geometry: Option<Geometry>,
 ) -> eframe::NativeOptions {
     let icon = load_icon(log);
@@ -556,18 +556,90 @@ fn native_options(
         // 所以这里关掉它，改由 `fonts::install` 注册带 `zh-CN` 的 provider（首帧前完成，EG-6）。
         system_font_fallback: false,
         centered,
-        wgpu_options: wgpu_configuration(backend),
+        wgpu_options: wgpu_configuration(backends),
         ..Default::default()
     }
 }
 
+/// 决定最终交给 wgpu 的后端位集（**只开一个后端**）。
+///
+/// 为什么必须收窄（同一产物 sha256=12db9ce2…ce3f30、30 采样 / 60s / K32 句柄口径）：
+/// - `auto`（全集枚举，wgpu 自选到 Vulkan）= **72.0MB**；
+/// - 显式 `--backend vulkan`（单后端）= **51.6MB** → 枚举范围本身白付 **20.4MB**；
+/// - 显式 `--backend dx12` = **116.4MB**，已破 100MB 闸门。
+///
+/// 所以 `auto` 收窄成「串行探测、只开一个后端」，且顺序是 Vulkan 优先（见 [`backend::AUTO_PROBE_ORDER`]）。
+///
+/// 语义：
+/// - `auto` = 串行探测（[`backend::AUTO_PROBE_ORDER`]），一次只实例化一个后端；
+///   显式设了 `WGPU_BACKEND` 时尊重它（与 wgpu 自己的默认行为对齐）；
+/// - `dx12` / `vulkan` = **只**允许该后端，**不回退**：配了 dx12 起不来就如实报错，
+///   绝不偷偷换后端（否则「配了 dx12 却在跑 vulkan」这种假验收就回来了）。
+fn resolve_backends(backend: Backend, log: &LogBuffer) -> eframe::wgpu::Backends {
+    use eframe::wgpu;
+
+    match backend {
+        Backend::Dx12 => {
+            log.push("后端：只允许 dx12（显式指定，不回退；起不来会如实报错）".to_owned());
+            backend.backends()
+        }
+        Backend::Vulkan => {
+            log.push("后端：只允许 vulkan（显式指定，不回退；起不来会如实报错）".to_owned());
+            backend.backends()
+        }
+        Backend::Auto => {
+            if let Some(from_env) = wgpu::Backends::from_env() {
+                log.push(format!(
+                    "后端：auto 尊重 WGPU_BACKEND → 只开 {}",
+                    backend::bits_label(from_env)
+                ));
+                return from_env;
+            }
+            let mut lines = Vec::new();
+            let chosen =
+                backend::probe_in_order(&backend::AUTO_PROBE_ORDER, probe_once, &mut lines);
+            for line in lines {
+                log.push(line);
+            }
+            chosen.unwrap_or_else(|| {
+                log.push(
+                    "后端：退回 wgpu 默认全集（内存与性能都不是最优；建议用 --backend 指定）"
+                        .to_owned(),
+                );
+                wgpu::Backends::default()
+            })
+        }
+    }
+}
+
+/// 真探测：只建**这一个**后端的 `Instance`，枚举 adapter，然后把实例交回去由调用方丢掉。
+///
+/// 返回值第二项是「存活凭证」——[`backend::probe_in_order`] 会在试下一个之前 drop 它，
+/// 所以同一时刻最多只有一个后端被实例化（这一点有单测证明）。
+fn probe_once(backends: eframe::wgpu::Backends) -> (backend::Probe, eframe::wgpu::Instance) {
+    use eframe::wgpu;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let probe = if !wgpu::Instance::enabled_backend_features().contains(backends) {
+        backend::Probe::Unsupported
+    } else if pollster::block_on(instance.enumerate_adapters(backends)).is_empty() {
+        backend::Probe::NoAdapter
+    } else {
+        backend::Probe::Ready
+    };
+    (probe, instance)
+}
+
 /// wgpu 设备配置：内存策略见 EG-3，设备上限见 [`DEVICE_MAX_SIDE`]（与图集上限解耦），
-/// 后端位集见 [`Backend`]（`--backend` 唯一的落点）。
-fn wgpu_configuration(backend: Backend) -> eframe::WgpuConfiguration {
+/// 后端位集由 [`resolve_backends`] 收窄成**单个**后端后再传进来。
+fn wgpu_configuration(backends: eframe::wgpu::Backends) -> eframe::WgpuConfiguration {
     let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
     // `InstanceDescriptor` 在 wgpu 30 里没有 `Default`：`without_display_handle()` 已经给出
     // `new_without_display_handle()` 的实例，这里只改唯一关心的字段（后端位集）。
-    setup.instance_descriptor.backends = backend.backends();
+    setup.instance_descriptor.backends = backends;
     setup.device_descriptor = Arc::new(move |_adapter: &eframe::wgpu::Adapter| {
         eframe::wgpu::DeviceDescriptor {
             label: Some("ariahost wgpu device"),

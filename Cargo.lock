@@ -279,6 +279,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_system_font_provider",
+ "pollster",
  "serde",
  "serde_json",
  "tray-icon",

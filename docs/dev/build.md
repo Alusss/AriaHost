@@ -133,6 +133,26 @@ $s.CounterSamples | Measure-Object -Property CookedValue -Minimum -Maximum
 - **DX12 首次被机器验证**（2026-11-25）：本机 `--backend dx12` 起窗成功。此前 `auto` 一直选 Vulkan，DX12 路径从未真正跑过——`--backend dx12` 现在是产品主路径的强制验证入口。
 - **待归因（未验证）**：显式 `vulkan` 自测 `private_kb≈55064` 与 `auto≈75504` 差 17–20 MB（怀疑 `auto` 同时初始化两套后端）；DX12 相对 Vulkan 多出的 ~20 MB 同样未归因。
 
+#### 4.2.1 三后端口径复测（M3-l，2026-11-25）
+
+口径升级：**`Get-Counter` 按进程名取数已被废弃**（同名残留实例下只回 1 个样本、无 PID，无法证明测的是谁）。现行口径是 `K32GetProcessMemoryInfo → PrivateWorkingSetSize`，**按被测进程句柄**取数，30 采样 / 60 s，采样期强制单实例（实例数≠1 判 INCONCLUSIVE）。
+
+同一产物（sha256=`12db9ce2…ce3f30`，Intel Iris Xe / 1920×1080 / 100% 缩放）：
+
+| 场景 | PWS（60 s，30 采样） | 到 100 MB 的余量 |
+|---|---|---|
+| 全集 `auto`（wgpu 自选 Vulkan） | 72.0 MB（71.7–73.9） | 28 MB |
+| 显式 `--backend vulkan`（单后端） | 51.6 MB（50.6–52.8） | 48 MB |
+| 显式 `--backend dx12` | **116.4 MB（116.3–116.6）** | **−16 MB（破闸门）** |
+
+三条结论（都改代码，不是改文案）：
+
+1. **枚举范围本身是成本，约 20.4 MB**：全集 72.0 vs 单后端 51.6。所以 `auto` 不再一次给 `Backends::all()`，改为**串行探测、只开一个后端**（`crates/ariahost-ui/src/backend.rs` 的 `AUTO_PROBE_ORDER` + `probe_in_order`，同一时刻最多一个实例，有单测用 Drop 计数器证明）。
+2. **DX12 是破闸门的那条路**：116.4 MB，超 100 MB **16 MB**。因此 `auto` 的探测顺序是 **Vulkan → DX12 → GL**（内存优先），DX12 只作兜底并在日志里说明为什么退到它。想改回 DX12 优先就改这一个常量的顺序——但那条路当前过不了 EG-4。
+3. **旧读数更正**：本文件早前记的 `auto` 96.7 MB、服务页 99.1 MB、以及「DX12 只多 ~20 MB」都建立在名口径 / 多实例读数上，**按本产物重测不再成立**；上表是新基准。DX12 为何比 Vulkan 多 65 MB 仍未逐项归因（驱动侧工作集 + 交换链，未拆）。
+
+> 闸门仍未过的是 **DX12 这条路**，不是产品主路径（`auto` 在本机走 Vulkan = 72.0 MB）。若某台机器只有 D3D12，它会以 116 MB 起窗——这条已记入 `known-limitations.md`（L9）。
+
 ### 4.3 无人值守取证（锁屏 / 无头机）
 
 - **不要指望截图**：锁屏时截出来是锁屏界面，无头环境根本没有桌面。改用 **UI Automation 读 egui（accesskit）暴露的文本节点**——M2-1 实测读到 **46 个可见文本节点**，覆盖服务状态、aria2 版本 / 速率 / 任务计数与四个按钮文案。这足以证明「文案与结构对」，也是 #16 面板形态的取证手段。

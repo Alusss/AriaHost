@@ -66,9 +66,170 @@ impl Backend {
     }
 }
 
+/// 单个后端的探测结论。
+///
+/// 两种失败要分开记日志：**后端没编进来**（本构建不具备能力）与**后端在但没有显卡**
+/// 是完全不同的事故，混成一句「不可用」以后没法排障。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// 该后端可用（至少枚举到一个 adapter）。
+    Ready,
+    /// 这个 wgpu 构建里没有该后端。
+    Unsupported,
+    /// 后端在，但一个 adapter 都没有。
+    NoAdapter,
+}
+
+/// `auto` 的串行探测顺序：**Vulkan → DX12 → GL**（内存优先，GL 兜底）。
+///
+/// 两个实测事实（同一产物 sha256=12db9ce2…ce3f30、K32 句柄口径、30 采样 / 60s / 单实例）：
+/// 1. **枚举范围本身是成本**：全集 `auto` = 72.0MB，单后端显式 `vulkan` = 51.6MB，差 **20.4MB**。
+///    所以 `auto` 不能一次给 `Backends::all()`，必须串行探测、只开一个。
+/// 2. **后端本身是更大的一笔**：显式 `dx12` = **116.4MB**，已破 100MB 闸门（EG-4）。
+///
+/// 因此顺序不能按「Windows 主路径优先」把 dx12 放第一位——那样 `auto` 在有 D3D12 的
+/// 机器上会直接选中 116MB 的那条路，闸门必破。**内存闸门是硬要求，DX12 只作兜底**：
+/// 只有 Vulkan 不可用时才走它，并在日志里如实说明为什么退到 DX12。
+/// 想改回 DX12 优先：只改这个常量的顺序即可（有单测锁语义，不锁具体顺序）。
+pub const AUTO_PROBE_ORDER: [(&str, wgpu::Backends); 3] = [
+    ("vulkan", wgpu::Backends::VULKAN),
+    ("dx12", wgpu::Backends::DX12),
+    ("gl", wgpu::Backends::GL),
+];
+
+/// 串行探测：按顺序一次只试**一个**后端，成功即返回它，失败先丢再试下一个。
+///
+/// `attempt` 必须「试完就把实例丢掉」——返回值里的 guard 在函数内被 `drop`，
+/// 所以同一时刻最多只有一个后端被实例化。这一点由单测用 Drop 计数器证明，
+/// 不靠注释保证。
+pub fn probe_in_order<P, G>(
+    order: &[(&'static str, wgpu::Backends)],
+    mut attempt: P,
+    log: &mut Vec<String>,
+) -> Option<wgpu::Backends>
+where
+    P: FnMut(wgpu::Backends) -> (Probe, G),
+{
+    for (label, backends) in order {
+        let (probe, guard) = attempt(*backends);
+        match probe {
+            Probe::Ready => {
+                log.push(format!(
+                    "后端探测：{label} 可用 → 只开 {label}（不走全集；全集比单后端多约 20MB）"
+                ));
+                drop(guard);
+                return Some(*backends);
+            }
+            Probe::Unsupported => log.push(format!(
+                "后端探测：{label} 不可用（本构建未编入该后端）→ 试下一个"
+            )),
+            Probe::NoAdapter => log.push(format!(
+                "后端探测：{label} 后端在，但没有可用显卡适配器 → 试下一个"
+            )),
+        }
+        // 先丢实例再试下一个：同时持有两个等于把 20MB 又加回来。
+        drop(guard);
+    }
+    log.push("后端探测：没有一个后端可用 → 退回 wgpu 默认（建议用 --backend 明确指定）".to_owned());
+    None
+}
+
+/// 把后端位集写成中文日志（避免把 `Backends(DX12 | VULKAN)` 这种 Debug 串打到用户日志里）。
+pub fn bits_label(bits: wgpu::Backends) -> String {
+    if bits.is_empty() {
+        return "（空集）".to_owned();
+    }
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (wgpu::Backends::DX12, "dx12"),
+        (wgpu::Backends::VULKAN, "vulkan"),
+        (wgpu::Backends::GL, "gl"),
+        (wgpu::Backends::METAL, "metal"),
+        (wgpu::Backends::BROWSER_WEBGPU, "webgpu"),
+    ] {
+        if bits.contains(bit) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        format!("{bits:?}")
+    } else {
+        names.join(" + ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Alive(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Alive {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn probe_stops_at_first_ready_and_never_holds_two_instances() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let alive = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut log = Vec::new();
+
+        let chosen = {
+            let (alive, peak, calls) = (alive.clone(), peak.clone(), calls.clone());
+            probe_in_order(
+                &[
+                    ("dx12", wgpu::Backends::DX12),
+                    ("vulkan", wgpu::Backends::VULKAN),
+                    ("gl", wgpu::Backends::GL),
+                ],
+                move |_backends| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let now = alive.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // 第一个后端：假装没有显卡；第二个：成功。
+                    let probe = if calls.load(Ordering::SeqCst) == 1 {
+                        Probe::NoAdapter
+                    } else {
+                        Probe::Ready
+                    };
+                    (probe, Alive(alive.clone()))
+                },
+                &mut log,
+            )
+        };
+
+        assert_eq!(chosen, Some(wgpu::Backends::VULKAN), "应落到第二个后端");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "成功之后不许继续探测");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "同一时刻最多一个实例存活（同时持有两个 = 白修那 20MB）"
+        );
+        assert_eq!(alive.load(Ordering::SeqCst), 0, "返回前必须把实例丢掉");
+        assert!(
+            log.iter()
+                .any(|line| line.contains("dx12 后端在，但没有可用显卡")),
+            "失败原因要写清楚：{log:?}"
+        );
+    }
+
+    #[test]
+    fn probe_reports_unsupported_apart_from_no_adapter() {
+        let mut log = Vec::new();
+        let chosen = probe_in_order(
+            &[("dx12", wgpu::Backends::DX12)],
+            |_| (Probe::Unsupported, ()),
+            &mut log,
+        );
+        assert_eq!(chosen, None);
+        assert!(log[0].contains("未编入该后端"), "{log:?}");
+        assert!(log[1].contains("没有一个后端可用"), "{log:?}");
+    }
 
     #[test]
     fn parses_the_three_documented_values() {
@@ -103,11 +264,37 @@ mod tests {
     }
 
     #[test]
-    fn auto_keeps_more_than_one_backend() {
-        // auto 不能退化成单后端，否则「默认路径」等于偷偷钉死某个后端。
-        let auto = Backend::Auto.backends();
-        assert!(auto.contains(wgpu::Backends::DX12) || auto.contains(wgpu::Backends::VULKAN));
-        assert_ne!(auto, wgpu::Backends::empty());
+    fn auto_probe_order_tries_exactly_one_backend_at_a_time() {
+        // auto 不再一次给全集：每个候选必须是**单个**后端位，
+        // 否则「同时实例化两个后端」会把实测约 20MB 的枚举成本加回来。
+        for (label, bits) in AUTO_PROBE_ORDER {
+            assert!(!label.is_empty());
+            assert_eq!(
+                bits.into_iter().count(),
+                1,
+                "{label} 必须是单个后端，实际 {bits:?}"
+            );
+        }
+        // 顺序只锁「内存优先」这一条语义：第一个必须是 vulkan（单后端实测 51.6MB，
+        // 而 DX12 是 116.4MB，已破闸门），DX12 只能作兜底。
+        assert_eq!(AUTO_PROBE_ORDER[0].1, wgpu::Backends::VULKAN);
+        let rest: Vec<wgpu::Backends> = AUTO_PROBE_ORDER[1..].iter().map(|(_, b)| *b).collect();
+        assert!(
+            rest.contains(&wgpu::Backends::DX12),
+            "DX12 必须仍在兜底链里"
+        );
+        assert!(rest.contains(&wgpu::Backends::GL), "GL 必须兜底");
+    }
+
+    #[test]
+    fn bits_label_names_the_backends_in_chinese_log_friendly_way() {
+        assert_eq!(bits_label(wgpu::Backends::DX12), "dx12");
+        assert_eq!(bits_label(wgpu::Backends::VULKAN), "vulkan");
+        assert_eq!(
+            bits_label(wgpu::Backends::DX12 | wgpu::Backends::VULKAN),
+            "dx12 + vulkan"
+        );
+        assert_eq!(bits_label(wgpu::Backends::empty()), "（空集）");
     }
 
     #[test]

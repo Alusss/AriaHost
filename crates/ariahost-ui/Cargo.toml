@@ -21,6 +21,8 @@ egui.workspace = true
 egui_system_font_provider.workspace = true
 # EG-8：任务列表虚拟化（`TableBuilder::body().rows()`）。默认 features 已关，只留 Table。
 egui_extras.workspace = true
+# M3-l：串行后端探测（只 block_on 一次 adapter 枚举）。
+pollster.workspace = true
 # 窗口状态（%LOCALAPPDATA%\AriaHost\window.json）的读写；工作区已有同一套 serde，不新增供应链。
 serde.workspace = true
 serde_json.workspace = true
