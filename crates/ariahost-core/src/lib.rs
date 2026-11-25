@@ -33,6 +33,7 @@ pub mod http;
 pub mod release;
 pub mod runtime;
 pub mod store;
+pub mod sync;
 pub mod zip_extract;
 
 pub use clean::{
@@ -66,6 +67,11 @@ pub use runtime::{
     FILE_ALLOCATION, LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
 };
 pub use store::{ActivePointer, ExeProbe, VersionStore, ACTIVE_FILE};
+pub use sync::{
+    service_core_status, service_core_status_default, service_core_status_with,
+    sync_core_to_service, sync_core_to_service_default, sync_core_to_service_with, RealSyncIo,
+    ServiceCoreStatus, SyncError, SyncIo, SyncOutcome, SyncReport, TMP_SUFFIX,
+};
 pub use zip_extract::{extract_core, ExtractedCore};
 
 /// 核心可执行文件名（版本库、解包、安装共用一处，避免第二份字面量）。
