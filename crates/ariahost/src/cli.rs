@@ -397,14 +397,35 @@ fn parse_dimension(raw: &str, label: &str) -> Result<u32, UsageError> {
 /// 执行一条命令并返回进程退出码。
 ///
 /// 面板分支自 M2 起真的起窗（阻塞到窗口关闭）；`--service` 与三个短命助手仍是占位实现。
+///
+/// **控制台**：Windows 是 GUI 子系统，stdout 默认没接控制台。凡是「要人/脚本看得见输出」
+/// 的命令，在输出前按需附着父控制台（[`crate::console::ensure_for_cli_output`]）；
+/// 面板与服务两条路径**不附着**——面板要绝对避免「关掉 cmd 窗口就被连带杀掉」，
+/// 服务由 SCM 在 Session 0 拉起、那里根本没有控制台。
 pub fn run(args: &[String]) -> i32 {
     match parse(args) {
-        Ok(command) => execute(&command),
+        Ok(command) => {
+            prepare_console(&command);
+            execute(&command)
+        }
         Err(error) => {
+            // 用法错误也要看得见：这一支没有 Command，按「要输出」处理。
+            crate::console::ensure_for_cli_output();
             eprintln!("{} {}", error.code(), error.message());
             eprintln!("{USAGE}");
             EXIT_ERR
         }
+    }
+}
+
+/// 这条命令要不要为输出准备控制台。
+///
+/// 只有两条路径不要：**面板**（GUI 常驻，附着后关 cmd 会连带杀进程）与
+/// **服务**（SCM/Session 0，没有父控制台）。其余（CLI、自检、短命助手）都要。
+fn prepare_console(command: &Command) {
+    let wants_console = !matches!(command, Command::Panel { .. } | Command::Service);
+    if wants_console {
+        crate::console::ensure_for_cli_output();
     }
 }
 
