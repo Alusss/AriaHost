@@ -286,11 +286,14 @@ fn run(
         ));
     }
 
-    // EG-12：单实例。本切片用 std::fs::File::try_lock 锁文件（Rust 1.89+ 稳定 API），
-    // M2-1 换成 CreateMutexW + ERROR_ALREADY_EXISTS + 命令行转发（见架构 §4.1.4）。
+    // EG-12：单实例。**Windows 主判据是命名互斥体**（`Local\AriaHost-panel-<用户名>` +
+    // `ERROR_ALREADY_EXISTS`，架构 §4.1.4 定稿），文件锁只作兜底/交叉印证。
+    //
+    // 为什么必须换（task-71 B 的真机现象）：只靠锁文件时，两个进程若跑在不同完整性级别
+    // 或不同会话里，`LockFileEx` 可能被系统降级/忽略，两边都拿到锁 → 出现两个面板。
     let lock = match instance::acquire() {
         instance::LockOutcome::Acquired(lock) => {
-            log.push(format!("单实例锁：已获取 {}", lock.path().display()));
+            log.push(format!("单实例锁：已获取 {}", lock.describe()));
             Some(lock)
         }
         instance::LockOutcome::AlreadyRunning { path } => {
@@ -299,7 +302,12 @@ fn run(
                 ErrorCode::DuplicateInstance.code(),
                 DUPLICATE_INSTANCE_HINT
             );
-            println!("锁文件：{}", path.display());
+            // 明确告诉用户「发生了什么」：后起的这个进程会立刻退出，
+            // 现有面板在任务栏或托盘里（不给路径，用户看了也不知道要干什么）。
+            println!(
+                "已有面板持有单实例锁（{}）；本次启动的进程直接退出，不影响已运行的面板。",
+                path.display()
+            );
             return EXIT_ERR;
         }
         instance::LockOutcome::Unavailable { path, reason } => {
