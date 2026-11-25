@@ -285,6 +285,24 @@ mod tests {
         assert_eq!(lines[1].name, CDN_LINE_NAME);
     }
 
+    /// 旧镜像线路（`r.alusss.cn` 前缀模板）已删除，这条测试是**删除的守护**：
+    /// 谁把镜像线路加回任何一条默认线路里，这里会先红（而不是等用户装不上才发现）。
+    #[test]
+    fn no_legacy_mirror_line_is_generated() {
+        for order in ["cdn,github", "github,cdn", "cdn", "github"] {
+            let (lines, _) = lines_from(order, "https://cdn.example.invalid/r/");
+            assert!(!lines.is_empty(), "顺序 {order} 不该一条线路都没有");
+            for line in &lines {
+                assert!(
+                    !line.template.contains("r.alusss.cn"),
+                    "顺序 {order}：旧镜像域名不得再出现在线路模板里（{} => {}）",
+                    line.name,
+                    line.template
+                );
+            }
+        }
+    }
+
     /// `cdn_base` 为空 → 只走 github（任务第 5 条的单测之一）。
     #[test]
     fn empty_cdn_base_keeps_only_github() {
