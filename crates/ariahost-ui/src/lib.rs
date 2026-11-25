@@ -22,6 +22,7 @@ mod fonts;
 mod instance;
 mod logbuf;
 mod metrics;
+mod settings;
 mod tasks;
 mod tray;
 mod view;
@@ -37,6 +38,7 @@ pub use app::{Banner, PanelInit, RuntimeFacts};
 pub use backend::Backend;
 pub use core_host::{CoreHost, CoreProbe, HostState};
 pub use logbuf::LogBuffer;
+pub use settings::{Effect, Group, Notice, Settings};
 pub use tasks::{TaskAction, TaskRow, TaskStatus};
 pub use view::{StatusView, Tone};
 pub use window::Geometry;
@@ -115,6 +117,21 @@ impl UiPrefs {
                     action.as_str(),
                     config.web.port
                 ));
+                // ui.renderer 是渲染器逃生口（auto | wgpu | glow，架构 §4.11 第 34 项）。
+                // 本构建只带 wgpu（eframe 默认 features，EG-3 的 MemoryHints 也走它），
+                // 所以选 glow 只能如实回退 + 记一条日志，不能假装切过去。
+                let renderer = config.ui.renderer.trim().to_ascii_lowercase();
+                match renderer.as_str() {
+                    "wgpu" => log.push("渲染器：wgpu（ui.renderer）".to_owned()),
+                    "glow" => log.push(
+                        "ui.renderer = glow，但本构建只带 wgpu（未编入 glow feature）：已按 wgpu 启动；要真用 glow 需带 glow feature 重编译"
+                            .to_owned(),
+                    ),
+                    "auto" | "" => log.push("渲染器：auto → wgpu（本构建唯一可用）".to_owned()),
+                    other => log.push(format!(
+                        "ui.renderer = {other} 不是 auto/wgpu/glow：按 auto（wgpu）启动，请到设置页改正"
+                    )),
+                }
                 Self {
                     close_action: action,
                     web_port: config.web.port,

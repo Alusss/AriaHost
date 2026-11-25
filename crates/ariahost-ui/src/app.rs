@@ -32,7 +32,7 @@ use crate::worker::{
     self, ActionOutcome, AddOutcome, Aria2Update, ServiceSnapshot, TaskRequest, Worker,
     WorkerOptions,
 };
-use crate::{CloseAction, UiPrefs};
+use crate::{settings, CloseAction, UiPrefs};
 
 /// 请求窗口尺寸后最多尝试多少帧（约 3 秒 @60fps）；超过就放弃并把 `ok=0`。
 const MAX_SIZE_ATTEMPTS: u32 = 200;
@@ -280,6 +280,12 @@ pub struct PanelApp {
     quit_save_pending: bool,
     /// 窗口藏到托盘后，后台唤醒线程的开关（`true` = 继续唤醒）。
     hidden_waker: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// 设置页是否打开（M2-4a：设置页替掉主体区，顶部标题栏不动）。
+    settings_open: bool,
+    /// 设置页编辑状态（首次打开才读盘，之后全是内存副本）。
+    settings: crate::settings::Settings,
+    /// 设置页里「打开配置文件所在目录」等动作的提示（复用 notice 会串味，单独一条）。
+    settings_flash: Option<(String, Instant)>,
 }
 
 impl PanelApp {
@@ -444,6 +450,9 @@ impl PanelApp {
             open_web,
             quit_save_pending: false,
             hidden_waker: None,
+            settings_open: false,
+            settings: crate::settings::Settings::new(),
+            settings_flash: None,
         }
     }
 
@@ -648,6 +657,544 @@ impl PanelApp {
                 self.close_prompt = Some(ClosePrompt { remember: false });
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // M2-4a 设置页
+    // -------------------------------------------------------------------
+
+    /// 打开/关闭设置页。关闭时若还有未保存改动，先问一句（不静默丢改动）。
+    fn toggle_settings(&mut self) {
+        if self.settings_open {
+            if self.settings.is_dirty() {
+                self.settings.leaving = true;
+            } else {
+                self.settings_open = false;
+                self.settings.leaving = false;
+            }
+            return;
+        }
+        // 只在**第一次**打开时读盘：之后每帧只用内存副本（不许每帧读 config.toml）。
+        self.settings.ensure_loaded();
+        self.settings.leaving = false;
+        self.settings_open = true;
+        self.log.push("打开设置页：下载 / 网络 / 界面三组");
+    }
+
+    /// 保存设置：先校验（有错不写盘），再走 `config::save` 的原子写；成功后应用「立即生效」项。
+    fn save_settings(&mut self) {
+        let saved = self.settings.save().is_ok();
+        let passed = self
+            .settings
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.ok);
+        if !saved || !passed {
+            // 校验没过：notice 里已经说清是哪一项，直接上屏一条错误条。
+            if let Some(notice) = self.settings.notice.clone() {
+                self.set_banner(Banner::new(Tone::Bad, notice.headline.clone()));
+            }
+            return;
+        }
+
+        // 立即生效 1/2：关闭三档（面板当场按新值处理点 X）。
+        let action = CloseAction::parse(&self.settings.draft().ui.close_action);
+        self.prefs.close_action = action;
+        self.log.push(format!(
+            "设置已保存：ui.close_action = {}（立即生效）",
+            action.as_str()
+        ));
+
+        // 立即生效 2/2：开机自启（HKCU Run，免提权；不用计划任务）。
+        let want = self.settings.draft().ui.start_with_windows;
+        match std::env::current_exe() {
+            Ok(exe) => match settings::apply_start_with_windows(want, &exe) {
+                Ok(()) => {
+                    self.log.push(if want {
+                        // 日志里带上真正写进注册表的值（含引号），排障时能直接复制核对。
+                        format!("已写入 HKCU Run：{}", settings::run_value(&exe))
+                    } else {
+                        "已清除 HKCU Run（ui.start_with_windows = false）".to_owned()
+                    });
+                }
+                Err(error) => {
+                    let headline = format!("配置已保存，但开机自启写入失败：{error}");
+                    self.log.push(headline.clone());
+                    self.settings.notice = Some(settings::Notice::err(
+                        headline,
+                        "确认 reg.exe 可用（Windows 自带）；或先用「任务管理器 → 启动」手动加",
+                    ));
+                }
+            },
+            Err(error) => {
+                self.log
+                    .push(format!("取不到本程序路径，跳过开机自启：{error}"));
+            }
+        }
+
+        self.set_banner(Banner::new(
+            Tone::Good,
+            "设置已保存到 config.toml（原子写）；重启后生效的项见列表标注",
+        ));
+    }
+
+    /// 设置页：顶栏（配置文件路径）+ 未保存提示 + 左导航 + 右内容 + 底部操作条。
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        // 底部固定操作条：先画，保证它永远在底部（不被内容顶走）。
+        egui::Panel::bottom("ariahost_settings_actions")
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let dirty = self.settings.is_dirty();
+                    let has_error = self.settings.has_errors();
+                    let can_save = dirty && !has_error;
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("保存"))
+                        .on_hover_text("写入 %APPDATA%\\AriaHost\\config.toml（原子写）")
+                        .clicked()
+                    {
+                        self.save_settings();
+                    }
+                    if ui
+                        .add_enabled(dirty, egui::Button::new("撤销更改"))
+                        .clicked()
+                    {
+                        self.settings.undo();
+                    }
+                    if ui.button("恢复默认").clicked() {
+                        self.settings.reset_defaults();
+                    }
+                    ui.separator();
+                    if dirty {
+                        ui.label(RichText::new("有未保存的改动").color(tone_color(Tone::Warn)));
+                    } else {
+                        ui.label(RichText::new("没有改动").weak());
+                    }
+                    if let Some((text, at)) = &self.settings_flash {
+                        if at.elapsed() < NOTICE_TIMEOUT {
+                            ui.label(RichText::new(text.clone()).weak());
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+            });
+
+        // 顶栏：配置文件的真实位置 + 打开目录。
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("配置文件").weak());
+            match settings::Settings::config_path() {
+                Some(path) => {
+                    ui.monospace(path.display().to_string());
+                    if ui.button("打开配置文件所在目录").clicked() {
+                        let dir = path.parent().map(Path::to_path_buf);
+                        match dir {
+                            Some(dir) => match open_in_file_manager(&dir) {
+                                Ok(()) => {
+                                    self.settings_flash =
+                                        Some(("已打开配置目录".to_owned(), Instant::now()))
+                                }
+                                Err(error) => {
+                                    self.settings_flash =
+                                        Some((format!("打开目录失败：{error}"), Instant::now()))
+                                }
+                            },
+                            None => {
+                                self.settings_flash =
+                                    Some(("配置路径没有父目录".to_owned(), Instant::now()))
+                            }
+                        }
+                    }
+                }
+                None => {
+                    ui.label(
+                        RichText::new("拿不到 %APPDATA%（配置不可用）")
+                            .color(tone_color(Tone::Bad)),
+                    );
+                }
+            }
+        });
+
+        // 保存/校验结果。
+        if let Some(notice) = self.settings.notice.clone() {
+            let color = if notice.ok {
+                tone_color(Tone::Good)
+            } else {
+                tone_color(Tone::Bad)
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(notice.headline).color(color));
+                if let Some(next) = notice.next {
+                    ui.label(RichText::new(format!("→ {next}")).weak());
+                }
+            });
+        }
+
+        // 未保存改动时离开：三个选择，绝不静默丢弃。
+        if self.settings.leaving {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("有未保存的改动，确定离开设置页？").color(tone_color(Tone::Warn)),
+                );
+                if ui.button("保存并离开").clicked() {
+                    self.save_settings();
+                    if self
+                        .settings
+                        .notice
+                        .as_ref()
+                        .is_some_and(|notice| notice.ok)
+                    {
+                        self.settings_open = false;
+                        self.settings.leaving = false;
+                    }
+                }
+                if ui.button("放弃改动并离开").clicked() {
+                    self.settings.undo();
+                    self.settings_open = false;
+                    self.settings.leaving = false;
+                }
+                if ui.button("取消").clicked() {
+                    self.settings.leaving = false;
+                }
+            });
+            ui.separator();
+        }
+
+        ui.add_space(2.0);
+        ui.horizontal_top(|ui| {
+            // 左侧分组导航（固定宽，避免内容宽度变化时抖）。
+            ui.allocate_ui_with_layout(
+                egui::vec2(96.0, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    for group in settings::Group::ALL {
+                        let selected = self.settings.group() == group;
+                        if ui.selectable_label(selected, group.label()).clicked() {
+                            self.settings.set_group(group);
+                        }
+                    }
+                },
+            );
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.settings.group() {
+                    settings::Group::Download => self.show_settings_download(ui),
+                    settings::Group::Network => self.show_settings_network(ui),
+                    settings::Group::Interface => self.show_settings_interface(ui),
+                });
+        });
+    }
+
+    /// 一组「标签 + 输入框 + 默认值 + 就地错误」的通用行。
+    fn settings_text_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &'static str,
+        label: &str,
+        hint: &str,
+        width: f32,
+    ) {
+        ui.horizontal(|ui| {
+            ui.add_sized([150.0, 18.0], egui::Label::new(label));
+            let mut text = self.settings.text(key).to_owned();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(width)
+                    .hint_text(hint),
+            );
+            if response.changed() {
+                self.settings.set_text(key, text);
+            }
+            let default = settings::default_text(key);
+            if !default.is_empty() {
+                ui.label(RichText::new(format!("默认 {default}")).weak());
+            }
+        });
+        if let Some(reason) = self.settings.error(key) {
+            ui.horizontal(|ui| {
+                ui.add_space(150.0);
+                ui.label(RichText::new(reason.to_owned()).color(tone_color(Tone::Bad)));
+            });
+        }
+    }
+
+    /// 一行说明（生效时机 / 只存不执行的诚实标注）。
+    fn settings_note(ui: &mut egui::Ui, key: &str, extra: &str) {
+        let effect = settings::effect(key);
+        let color = match effect {
+            settings::Effect::Immediate => tone_color(Tone::Good),
+            settings::Effect::Restart => tone_color(Tone::Warn),
+            settings::Effect::NotWired => tone_color(Tone::Bad),
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(150.0);
+            ui.label(RichText::new(effect.text()).color(color).small());
+            if !extra.is_empty() {
+                ui.label(RichText::new(extra).weak().small());
+            }
+        });
+    }
+
+    /// A 组：下载（`[dl]`）。
+    fn show_settings_download(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("下载").strong());
+        ui.label(
+            RichText::new(
+                "落盘目录与文件命名；这些值会渲染进 aria2.conf，改完需重启 aria2 才生效。",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        self.settings_text_row(
+            ui,
+            "dl.dir",
+            "下载目录",
+            "必须是已存在且可写的目录，例如 D:\\Downloads",
+            280.0,
+        );
+        Self::settings_note(
+            ui,
+            "dl.dir",
+            "本批不给「浏览…」按钮：仓库里没有 rfd，不为选目录引新依赖",
+        );
+        ui.add_space(6.0);
+
+        let mut renamed = self.settings.draft().dl.auto_file_renaming;
+        if ui
+            .checkbox(
+                &mut renamed,
+                "重名文件自动改名（auto-file-renaming，默认 true）",
+            )
+            .changed()
+        {
+            self.settings.draft_mut().dl.auto_file_renaming = renamed;
+        }
+        let mut overwrite = self.settings.draft().dl.allow_overwrite;
+        if ui
+            .checkbox(
+                &mut overwrite,
+                "允许覆盖同名文件（allow-overwrite，默认 false）",
+            )
+            .changed()
+        {
+            self.settings.draft_mut().dl.allow_overwrite = overwrite;
+        }
+        let mut continue_dl = self.settings.draft().dl.continue_dl;
+        if ui
+            .checkbox(&mut continue_dl, "断点续传（continue，默认 true）")
+            .changed()
+        {
+            self.settings.draft_mut().dl.continue_dl = continue_dl;
+        }
+        let mut always_resume = self.settings.draft().dl.always_resume;
+        if ui
+            .checkbox(&mut always_resume, "总是续传（always-resume，默认 true）")
+            .changed()
+        {
+            self.settings.draft_mut().dl.always_resume = always_resume;
+        }
+    }
+
+    /// B 组：网络（`[net]`）。
+    fn show_settings_network(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("网络").strong());
+        ui.label(
+            RichText::new("并发、分片与限速。尺寸要写成「数字+单位」（20M / 512K / 1G）；这条规则是 aria2 的，写成 20MB 会被它拒掉。")
+                .weak(),
+        );
+        ui.add_space(4.0);
+        self.settings_text_row(ui, "net.split", "分片数 split", "1–16", 80.0);
+        self.settings_text_row(
+            ui,
+            "net.max_connection_per_server",
+            "单服务器连接数",
+            "1–16",
+            80.0,
+        );
+        self.settings_text_row(
+            ui,
+            "net.min_split_size",
+            "最小分片 min-split-size",
+            "≥ 1M",
+            120.0,
+        );
+        self.settings_text_row(
+            ui,
+            "net.max_overall_download_limit",
+            "全局限速（下载）",
+            "0 = 不限速",
+            120.0,
+        );
+        self.settings_text_row(
+            ui,
+            "net.max_download_limit",
+            "单任务限速",
+            "0 = 不限速",
+            120.0,
+        );
+        self.settings_text_row(
+            ui,
+            "net.max_overall_upload_limit",
+            "全局限速（上传）",
+            "0 = 不限速",
+            120.0,
+        );
+        self.settings_text_row(ui, "net.connect_timeout", "连接超时（秒）", "1–600", 80.0);
+        self.settings_text_row(ui, "net.max_tries", "重试次数", "0–100（0 = 不限）", 80.0);
+        self.settings_text_row(ui, "net.proxy", "代理", "空 = 不使用代理", 280.0);
+        Self::settings_note(
+            ui,
+            "net.proxy",
+            "形如 http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080；任务级代理，与线路出口无关",
+        );
+        self.settings_text_row(
+            ui,
+            "net.disk_cache",
+            "内存缓存 disk-cache",
+            "16M / 0 = 关",
+            120.0,
+        );
+    }
+
+    /// C 组：界面（`[ui]` / `[lifecycle]`）。
+    fn show_settings_interface(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("界面").strong());
+        ui.label(
+            RichText::new("关闭行为、渲染器与开机自启。标红的项本批只写配置、行为还没接线——不会骗你说已经生效。")
+                .weak(),
+        );
+        ui.add_space(4.0);
+
+        // ui.close_action：三档，保存后立即生效。
+        ui.horizontal(|ui| {
+            ui.add_sized([150.0, 18.0], egui::Label::new("关闭按钮行为"));
+            let current = self.settings.draft().ui.close_action.clone();
+            let label = close_action_label(&current);
+            egui::ComboBox::from_id_salt("settings_close_action")
+                .selected_text(label)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (value, text) in [
+                        ("tray", "隐藏到托盘（默认）"),
+                        ("ask", "每次询问"),
+                        ("exit", "直接退出（按退出流程停 aria2）"),
+                    ] {
+                        if ui.selectable_label(current == value, text).clicked() {
+                            self.settings.draft_mut().ui.close_action = value.to_owned();
+                            self.settings.revalidate();
+                        }
+                    }
+                });
+            ui.label(RichText::new("默认 tray").weak());
+        });
+        if let Some(reason) = self.settings.error("ui.close_action") {
+            ui.label(RichText::new(reason.to_owned()).color(tone_color(Tone::Bad)));
+        }
+        Self::settings_note(ui, "ui.close_action", "保存后立刻按新值处理点 X");
+
+        // ui.renderer：auto | wgpu | glow（架构 §4.11 第 34 项，逃生口；不是 --backend 的 dx12/vulkan）。
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([150.0, 18.0], egui::Label::new("渲染器 renderer"));
+            let current = self.settings.draft().ui.renderer.clone();
+            egui::ComboBox::from_id_salt("settings_renderer")
+                .selected_text(current.clone())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (value, text) in [
+                        ("auto", "auto（默认）"),
+                        ("wgpu", "wgpu"),
+                        ("glow", "glow（逃生口，本构建未编译）"),
+                    ] {
+                        if ui.selectable_label(current == value, text).clicked() {
+                            self.settings.draft_mut().ui.renderer = value.to_owned();
+                            self.settings.revalidate();
+                        }
+                    }
+                });
+            ui.label(RichText::new("默认 auto").weak());
+        });
+        if self.settings.draft().ui.renderer.trim() == "glow" {
+            ui.horizontal(|ui| {
+                ui.add_space(150.0);
+                ui.label(
+                    RichText::new(
+                        "当前构建只带 wgpu（EG-3）：保存后仍按 wgpu 启动，日志会记一条回退说明",
+                    )
+                    .color(tone_color(Tone::Warn)),
+                );
+            });
+        }
+        Self::settings_note(ui, "ui.renderer", "重启面板生效");
+
+        // ui.start_minimized / ui.minimize_to_tray：本批只写配置（架构标 ❌）。
+        ui.add_space(6.0);
+        let mut start_min = self.settings.draft().ui.start_minimized;
+        if ui
+            .checkbox(
+                &mut start_min,
+                "启动时最小化到托盘（start_minimized，默认 true）",
+            )
+            .changed()
+        {
+            self.settings.draft_mut().ui.start_minimized = start_min;
+        }
+        Self::settings_note(ui, "ui.start_minimized", "");
+        let mut min_to_tray = self.settings.draft().ui.minimize_to_tray;
+        if ui
+            .checkbox(
+                &mut min_to_tray,
+                "允许最小化到托盘（minimize_to_tray，默认 true）",
+            )
+            .changed()
+        {
+            self.settings.draft_mut().ui.minimize_to_tray = min_to_tray;
+        }
+        Self::settings_note(ui, "ui.minimize_to_tray", "");
+
+        // ui.start_with_windows：HKCU Run，保存后立即生效，不需要管理员。
+        ui.add_space(6.0);
+        let mut autostart = self.settings.draft().ui.start_with_windows;
+        if ui
+            .checkbox(
+                &mut autostart,
+                "开机自启（start_with_windows，写 HKCU Run，不用计划任务）",
+            )
+            .changed()
+        {
+            self.settings.draft_mut().ui.start_with_windows = autostart;
+        }
+        Self::settings_note(ui, "ui.start_with_windows", "保存时就写/删注册表值");
+
+        // lifecycle.quit_default：三选一（架构 §7-R 的三种退出选项），本批只写配置。
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_sized([150.0, 18.0], egui::Label::new("退出时默认动作"));
+            let current = self.settings.draft().lifecycle.quit_default.clone();
+            let label = quit_default_label(&current);
+            egui::ComboBox::from_id_salt("settings_quit_default")
+                .selected_text(label)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (value, text) in [
+                        ("tray", "收进托盘继续下载"),
+                        ("pause", "暂停任务后退出（默认）"),
+                        ("stop", "停止任务后退出"),
+                    ] {
+                        if ui.selectable_label(current == value, text).clicked() {
+                            self.settings.draft_mut().lifecycle.quit_default = value.to_owned();
+                            self.settings.revalidate();
+                        }
+                    }
+                });
+            ui.label(RichText::new("默认 pause").weak());
+        });
+        Self::settings_note(
+            ui,
+            "lifecycle.quit_default",
+            "值域取自架构 §7-R 的三种退出选项；文档没给枚举清单，已上报 Lead",
+        );
     }
 
     /// 启动检测：`session\aria2.session` 非空 → 顶部信息条（不是弹窗）。
@@ -1976,8 +2523,27 @@ impl eframe::App for PanelApp {
         ui.horizontal(|ui| {
             ui.heading(format!("{PRODUCT_NAME} {VERSION}"));
             ui.label(RichText::new("M2-2b 下载面板").weak());
+            // 设置入口放标题栏右侧：不占任务表的地盘，也不改主界面布局。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.settings_open {
+                    "返回主界面"
+                } else {
+                    "设置"
+                };
+                if ui.button(label).clicked() {
+                    self.toggle_settings();
+                }
+            });
         });
         ui.add_space(2.0);
+
+        // 设置页打开时替掉主体区（顶部状态栏、任务表都不画）：既省内存，也不重排主界面。
+        if self.settings_open {
+            self.show_settings(ui);
+            self.show_close_prompt(ui.ctx());
+            self.maybe_finish_selftest(ui);
+            return;
+        }
 
         egui::Panel::top("ariahost_status")
             .show_separator_line(false)
@@ -2004,6 +2570,26 @@ impl eframe::App for PanelApp {
 
         self.show_close_prompt(ui.ctx());
         self.maybe_finish_selftest(ui);
+    }
+}
+
+/// 「关闭按钮行为」下拉的中文标签（值域 = 架构 §4.11 第 37 项：tray | ask | exit）。
+fn close_action_label(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ask" => "每次询问",
+        "exit" => "直接退出",
+        "tray" => "隐藏到托盘",
+        _ => "未知值（将被校验拦下）",
+    }
+}
+
+/// 「退出时默认动作」下拉的中文标签（架构 §7-R 的三种退出选项）。
+fn quit_default_label(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tray" => "收进托盘继续下载",
+        "stop" => "停止任务后退出",
+        "pause" => "暂停任务后退出",
+        _ => "未知值（将被校验拦下）",
     }
 }
 
