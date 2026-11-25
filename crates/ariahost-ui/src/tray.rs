@@ -235,7 +235,7 @@ fn fallback_rgba() -> (Vec<u8>, u32, u32) {
                 continue;
             }
             // 箭头：竖杆 + 三角头（纯几何，不引字体/位图）。
-            let in_shaft = dx.abs() <= 2.5 && dy >= -6.0 && dy <= 3.0;
+            let in_shaft = dx.abs() <= 2.5 && (-6.0..=3.0).contains(&dy);
             let in_head = dy > 3.0 && dy <= 10.0 && dx.abs() <= (10.0 - dy) * 1.4;
             let (r, g, b) = if in_shaft || in_head {
                 (255u8, 255u8, 255u8)
