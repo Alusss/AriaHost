@@ -3463,7 +3463,7 @@ fn banner_level(tone: Tone) -> Option<Level> {
 /// 「核心」一行的人话总结（信息区与「关于」**共用同一份**，不各写一套）。
 ///
 /// 口径（M3-j / task-54 C-UI）：
-/// - 未就绪 → `未就绪（<首句原因>）`；
+/// - 未就绪 → `未就绪（<原因，含冒号后的关键限定>）`；
 /// - 就绪 → `<内置|托管|外部> · 版本 X.Y.Z`；版本探针失败 → `<来源> · 版本未知（<短因>）`。
 ///
 /// 来源取的是 `resolve_core_in` 的**实际解析结果**（`CoreOrigin`），不是配置里那个
@@ -3484,14 +3484,13 @@ fn core_summary(probe: &CoreProbe) -> String {
     }
 }
 
-/// 取首句并截到一行宽度，用于界面（日志里保留全文，不要在这里省信息）。
+/// 取一句话并截到一行宽度，用于界面（日志里保留全文，不要在这里省信息）。
+///
+/// **冒号不当作断句**：task-54 判据 R3 要求 `source = external` 但文件不存在时，
+/// 界面能看出「external_path 指向的文件不存在」——那句话正好在冒号后面。
+/// 只按换行/分号/句号断句（那些后面才是并列的其它原因），再按字符数截断。
 fn short_reason(text: &str) -> String {
-    // 冒号后面往往还有一长串 detail；界面只需要第一句。
-    let first = text
-        .split(['\n', '；', '。', '：'])
-        .next()
-        .unwrap_or(text)
-        .trim();
+    let first = text.split(['\n', '；', '。']).next().unwrap_or(text).trim();
     const MAX_CHARS: usize = 40;
     if first.chars().count() <= MAX_CHARS {
         return first.to_owned();
@@ -3779,7 +3778,7 @@ mod tests {
         assert!(!text.contains("未就绪"), "{text}");
     }
 
-    /// 未就绪时给出首句原因（截断到一行），且不会出现「来源 · 版本」这种误导组合。
+    /// 未就绪时给出原因（截断到一行），且不会出现「来源 · 版本」这种误导组合。
     #[test]
     fn core_summary_for_missing_core_is_short_and_honest() {
         let probe = CoreProbe {
@@ -3791,8 +3790,34 @@ mod tests {
         };
         let text = core_summary(&probe);
         assert!(text.starts_with("未就绪（AH-E2001 找不到 aria2c"), "{text}");
-        assert!(!text.contains('；'), "应只留首句：{text}");
-        assert!(!text.contains('：'), "应只留首句：{text}");
+        assert!(
+            !text.contains('；'),
+            "分号后面是并列的其它原因，界面上不要：{text}"
+        );
+        assert!(text.chars().count() <= 46, "一行放不下：{text}");
+    }
+
+    /// task-54 判据 R3：`source = external` 但文件不存在时，界面必须留着
+    /// `external_path` 这个关键限定，不能被压成泛泛的「找不到 aria2c」。
+    #[test]
+    fn missing_external_core_keeps_the_external_path_qualifier() {
+        let probe = CoreProbe {
+            missing: Some(
+                "找不到 aria2c：external_path 指向的文件不存在：C:\\Users\\NoSuchDir\\aria2c.exe"
+                    .to_owned(),
+            ),
+            ..CoreProbe::default()
+        };
+        let text = core_summary(&probe);
+        assert!(text.starts_with("未就绪（"), "{text}");
+        assert!(
+            text.contains("external_path 指向的文件不存在"),
+            "关键限定被截掉了：{text}"
+        );
+        assert!(
+            !text.contains('…') || text.contains("…）"),
+            "省略号只能出现在末尾：{text}"
+        );
     }
 
     /// 截断只在超长时发生，且按字符而不是字节切（中文不会被劈开）。
