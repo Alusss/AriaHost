@@ -67,17 +67,43 @@ version（解析版本 + 元数据自检，ubuntu）
 | `build` | `cargo build --release --locked --target x86_64-pc-windows-msvc` → 暂存 `dist/x64` → 签名占位①（签 exe，无 secret 即跳过）→ `choco install nsis` → `makensis -INPUTCHARSET UTF8` → 签名占位②（签 setup）→ `SHA256SUMS.txt` + `manifest.json`（`variant = per-user`）→ `upload-artifact`（7 天）。`timeout-minutes: 30` | 编译、打包或校验和失败 |
 | `publish` | 仅 tag：下载 artifact（**不** merge）→ 只捞 `*-x64-setup.exe` 与 `*manifest.json` → 硬校验 x64 包存在 → 重算校验和 → `gh release create --verify-tag` | 缺 `contents: write` 或 tag 不存在 |
 
-**x86 自 M4-1 起转正为流水线的一部分**（Q15 拍板：双架构都要出包）。落地方式：
+**x86 自 M4-1 起转正为流水线的一部分**（Q15 拍板：双架构都要出包），但**按分钟预算分时机跑**：
 
 | 位置 | 32 位是怎么进来的 |
 |---|---|
 | `rust-toolchain.toml` | `targets` 里同时列 `x86_64-pc-windows-msvc` 与 `i686-pc-windows-msvc`（全仓唯一事实源） |
 | `.cargo/config.toml` | `[target.i686-pc-windows-msvc] rustflags` 解开，与 x64 同为静态 CRT |
-| `ci.yml` | 目标断言改成两个 target 都必须在；在 x64 clippy/test 之外加一条 `cargo check --workspace --all-targets --target i686-pc-windows-msvc`（**只 check**，不 codegen、不测试：同一份类型检查已能抓 32 位不成立的写法，省 Windows runner 分钟）；makensis 门禁加第 5 条 `/DARCH=x86` 变体编译 |
-| `release.yml` | `build` job 改成 `matrix.include`（x64/x86 两条腿，`fail-fast: false`）；包名、SHA256SUMS、manifest、artifact 全按 `matrix.arch` 区分；publish 硬门禁要求**两个包都在** |
+| `ci.yml` → `windows-x86` job | **真跑** clippy + test + build（runner 是 x64 Windows，32 位测试二进制可直接执行）+ dumpbin 静态 CRT 门禁；独立缓存 key（`-x86-`） |
+| `release.yml` → `build` matrix | x64/x86 两条腿、`fail-fast: false`；包名/SHA256SUMS/manifest/artifact 全按 `matrix.arch` 派生；构建后各跑一次 dumpbin 静态 CRT 门禁 |
+| `release.yml` → `publish` | 汇总两包，**缺任一腿不发 Release** |
+
+### 32 位腿的触发时机（分钟预算的直接后果）
+
+`windows-x86` 只在三种时机启动，其余时候 skip：
+
+1. `schedule`：每周日 18:00 UTC 全量跑一次（给 32 位定期实证，防止「静默烂掉」）；
+2. `workflow_dispatch` 且勾选 `run_x86=true`（按需验，比如改动了 Win32/指针/`usize` 相关代码）；
+3. tag 发布：`release.yml` 的矩阵跑真实的 32 位产包。
+
+skip 时 `ci-gate` 视为通过（不阻塞合并），但 job 在 Actions 页面里始终可见——**可见的跳过 ≠ 悄悄砍掉**。
+**不给任何腿 `continue-on-error`**：失败 job 一样烧 2× 分钟，而且静默吞掉后没人会注意到某一腿其实一直没出包（这比不跑更坏）。
 
 全机变体（`/DPER_MACHINE`、产物名带 `-machine-`）仍排在 M4 后续批次。
-**不给任何腿 `continue-on-error`**：失败 job 一样烧 2× 分钟，而且失败被静默吞掉后没人会注意到某一腿其实一直没出包（这比不跑更坏）。
+
+### 账单（估算，按 2026-11-25 的 x64 实测基线外推）
+
+| 场景 | 墙钟（并行后的最长腿） | 计费（2×，按腿相加） |
+|---|---|---|
+| PR / push（仅 x64） | ~13 min（实测基线） | **~26 min** |
+| 定时全量（x64 + x86） | ~16 min（32 位 codegen 略慢、缓存独立） | **~26 + ~30 = 56 min** |
+| tag 发布（release.yml 双腿） | ~20–25 min | **~45–50 min** |
+| 手动 dispatch 带 `run_x86` | ~16 min | ~56 min |
+
+月度估算（示例：20 次 push + 20 个 PR + 4 次定时 + 1 次发布）：
+`40×26 + 4×56 + 50 = 1314 分钟` —— **超过 Free 1000 分钟额度**，注意这不是新增的结论：
+即便只跑 x64，40×26 也已是 1040。可调的两个旋钮（都在本文件与 workflow 注释里写明）：
+① `schedule` 的 `cron` 改成每两周/暂停；② PR 上只保留 `fmt` + `meta`，把 x64 编译腿推到 push。
+32 位腿的**产包**不受这些旋钮影响——`release.yml` 的矩阵在 tag 上必跑。
 
 ## 4. 缓存
 

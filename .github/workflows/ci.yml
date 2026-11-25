@@ -2,10 +2,14 @@
 #
 # 计费前提：本仓库是 **private**，Windows runner 按 **2× 分钟**计费；
 # GitHub Free 的 2000 分钟/月 ≈ **1000 分钟**实际 Windows 构建时间。
-# 所以这里只跑 **x64**、不矩阵、不跑 x86、不跑全机变体（M4 再谈，见 docs/dev/ci.md）。
+# M4-1（2026-11-26）起双架构，但 32 位腿**不跟每次 push 跑**（见下面的触发策略与
+# docs/dev/ci.md §2 的账单表）：x64 腿每轮约 26 计费分钟，两条腿都跑 ≈ 58 分钟/轮，
+# 按月 30 次就冲破 1000 分钟额度。所以 32 位腿只在「定时全量 / 手动指定 / 夜间全量」
+# 三种时机跑，其余时候 skip——**skip 不等于砍掉**，`ci-gate` 把它当通过但保持可见。
 #
-# 省分钟的四个机制：
-#   1. 单 arch，且 Windows 侧只留 **1 个 job**（clippy → test → build 串行，共用一次工具链与缓存）；
+# 省分钟的机制：
+#   1. 宿主 arch 只跑一条腿（x64：clippy → test → build 串行，共用一次工具链与缓存）；
+#      32 位腿是独立 job，仅在定时/手动/发布时启动，且自带缓存（key 带 arch，不互相污染）；
 #   2. concurrency：同一 ref 连续 push 只留最新一次，旧 run 立即取消；
 #   3. 路径判定（`changes` job）：纯 docs/**、*.md、.scratch/**、LICENSE 改动跳过所有编译 job；
 #   4. 所有 upload-artifact 都带 retention-days: 7。
@@ -30,6 +34,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_x86:
+        description: "同时跑 32 位腿（clippy + test + build + dumpbin；默认关，省 2× 分钟）"
+        type: boolean
+        default: false
+  schedule:
+    # 每周日 18:00 UTC 全量跑一次（含 32 位腿）。32 位是发版产物，
+    # 不给它定期实证就会「静默烂掉」；每周一次在预算内（约 +8 计费分钟/周）。
+    - cron: "0 18 * * 0"
 
 permissions:
   contents: read
@@ -292,13 +305,9 @@ jobs:
         run: cargo test --workspace --locked
       - name: Release 构建（x64）
         run: cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
-      # M4-1：32 位腿的**编译验证**。只做 check（不 codegen、不测试、不打包），
-      # 因为同一份 LLVM 类型检查已能暴露「在 32 位下不成立」的写法（usize 宽度、
-      # 指针转换、`as` 截断、按 cfg 分支的 Win32 类型）；真正的 release 产包在
-      # release.yml 的 matrix 里跑，避免 CI 双份 codegen 烧 Windows runner 分钟。
-      # 产物落在 target/i686-pc-windows-msvc/（已被上面的缓存覆盖）→ 第二次起增量。
-      - name: 32 位编译检查（i686-pc-windows-msvc）
-        run: cargo check --workspace --all-targets --locked --target i686-pc-windows-msvc
+      # 32 位的**编译/测试证据不在这一腿里**：见下面独立的 `windows-x86` job。
+      # 这里刻意不加 `cargo check --target i686`——它会给每次 push 多烧 3–5 分钟 2× 计费，
+      # 而真正的 32 位 clippy/test/build 已经在定时/手动/发布三条时机上真跑（含 dumpbin）。
       - name: 校验主程序产物（+ 静态 CRT 快检）
         shell: pwsh
         run: |
@@ -464,6 +473,97 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ── 32 位腿（M4-1）─────────────────────────────────────────────────────────
+  # **真跑**（clippy + test + build + dumpbin），不是只编译：runner 是 x64 Windows，
+  # 32 位测试二进制可直接执行，所以「测试好」有实际意义。
+  #
+  # 触发策略（见 docs/dev/ci.md §2 的账单）：PR 与日常 push 都**不**跑它（否则单轮
+  # 26→58 计费分钟，30 次/月就破 1000 分钟额度）；只在三种时机跑：
+  #   ① 定时（每周日 18:00 UTC）② 手动 dispatch 且 run_x86=true ③ tag 发布（release.yml 的矩阵）。
+  # skip 时 `ci-gate` 视为通过（不阻塞合并），但 job 在 Actions 页面里始终可见——
+  # 「可见的跳过」和「悄悄砍掉」不是一回事。
+  windows-x86:
+    name: windows / x86（clippy + test + build + dumpbin）
+    needs: [changes, preflight]
+    if: |
+      needs.changes.outputs.code == 'true'
+      && (github.event_name == 'schedule'
+          || (github.event_name == 'workflow_dispatch' && inputs.run_x86)
+          || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')))
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust（显式传 toolchain 输入，版本与 rust-toolchain.toml 一致）
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          # i686 是 Tier 1 without host tools：必须由 x64 宿主交叉编译，std 由 action 装入。
+          targets: i686-pc-windows-msvc
+      - name: 导入 MSVC 开发环境（rc.exe / dumpbin）
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: 校验 32 位 target 已装入
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -V
+          rustup target list --installed | tr -d '\r' | grep -qx 'i686-pc-windows-msvc' \
+            || { echo "::error::未安装 i686-pc-windows-msvc target。"; exit 1; }
+          echo "OK：i686-pc-windows-msvc 已安装"
+      - name: 缓存 registry 与 target（32 位独立 key）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-x86-${{ hashFiles('**/Cargo.lock') }}-${{ steps.toolchain.outputs.cachekey }}
+          restore-keys: |
+            ${{ runner.os }}-x86-
+      - name: Clippy（32 位，warnings 即错误）
+        run: cargo clippy --workspace --all-targets --locked --target i686-pc-windows-msvc -- -D warnings
+      - name: 单元 + 集成测试（32 位，真跑）
+        run: cargo test --workspace --locked --target i686-pc-windows-msvc
+      - name: Release 构建（32 位）
+        run: cargo build --workspace --release --locked --target i686-pc-windows-msvc
+      - name: 静态 CRT 门禁（32 位产物，dumpbin）
+        shell: pwsh
+        run: |
+          $exe = "target/i686-pc-windows-msvc/release/ariahost.exe"
+          if (-not (Test-Path $exe)) { Write-Error "缺少 $exe"; exit 1 }
+          Get-Item $exe | Select-Object Name, Length
+          $dumpbin = $null
+          $cmd = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if ($cmd) { $dumpbin = $cmd.Source }
+          if (-not $dumpbin) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $vswhere) {
+              $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              if ($vs) {
+                $cand = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+                  Sort-Object Name -Descending |
+                  ForEach-Object { Join-Path $_.FullName 'bin\Hostx64\x64\dumpbin.exe' } |
+                  Where-Object { Test-Path $_ } | Select-Object -First 1
+                if ($cand) { $dumpbin = $cand }
+              }
+            }
+          }
+          if (-not $dumpbin) { Write-Error "找不到 dumpbin.exe：32 位静态 CRT 门禁无法执行（不降级为 warning）"; exit 1 }
+          $deps = (& $dumpbin /nologo /dependents $exe) | Out-String
+          Write-Host $deps
+          $bad = @('VCRUNTIME140', 'VCRUNTIME140_1', 'MSVCP140') | Where-Object { $deps -match $_ }
+          if ($bad.Count -gt 0) { Write-Error "32 位产物动态链接了 VC++ 运行库（$($bad -join ',')）：静态 CRT 失效，用户机器会缺 DLL"; exit 1 }
+          Write-Host "OK：32 位产物只依赖系统 DLL（无 VCRUNTIME/MSVCP）"
+      - name: 上传 32 位调试产物（7 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ariahost-x86-release
+          path: target/i686-pc-windows-msvc/release/ariahost.exe
+          if-no-files-found: error
+          retention-days: 7
+
   # 安装脚本的编译期闸门已从 ubuntu（stub）**迁到上面的 windows job**（用真实载荷）。
   # 原因见该步骤上方注释：Linux 绿灯对 Windows 没有证明力（2026-11-25 首发 tag 实证）。
   # 这里不再保留独立 job —— 少一个 job 也少一份"看起来验证过"的错觉。
@@ -473,7 +573,7 @@ jobs:
   gate:
     name: ci-gate
     if: always()
-    needs: [changes, meta, preflight, fmt, windows]
+    needs: [changes, meta, preflight, fmt, windows, windows-x86]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

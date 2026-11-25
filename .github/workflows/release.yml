@@ -225,6 +225,37 @@ jobs:
             ${{ runner.os }}-release-${{ matrix.arch }}-
       - name: 构建（release, ${{ matrix.arch }}）
         run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      # 静态 CRT 门禁（两个架构都跑）：发出去的 exe 绝不能依赖 VCRUNTIME140/MSVCP140，
+      # 否则用户机器没装 VC++ 运行库就是「双击没反应」。CI 里 x64/x86 各有同名门禁，
+      # 这里是发布路径上的最后一道（CI 的 32 位腿只在定时/手动跑，发布必跑）。
+      - name: 静态 CRT 门禁（dumpbin，${{ matrix.arch }}）
+        shell: pwsh
+        run: |
+          $exe = "target/${{ matrix.target }}/release/ariahost.exe"
+          if (-not (Test-Path $exe)) { Write-Error "缺少 $exe"; exit 1 }
+          Get-Item $exe | Select-Object Name, Length
+          $dumpbin = $null
+          $cmd = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if ($cmd) { $dumpbin = $cmd.Source }
+          if (-not $dumpbin) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (Test-Path $vswhere) {
+              $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              if ($vs) {
+                $cand = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+                  Sort-Object Name -Descending |
+                  ForEach-Object { Join-Path $_.FullName 'bin\Hostx64\x64\dumpbin.exe' } |
+                  Where-Object { Test-Path $_ } | Select-Object -First 1
+                if ($cand) { $dumpbin = $cand }
+              }
+            }
+          }
+          if (-not $dumpbin) { Write-Error "找不到 dumpbin.exe：${{ matrix.arch }} 的静态 CRT 门禁无法执行（不降级为 warning）"; exit 1 }
+          $deps = (& $dumpbin /nologo /dependents $exe) | Out-String
+          Write-Host $deps
+          $bad = @('VCRUNTIME140', 'VCRUNTIME140_1', 'MSVCP140') | Where-Object { $deps -match $_ }
+          if ($bad.Count -gt 0) { Write-Error "${{ matrix.arch }} 产物动态链接了 VC++ 运行库（$($bad -join ',')）：静态 CRT 失效"; exit 1 }
+          Write-Host "OK：${{ matrix.arch }} 产物只依赖系统 DLL（无 VCRUNTIME/MSVCP）"
       - name: 暂存产物到 dist/${{ matrix.arch }}
         shell: pwsh
         run: |
