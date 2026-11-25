@@ -215,71 +215,185 @@ impl From<ConfigError> for RuntimeError {
 // 定位核心
 // ---------------------------------------------------------------------------
 
-/// 按 `aria2.source` 在**用户平面**（`%LOCALAPPDATA%`）定位 aria2c。\n///\n/// 服务模式必须改用 [`resolve_core_exe_in`] 传 [`Plane::Service`]：服务账户读不到用户目录（R7/R9）。
+/// 内置核心的文件名：安装包把它放在**本 exe 同目录**（与安装器 `ariahost.nsi` 一致）。
+pub const BUNDLED_CORE_EXE: &str = "aria2c.exe";
+
+/// 核心的来源。面板「核心」区要能看出当前用的是哪一种（内置/托管/外部）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreOrigin {
+    /// 安装包自带：exe 同目录的 `aria2c.exe`（不进版本库，不参与版本管理）。
+    Bundled,
+    /// 版本库 `active.json` 指向的 `versions/<ver>/aria2c.exe`。
+    Managed,
+    /// 用户指定的 `aria2.external_path`。
+    External,
+}
+
+impl CoreOrigin {
+    /// 稳定文本（面板、`--aria2-status`、诊断包共用；不要解析中文）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::Managed => "managed",
+            Self::External => "external",
+        }
+    }
+}
+
+/// 解析出来的核心：路径 + 来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCore {
+    /// `aria2c.exe` 的实际路径。
+    pub path: PathBuf,
+    /// 它为什么被选中。
+    pub origin: CoreOrigin,
+}
+
+/// 内置核心的候选路径：**当前进程 exe 所在目录**的 `aria2c.exe`。
 ///
-/// - `managed`：版本库 `active.json` 指向的 `versions/<ver>/aria2c.exe`；
-/// - `external`：`aria2.external_path`（支持 `~` 展开）。
+/// 为什么按「当前 exe」而不是固定安装目录：便携版/开发构建也该能吃到同目录的核心，
+/// 而安装器只保证「同一个目录里放了 `ariahost.exe` 与 `aria2c.exe`」这一条。
+pub fn bundled_core_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join(BUNDLED_CORE_EXE))
+}
+
+/// 按 `aria2.source` 在**用户平面**（`%LOCALAPPDATA%`）定位 aria2c。
+///
+/// 服务模式必须改用 [`resolve_core_in`] 传 [`Plane::Service`]：服务账户读不到用户目录（R7/R9）。
+pub fn resolve_core(config: &Config) -> Result<ResolvedCore, RuntimeError> {
+    resolve_core_in(config, Plane::User)
+}
+
+/// 按 `aria2.source` 在**指定平面**定位 aria2c（内置候选取当前 exe 同目录）。
+pub fn resolve_core_in(config: &Config, plane: Plane) -> Result<ResolvedCore, RuntimeError> {
+    resolve_core_in_with(config, plane, bundled_core_path().as_deref())
+}
+
+/// 同 [`resolve_core_in`]，但**显式注入**内置候选路径（单测用：测试二进制同目录不是安装目录）。
+///
+/// 取值语义（架构 §4.11 `aria2.source`）：
+/// - `auto`（**默认**）：内置 → 托管 → 配了 `external_path` 的外部 → 报「未就绪」；
+/// - `managed` / `external`：只看那一种，不存在就报错（不隐式降级，老配置语义不变）。
 ///
 /// 顺带做**悬空回滚指针修复**：若 `active.json` 的 `previous` 指向已删除的版本目录，
 /// 清掉该字段并原子写回（否则「回滚」按钮会指向空气）。
-pub fn resolve_core_exe(config: &Config) -> Result<PathBuf, RuntimeError> {
-    resolve_core_exe_in(config, Plane::User)
+pub fn resolve_core_in_with(
+    config: &Config,
+    plane: Plane,
+    bundled: Option<&Path>,
+) -> Result<ResolvedCore, RuntimeError> {
+    let versions_root = versions_dir(plane);
+    resolve_core_with(config, versions_root.as_deref(), bundled)
 }
 
-/// 按 `aria2.source` 在**指定平面**定位 aria2c 可执行文件。
-///
-/// 服务模式传 [`Plane::Service`]（`%ProgramData%\AriaHost\aria2\versions`）：
-/// 服务账户读不到用户的 `%LOCALAPPDATA%`（架构 §4.6 R7/R9）。
-pub fn resolve_core_exe_in(config: &Config, plane: Plane) -> Result<PathBuf, RuntimeError> {
+/// 全部来源都显式注入的解析器本体（**单测只测这一层**：不读环境变量）。
+fn resolve_core_with(
+    config: &Config,
+    versions_root: Option<&Path>,
+    bundled: Option<&Path>,
+) -> Result<ResolvedCore, RuntimeError> {
+    use ariahost_common::Aria2Source;
+
     match config.aria2.source {
-        ariahost_common::Aria2Source::Managed => {
-            let dir = versions_dir(plane).ok_or_else(|| RuntimeError::CoreNotFound {
-                detail: format!("拿不到{:?}平面的版本库根目录", plane),
-            })?;
-            let store = VersionStore::new(&dir);
-            let pointer = store.active().map_err(|error| RuntimeError::CoreNotFound {
-                detail: format!("读取激活指针失败：{error}"),
-            })?;
-            let Some(pointer) = pointer else {
-                return Err(RuntimeError::CoreNotFound {
-                    detail: format!(
-                        "{} 下没有 active.json（还没装过 aria2 核心）",
-                        dir.display()
-                    ),
-                });
-            };
-            // 悬空 previous → 修掉（失败不算致命：回滚按钮另有校验）。
-            let _ = store.repair_dangling_previous();
-            let exe = store.exe_path(&pointer.active);
-            if exe.is_file() {
-                Ok(exe)
-            } else {
-                Err(RuntimeError::CoreNotFound {
-                    detail: format!(
-                        "版本 {} 的 aria2c.exe 不存在：{}",
-                        pointer.active,
-                        exe.display()
-                    ),
-                })
-            }
-        }
-        ariahost_common::Aria2Source::External => {
-            let raw = config.aria2.external_path.trim();
-            if raw.is_empty() {
-                return Err(RuntimeError::CoreNotFound {
-                    detail: "aria2.source=external 但 aria2.external_path 为空".to_owned(),
+        Aria2Source::Auto => {
+            if let Some(path) = bundled.filter(|path| path.is_file()) {
+                return Ok(ResolvedCore {
+                    path: path.to_path_buf(),
+                    origin: CoreOrigin::Bundled,
                 });
             }
-            let exe = config::expand_user_path(raw);
-            if exe.is_file() {
-                Ok(exe)
-            } else {
-                Err(RuntimeError::CoreNotFound {
-                    detail: format!("external_path 指向的文件不存在：{}", exe.display()),
-                })
+            match managed_core_in(versions_root) {
+                Ok(path) => Ok(ResolvedCore {
+                    path,
+                    origin: CoreOrigin::Managed,
+                }),
+                Err(managed_error) => {
+                    // 外部路径是用户显式写的：auto 下它是最后一道可用来源。
+                    if config.aria2.external_path.trim().is_empty() {
+                        return Err(RuntimeError::CoreNotFound {
+                            detail: format!(
+                                "未就绪：exe 同目录没有 {}，版本库也没有可用版本（{managed_error}）——\
+                                 可在首次运行引导里在线下载或指定本地 aria2c",
+                                BUNDLED_CORE_EXE
+                            ),
+                        });
+                    }
+                    external_core(config)
+                }
             }
         }
+        Aria2Source::Managed => Ok(ResolvedCore {
+            path: managed_core_in(versions_root)?,
+            origin: CoreOrigin::Managed,
+        }),
+        Aria2Source::External => external_core(config),
     }
+}
+
+/// 版本库里的托管核心（`managed` 分支的唯一实现）。
+fn managed_core_in(versions_root: Option<&Path>) -> Result<PathBuf, RuntimeError> {
+    let dir = versions_root.ok_or_else(|| RuntimeError::CoreNotFound {
+        detail: "拿不到核心版本库根目录（LOCALAPPDATA/PROGRAMDATA 缺失）".to_owned(),
+    })?;
+    let store = VersionStore::new(dir);
+    let pointer = store.active().map_err(|error| RuntimeError::CoreNotFound {
+        detail: format!("读取激活指针失败：{error}"),
+    })?;
+    let Some(pointer) = pointer else {
+        return Err(RuntimeError::CoreNotFound {
+            detail: format!(
+                "{} 下没有 active.json（还没装过 aria2 核心）",
+                dir.display()
+            ),
+        });
+    };
+    // 悬空 previous → 修掉（失败不算致命：回滚按钮另有校验）。
+    let _ = store.repair_dangling_previous();
+    let exe = store.exe_path(&pointer.active);
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err(RuntimeError::CoreNotFound {
+            detail: format!(
+                "版本 {} 的 aria2c.exe 不存在：{}",
+                pointer.active,
+                exe.display()
+            ),
+        })
+    }
+}
+
+/// 用户显式指定的外部核心（`external` 分支的唯一实现）。
+fn external_core(config: &Config) -> Result<ResolvedCore, RuntimeError> {
+    let raw = config.aria2.external_path.trim();
+    if raw.is_empty() {
+        return Err(RuntimeError::CoreNotFound {
+            detail: "aria2.source=external 但 aria2.external_path 为空".to_owned(),
+        });
+    }
+    let exe = config::expand_user_path(raw);
+    if exe.is_file() {
+        Ok(ResolvedCore {
+            path: exe,
+            origin: CoreOrigin::External,
+        })
+    } else {
+        Err(RuntimeError::CoreNotFound {
+            detail: format!("external_path 指向的文件不存在：{}", exe.display()),
+        })
+    }
+}
+
+/// 只要路径的旧入口（服务端 `scm.rs` 等不关心来源的调用方保留）。
+pub fn resolve_core_exe(config: &Config) -> Result<PathBuf, RuntimeError> {
+    resolve_core(config).map(|core| core.path)
+}
+
+/// 只要路径的旧入口（指定平面）。
+pub fn resolve_core_exe_in(config: &Config, plane: Plane) -> Result<PathBuf, RuntimeError> {
+    resolve_core_in(config, plane).map(|core| core.path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,7 +1203,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    use ariahost_common::config::{Aria2Section, Config, DlSection, RpcSection};
+    use ariahost_common::config::{Aria2Section, Aria2Source, Config, DlSection, RpcSection};
 
     // ---- 假件 ----
 
@@ -1593,5 +1707,190 @@ mod tests {
         assert_eq!(capped, Duration::from_millis(250));
         let grown = next_interval(start, Duration::from_secs(1));
         assert_eq!(grown, Duration::from_millis(300));
+    }
+
+    // ---- 核心定位（`aria2.source` 三态；全部用注入路径，不读环境变量）----
+
+    /// 每个测试一独立目录；返回 `(根, 版本库根, 内置核心路径)`。
+    ///
+    /// 版本库根与内置核心都不预建：调用方按需造，避免「顺手就存在」把测试测空。
+    fn resolve_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "ariahost-resolve-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let versions = root.join("versions");
+        let bundled = root.join("install").join(BUNDLED_CORE_EXE);
+        std::fs::create_dir_all(&root).expect("建测试根");
+        (root, versions, bundled)
+    }
+
+    /// 在版本库里装一个「已激活」的版本（只造文件，不跑安装流程）。
+    fn install_fake_managed(versions: &Path, version: &str) -> PathBuf {
+        let dir = versions.join(version);
+        std::fs::create_dir_all(&dir).expect("建版本目录");
+        let exe = dir.join(BUNDLED_CORE_EXE);
+        std::fs::write(&exe, b"MZ").expect("写占位核心");
+        std::fs::write(
+            versions.join("active.json"),
+            format!("{{\"active\":\"{version}\",\"previous\":null}}\n"),
+        )
+        .expect("写激活指针");
+        exe
+    }
+
+    /// 造一个「内置核心」文件（内容无所谓，只需要是文件）。
+    fn install_fake_bundled(bundled: &Path) -> PathBuf {
+        if let Some(parent) = bundled.parent() {
+            std::fs::create_dir_all(parent).expect("建安装目录");
+        }
+        std::fs::write(bundled, b"MZ").expect("写内置核心");
+        bundled.to_path_buf()
+    }
+
+    fn config_with(source: Aria2Source, external: &str) -> Config {
+        let mut config = sample_config();
+        config.aria2.source = source;
+        config.aria2.external_path = external.to_owned();
+        config
+    }
+
+    #[test]
+    fn auto_prefers_bundled_over_managed() {
+        let (root, versions, bundled) = resolve_fixture("auto-bundled");
+        install_fake_bundled(&bundled);
+        install_fake_managed(&versions, "1.37.0");
+
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Auto, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("auto 应解析成功");
+
+        assert_eq!(core.origin, CoreOrigin::Bundled);
+        assert_eq!(core.path, bundled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_falls_back_to_managed_when_bundled_is_missing() {
+        let (root, versions, bundled) = resolve_fixture("auto-managed");
+        let managed = install_fake_managed(&versions, "1.37.0");
+        // 内置路径给了但文件不存在（安装包漏带/用户删了）。
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Auto, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("auto 应退到托管核心");
+
+        assert_eq!(core.origin, CoreOrigin::Managed);
+        assert_eq!(core.path, managed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_uses_external_path_as_the_last_resort() {
+        let (root, versions, bundled) = resolve_fixture("auto-external");
+        let external = root.join("portable").join(BUNDLED_CORE_EXE);
+        install_fake_bundled(&external);
+
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Auto, external.to_str().expect("UTF-8 路径")),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("auto 应退到外部核心");
+
+        assert_eq!(core.origin, CoreOrigin::External);
+        assert_eq!(core.path, external);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_with_nothing_available_is_core_not_found_and_points_at_the_guide() {
+        let (root, versions, bundled) = resolve_fixture("auto-none");
+        let error = resolve_core_with(
+            &config_with(Aria2Source::Auto, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect_err("三处都没有核心时必须报错");
+
+        assert!(
+            matches!(error, RuntimeError::CoreNotFound { .. }),
+            "应是 CoreNotFound：{error:?}"
+        );
+        assert_eq!(error.code(), Some(ErrorCode::Aria2NotFound));
+        let detail = error.to_string();
+        assert!(
+            detail.contains("首次运行引导"),
+            "错误文案必须给出可执行下一步：{detail}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn managed_source_never_silently_falls_back_to_bundled() {
+        let (root, versions, bundled) = resolve_fixture("managed-strict");
+        install_fake_bundled(&bundled);
+
+        let error = resolve_core_with(
+            &config_with(Aria2Source::Managed, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect_err("source=managed 时不得使用内置核心");
+
+        assert!(matches!(error, RuntimeError::CoreNotFound { .. }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn external_source_requires_a_non_empty_existing_file() {
+        let (root, versions, bundled) = resolve_fixture("external-strict");
+
+        let empty = resolve_core_with(
+            &config_with(Aria2Source::External, "   "),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect_err("external 且路径为空必须报错");
+        assert!(empty.to_string().contains("external_path 为空"), "{empty}");
+
+        let missing = resolve_core_with(
+            &config_with(Aria2Source::External, "C:\\nope\\aria2c.exe"),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect_err("external 指向不存在的文件必须报错");
+        assert!(
+            missing
+                .to_string()
+                .contains("external_path 指向的文件不存在"),
+            "{missing}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_versions_root_reports_a_readable_reason() {
+        let (root, _versions, bundled) = resolve_fixture("no-root");
+        let error = resolve_core_with(&config_with(Aria2Source::Auto, ""), None, Some(&bundled))
+            .expect_err("拿不到版本库根目录时必须有可读原因");
+
+        assert!(error.to_string().contains("版本库根目录"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn core_origin_strings_are_pinned() {
+        // 面板/`--aria2-status`/诊断包都按这几个字符串判断，中文不许混进来。
+        assert_eq!(CoreOrigin::Bundled.as_str(), "bundled");
+        assert_eq!(CoreOrigin::Managed.as_str(), "managed");
+        assert_eq!(CoreOrigin::External.as_str(), "external");
     }
 }

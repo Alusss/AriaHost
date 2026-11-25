@@ -66,10 +66,11 @@ pub use release::{
 #[cfg(windows)]
 pub use runtime::JobGuard;
 pub use runtime::{
-    launch_spec, prepare_conf, render_conf, resolve_core_exe, resolve_core_exe_in, Child,
-    CoreRuntime, CoreState, CoreStatus, LaunchSpec, ProcessSpawner, Readiness, RpcProbe,
-    RuntimeError, RuntimeEvent, RuntimePaths, Spawner, Timeouts, CONF_FILE_NAME, CREATE_NO_WINDOW,
-    FILE_ALLOCATION, LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
+    bundled_core_path, launch_spec, prepare_conf, render_conf, resolve_core, resolve_core_exe,
+    resolve_core_exe_in, resolve_core_in, resolve_core_in_with, Child, CoreOrigin, CoreRuntime,
+    CoreState, CoreStatus, LaunchSpec, ProcessSpawner, Readiness, ResolvedCore, RpcProbe,
+    RuntimeError, RuntimeEvent, RuntimePaths, Spawner, Timeouts, BUNDLED_CORE_EXE, CONF_FILE_NAME,
+    CREATE_NO_WINDOW, FILE_ALLOCATION, LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
 };
 pub use store::{ActivePointer, ExeProbe, VersionStore, ACTIVE_FILE};
 pub use sync::{

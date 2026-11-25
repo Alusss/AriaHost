@@ -228,7 +228,14 @@ pub struct LifecycleSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Aria2Source {
-    /// 版本库托管（默认；架构裁决 R1）。
+    /// 自动（**新默认**，M3-j/task-54）：`ariahost.exe` 同目录有自带核心就用它，
+    /// 否则回退到版本库托管。
+    ///
+    /// 为什么改默认：安装包自带 aria2c 之后，「在线下载」在受限网络里是死路
+    /// （镜像长期 404、github.com 不通），只有自带才能开箱即用。显式的
+    /// `managed`/`external` 语义不变，老配置不会被迁移。
+    Auto,
+    /// 版本库托管（task-54 之前是默认）。
     Managed,
     /// 用户自带 aria2c。
     External,
@@ -238,6 +245,7 @@ impl Aria2Source {
     /// 文本形态（写日志/诊断包用）。
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Managed => "managed",
             Self::External => "external",
         }
@@ -323,7 +331,7 @@ impl Default for Config {
 impl Default for Aria2Section {
     fn default() -> Self {
         Self {
-            source: Aria2Source::Managed,
+            source: Aria2Source::Auto,
             external_path: String::new(),
             update_channel: "stable".to_owned(),
             check_update_on_start: true,
@@ -1057,7 +1065,7 @@ mod tests {
     fn defaults_match_the_52_key_schema() {
         let config = Config::default();
         assert_eq!(config.schema_version, SCHEMA_VERSION);
-        assert_eq!(config.aria2.source, Aria2Source::Managed);
+        assert_eq!(config.aria2.source, Aria2Source::Auto);
         assert!(config.aria2.external_path.is_empty());
         assert_eq!(config.aria2.update_channel, "stable");
         assert!(config.aria2.check_update_on_start);
@@ -1268,7 +1276,7 @@ beta = "two"
         fs::write(&path, "[aria2.rpc]\nport = 7777\n").expect("写");
         let config = load_from(&path).expect("部分文件应成功");
         assert_eq!(config.aria2.rpc.port, 7777);
-        assert_eq!(config.aria2.source, Aria2Source::Managed, "缺的键取默认");
+        assert_eq!(config.aria2.source, Aria2Source::Auto, "缺的键取默认");
         assert_eq!(config.net.split, 5);
     }
 
