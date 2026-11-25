@@ -31,7 +31,9 @@ fn main() {
     // 设 `ARIAHOST_SKIP_ICON=1` 只跳过资源嵌入，**不影响任何 Rust 代码的编译与 lint**；
     // 正式构建（CI/发布）不设该变量，资源照常嵌入。
     if std::env::var_os("ARIAHOST_SKIP_ICON").is_some() {
-        println!("cargo:warning=ARIAHOST_SKIP_ICON 已设置：跳过图标/版本资源嵌入（仅用于跨目标 lint）");
+        println!(
+            "cargo:warning=ARIAHOST_SKIP_ICON 已设置：跳过图标/版本资源嵌入（仅用于跨目标 lint）"
+        );
         return;
     }
 
