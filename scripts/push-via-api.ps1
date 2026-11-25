@@ -67,6 +67,13 @@ $locals = @(& git rev-list --reverse "$base..HEAD")
 if ($locals.Count -eq 0) { Write-Host 'nothing to push'; exit 0 }
 Write-Host "commits to push: $($locals.Count)"
 
+# 本次推送的目标提交：**在开始时就固定下来**。
+# 否则推送期间若有别的进程/成员提交了新 commit，脚本末尾重读 HEAD 会把
+# 「没推过的提交」写进 marker，导致下次推送静默跳过它们（已在 2026-11-25 发生过两次）。
+$pushTarget = $locals[-1]
+$pushTargetTree = (& git rev-parse "$pushTarget^{tree}").Trim()
+Write-Host "push target   = $pushTarget (tree $($pushTargetTree.Substring(0,8)))"
+
 $remoteTree = (Invoke-GhJson 'GET' "repos/$repo/git/commits/$remoteHead" $null).tree.sha
 $prevCommit = $remoteHead
 $tmp = Join-Path $env:TEMP ('ghpush-' + [guid]::NewGuid().ToString('N'))
@@ -126,9 +133,9 @@ foreach ($c in $locals) {
 $refPayload = Join-Path $tmp 'ref.json'
 Write-Json $refPayload @{ sha = $prevCommit; force = $false }
 Invoke-GhJson 'PATCH' "repos/$repo/git/refs/heads/$branch" $refPayload | Out-Null
-Set-Content -Path $markerFile -Value (& git rev-parse HEAD).Trim() -NoNewline
+Set-Content -Path $markerFile -Value $pushTarget -NoNewline
 
-$localTree = (& git rev-parse 'HEAD^{tree}').Trim()
+$localTree = $pushTargetTree
 $remoteTreeNow = (Invoke-GhJson 'GET' "repos/$repo/git/commits/$prevCommit" $null).tree.sha
 Write-Host ""
 Write-Host "remote $branch updated to $prevCommit"
