@@ -417,7 +417,7 @@ mod tests {
         // 结构被改动（增删槽位、换类型）会在这里先炸，而不是在真机上调用错函数。
         assert_eq!(
             size_of::<platform::PropertyStoreVtbl>(),
-            8 * size_of::<usize>()
+            usize::BITS as usize
         );
     }
 
