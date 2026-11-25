@@ -140,7 +140,42 @@ $s.CounterSamples | Measure-Object -Property CookedValue -Minimum -Maximum
 - **能力边界**：UI Automation 证明不了**字形正确、中文渲染正常、输入法能上屏**。`selftest` 里 `font=Microsoft_YaHei_UI` 只说明字体解析成功 ≠ 字形正确 ≠ 能输入——这三件事必须人眼 + 真机输入法，见验收 #13（**仍未通过**）。
 - **能验「关闭行为」**（2026-11-25 实测）：对窗口发 `WindowPattern.Close`（UIA）**确实会走到 eframe 的 `close_requested`**，不是被 winit 直接吞掉。判据是 `window.json` 被写盘——它只在 close 分支里写。因此 `ui.close_action` 三档（`tray`/`ask`/`exit`）可以在锁屏下真机验证：`tray` 之后进程仍在且窗口 `Visible=false`；`ask` 之后 UIA 树里出现对话框文本；`exit` 之后约 4 秒进程与 `aria2c` 都消失。
 
-## 5. 本地打安装包
+## 5. 本地绿的边界（必读）
+
+这里的「绿」指本地命令跑过、退出码 0。**本机的绿只覆盖跨平台那部分**，不是 CI 绿的等价物。下表四条判据，按它决定「这条改动能不能在本地下结论」。
+
+| # | 情形 | 本地为什么绿 | 该怎么做 |
+|---|---|---|---|
+| 1 | 改 `#[cfg(windows)]` 里的代码 | Linux 目标下整段不参与编译，clippy 看不到任何一行 | **不在本地下结论**，推上去等 Windows CI |
+| 2 | 为了让绿而加 `#[allow(...)]` | lint 被自己关掉了 | **禁止**。CI 红是代码问题，不是配置问题 |
+| 3 | 含固定端口的自检 / 测试 | 端口已被占 → `Server::start` 提前失败返回，测试 0.02s「通过」 | 先查端口占用再跑，跑完清进程 |
+| 4 | 新增目标依赖但没让 `Cargo.lock` 落笔 | 本地不加 `--locked` 照样编过 | 跑一次 `cargo check` 让 lock 落笔再提交 |
+
+三次真实翻车（本仓已发生）：
+
+- **`tray.rs`**：每条语句都挂 `#[cfg(windows)]`，WSL 上 `cargo clippy --workspace --all-targets -- -D warnings` 报 **0 告警**；CI 上 `tray.rs:238` 的 `manual_range_contains` 立刻红（已改成 `RangeInclusive::contains`）。
+- **6875 端口**：WSL 里一个孤儿测试进程占着端口，`Server::start` 提前失败返回，单测 **0.02 秒**「通过」；CI 上端口空闲 → 真起服务 → **挂死**。
+- **`--locked`**：给 crate 加 `[target.'cfg(windows)'.dependencies]`（如 `windows-sys`）后没让 lock 落笔，CI 的 `--locked` 构建直接失败。
+
+**禁止用 `#[allow]` 换绿**：等于把这道门禁关掉，下一处同类问题就没人挡。
+
+### 5.1 本地能做什么
+
+方法论：**本地尽力 → 推 → CI 出 exe → 本机真跑取证**。顺序不能反——`--panel-selftest` 的内存/交换链、托盘、三档关闭这些，必须有 exe 才有意义。
+
+```powershell
+# 本地唯一能全信的一步（不碰链接器）
+cargo fmt --all -- --check
+
+# 跨平台部分：WSL 交叉 check（已实测约 1m13s）
+wsl -d debian13s1-claudecode -u root -- bash -c 'export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin; export CARGO_TARGET_DIR=/tmp/wasm-check; cd /mnt/f/git_project/wasm && cargo check -p ariahost --target x86_64-unknown-linux-gnu'
+```
+
+> 这次 check 的绿**只覆盖 `cfg(not(windows))` 分支**。含 `#[cfg(windows)]` 的代码（如 `ariahost-ui` 的托盘、`ariahost-svc` 的 SCM）在 Linux 目标下等于没被检查。
+
+端口占用自查：WSL `ss -ltn | grep 6875`；Windows `Get-NetTCPConnection -LocalPort 6875 -ErrorAction SilentlyContinue`。
+
+## 6. 本地打安装包
 
 前置：`dist\<arch>\ariahost.exe` 已存在，且 `makensis` 在 PATH（安装见 [setup.md](setup.md)）。
 
@@ -156,21 +191,21 @@ makensis /DVERSION=0.1.0 /DVI_VERSION=0.1.0.0 /DARCH=x64 /DSRCDIR=..\dist\x64 in
 
 > **NSIS 脚本未经本地编译验证**（开发机无 `makensis`）。首次编译请预留排错时间，并按 [dev/release.md](release.md) §5 自检清单逐条核对；编译错误以 M3 的 CI 日志为准。
 
-### 5.1 品牌图标管线（exe / 安装器 / 快捷方式共用一份 ICO）
+### 6.1 品牌图标管线（exe / 安装器 / 快捷方式共用一份 ICO）
 
 - 源图 `assets/branding/ariahost-icon-256.png`（256×256 ARGB）→ `installer/ariahost.ico`：7 尺寸 16/24/32/48/64/128/256、32bpp；用 Pillow 生成，加 `bitmap_format="bmp"` 输出**未压缩 DIB 条目**（避开 NSIS / `rc.exe` 对 PNG 压缩图标的兼容风险），**不要手改 ICO**。
 - exe 侧：`crates/ariahost/build.rs` 用 `winresource` 把该 ICO 与版本资源（ProductName / FileVersion / LegalCopyright 等）嵌进 `ariahost.exe`；MSVC 目标需要 Windows SDK 的 `rc.exe`（winresource 按 `RC_PATH` → `WindowsSdkVerBinPath` → 注册表 `KitsRoot10` 查找，CI 另有 `ilammy/msvc-dev-cmd` 兜底）。
 - 安装器侧：`installer/ariahost.nsi` 用同一份 ICO 作 `MUI_ICON`/`MUI_UNICON`、`Icon`（setup.exe 自身），并装到 `$INSTDIR` 供开始菜单/桌面快捷方式引用；编译期路径一律 `${SRCDIR}\ariahost.ico`。
 - CI 侧：`ci.yml` 的 makensis 门禁与 `release.yml` 的 `dist\x64` 暂存步骤都会先把 ICO 拷进 SRCDIR；`ci.yml` 还用 `VersionInfo` 断言 `ProductName`/`LegalCopyright`，证明资源真的进了 exe。
 
-## 6. 版本号与静态链接
+## 7. 版本号与静态链接
 
 - 唯一来源：根 `Cargo.toml` 的 `[workspace.package] version`（各 crate 用 `version.workspace = true` 继承）。
 - 安装包版本由 CI 从该值解析后通过 `/DVERSION`、`/DVI_VERSION` 注入 NSIS，**不在 `.nsi` 里手写**。
 - 改版本 = 改 `Cargo.toml` 一处 + 打 tag；发版流程见 [dev/release.md](release.md)。
 - **静态 CRT**（架构 §4.13 D13，验收 #15a）：M1 需在仓库根新增 `.cargo/config.toml` 设 `rustflags = ["-C","target-feature=+crt-static"]`，确保干净机器无需 `VCRUNTIME140.dll`。该文件**尚未创建**（属架构落地项，不在文档交付范围）；注意环境变量 `RUSTFLAGS` 会整体覆盖这里的配置，不要混用。
 
-## 7. 清理与排错
+## 8. 清理与排错
 
 ```powershell
 cargo clean                       # 全清（下次冷构建很慢）

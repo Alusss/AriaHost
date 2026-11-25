@@ -1,6 +1,6 @@
 # 测试策略
 
-> 适用：M1 起。当前仓库没有代码，**没有任何测试被执行过**；本文定义「怎么写、怎么跑、按什么验收」。
+> 适用：M1 起。自动化目标已在 CI 跑绿（`fmt` / `clippy -D warnings` / `test` / 静态 CRT 快检 / `makensis`），但**没有任何一条验收被人工签字**；本文定义「怎么写、怎么跑、按什么验收」。
 > 验收条目以[需求分析](../requirements-and-design/2026-11-22-wasm-需求分析.md) **§6 的 21 行**（15 条编号，#3/#15 各拆 a/b，另 #16–#19）为准；阈值（30s/25s/60MB/100MB 等）同样只引用定版文档，本文不另立数字。
 
 ## 1. 三层测试
@@ -23,6 +23,12 @@ cargo test --workspace -- --include-ignored
 - 不设覆盖率百分比硬指标（首版代码量小，覆盖率数字容易变成装饰）。
 - 不写「mock 一切」的集成测试：RPC 行为以真 aria2 为准，mock 只用于错误分支。
 - 不在测试里断言耗时/内存的绝对值；性能只在验收 #11 与 N1 的口径下实测并记录环境。
+
+### 2.1 单测禁改系统状态
+
+`crates/ariahost/src/cli.rs` 的单测曾经**真的往 SCM 注册服务**：`--install-service` 在管理员上下文执行成功、退出码 0，而断言写死 `1` → 测试红，且**宿主机服务表被污染**。更危险的是 `--uninstall-service`——在装了 AriaHost 的机器上跑一次 `cargo test` 会**删掉用户真实的服务**。现改为纯函数测试（`parse_args` / 服务状态 JSON 只比形状，见 `service_status_json_shape_is_stable`）。
+
+**规则**：凡是会注册/删除服务、写注册表、改系统目录、占用真实端口的命令，单测**只能测参数解析、输出形状与错误映射**，不许产生副作用；要覆盖副作用就放进需显式开关的集成测试（`cargo test -- --include-ignored`）。
 
 ## 3. 验收 21 行（15 条编号）→ 验证手段映射
 
@@ -52,6 +58,11 @@ cargo test --workspace -- --include-ignored
 | 18 | **第 9 条·第三方 RPC 形态（M1）**：用设置页 secret（headless 首启生成的 secret）连 `127.0.0.1:6800`，`aria2.getGlobalStat`/`addUri`/`tellStatus`/`pause` 均成功；错误 secret 与无 secret 均被拒；`aria2.rpc.listen=off` 时连接被拒 | 用 curl/Postman 带 `token:` 发 4 个方法；再发错 token 与空 token；最后切 `off` 重试 | M1 | 是（可脚本化，作为 M1 冒烟） |
 | 19 | **N8 文档完备性（M3）**：`docs/dev/{setup,build,ci,release,style,test}.md` 六篇存在；`docs/README.md` 索引全链可达；`docs/dev/`、`README.md`、`docs/README.md` 无旧前缀/「验收 11 条」/「150MB」等过期口径残留（定版文档的历史修订记录除外）；新人按 `setup.md`→`build.md` 在干净环境 ≤30min 跑起来；未验证项均带标记 | 逐链点开；`Select-String` 扫过期口径；找一位未接触过仓库的人计时录屏走一遍 | M3 | 部分（链接与禁词可脚本化） |
 
+### 3.1 真机取证手段（锁屏 / 无桌面也能用）
+
+- **UIA 关窗可替代手点 X**：对窗口发 UI Automation 的 `WindowPattern.Close` **确实会走到 eframe 的 `close_requested`**（不是被 winit 吞掉）。探针实测：调完 **0.3s 内**进程退出、`window.json` 被写出（该文件只在 close 分支写）。因此 `ui.close_action` 三档可在锁屏下验收：`tray` → 进程仍在、窗口 `Visible=false`；`ask` → UIA 树里出现对话框文本；`exit` → 约 **4s** 内 `ariahost` 与 `aria2c` 一起消失。方法细节见 [build.md](build.md) §4.3。
+- **内存只认外部采样**（口径不动）：release 构建、窗口真实打开、启动后 **60s 稳态**，取 `GetProcessMemoryInfo → PrivateWorkingSetSize`（进程外 `Get-Counter '\Process(ariahost)\Working Set - Private'`，每 6s 一次取序列）。**不得用程序自报的 `private_kb` 当闸门**——同一状态两者差 3 MB 量级，见 [build.md](build.md) §4.2。
+
 ## 4. 手工验收记录模板
 
 每次验收在 `.scratch/` 或 PR 描述里贴这张表（不入 `docs/`，避免文档过期）：
@@ -71,8 +82,8 @@ cargo test --workspace -- --include-ignored
 ## 5. CI 里的测试
 
 - `ci.yml` 的 `windows` job 里的「单元 + 集成测试」步骤跑 `cargo test --workspace --locked`（单元 + 不需要外部二进制的集成）。**没有独立的 `test` job**：clippy/test/build 串行在同一个 Windows job 里，共用一次工具链安装与缓存。
-- 另有 `nsi-syntax`（ubuntu）：用 1 字节 stub 只跑 `makensis`，挡安装脚本的编译期错误，约 1 分钟 1× 计费。它不在验收编号里，属预防性闸门。
+- `makensis` 编译门禁跑在**同一个 `windows` job** 里、用真实载荷（真 exe + 真 ICO）。**没有独立的 `nsi-syntax`（ubuntu）job**——它当年用 1 字节 stub 在 Linux 上编译，给出的是假绿，已删除。
 - 需要 aria2c 的集成测试不进默认 CI（runner 上没有受控的 aria2 版本）；M2 起可评估下载固定版本 aria2 后开启。
 - 验收 #12 的「CI 出包」只能由 `release.yml` 证明：本地无法替代（本机无 makensis/工具链）。
 - `clippy -D warnings` 与 `fmt --check` 是同级门禁：测试过了但 clippy 红，PR 一样不能合。
-- 目前**没有任何一条验收被执行过**（无代码、无安装包）；#1/#12 的首次真跑在 **M3**，#15a 在 **M1**，#15b 在 **M2**。本节所有结论**未经 cargo/makensis 验证**。
+- **已跑绿的是自动化那部分**（2026-11-25）：`fmt` / `clippy` / `cargo test --workspace --locked` / 静态 CRT 快检（`dumpbin`）/ `makensis` 真实载荷编译 / `release.yml` 出包 + `SHA256SUMS.txt`。**验收本身按人工签字算**：#1、#19 待真机，#13 IME 待真机，#15b 待干净 VM——「CI 绿」不等于「验收通过」。
