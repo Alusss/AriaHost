@@ -17,8 +17,8 @@ use std::thread;
 use ariahost_aria2::Aria2Version;
 use ariahost_common::ErrorCode;
 use ariahost_core::{
-    default_lines, DownloadLine, Fetcher, HashState, HttpClient, HttpOptions, UpdateState,
-    VersionStore, CORE_EXE,
+    ci_lines, default_lines, DownloadLine, Fetcher, HashState, HttpClient, HttpOptions,
+    UpdateState, VersionStore, CORE_EXE, FILE_PLACEHOLDER,
 };
 use serde_json::json;
 use zip::write::SimpleFileOptions;
@@ -732,12 +732,167 @@ fn mirror_template_line_is_actually_used() {
     );
 }
 
+/// 合法 zip，但条目里**没有** `aria2c.exe`（替换包 / 错包形态）。
+fn zip_without_core() -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    writer
+        .start_file("README.txt", options)
+        .expect("start_file");
+    writer.write_all(b"no core here").expect("write");
+    writer.finish().expect("finish").into_inner()
+}
+
+/// M4-0 验收第 5 条：CDN 线路吃到坏包必须**被拦下并自动降到下一线路**。
+///
+/// 五种形态逐条走同一个 fetch：前四种都在 CDN 上坏掉、必须落到 GitHub 直连成功；
+/// 第五种（完全正常）则**留在 CDN**、不发生降级。
+///
+/// 「Content-Length 与实际字节不符」由 [`size_mismatch_between_release_and_body_is_rejected`]
+/// 单独覆盖（那需要假服务器故意谎报长度，`Route` 造不出来），这里用**截断的 zip** 替代表「下了一半」。
 #[test]
-fn default_lines_still_direct_then_mirror() {
-    // 守住默认顺序（直连优先）：这是 Q2 的拍板结论。
+fn bad_cdn_responses_all_degrade_to_github_line() {
+    let good = build_core_zip(b"core-bytes-ok");
+    // Cloudflare 404 页的量级（27,150 B，text/html）——正是 fail-closed 预检要拦的形态。
+    let html_page = vec![b'<'; 27_150];
+    // 合法魔数但被截断：等价于「下了一半」。
+    let mut truncated = good.clone();
+    truncated.truncate(good.len() / 2);
+
+    // (标签, CDN 上的坏响应)
+    let bad_forms: Vec<(&str, Route)> = vec![
+        (
+            "html404",
+            Route::new("/cdn/asset.zip", 404, Some("text/html"), html_page),
+        ),
+        (
+            "badmagic",
+            Route::new(
+                "/cdn/asset.zip",
+                200,
+                Some("application/octet-stream"),
+                b"not a zip at all".to_vec(),
+            ),
+        ),
+        (
+            "truncated",
+            Route::new(
+                "/cdn/asset.zip",
+                200,
+                Some("application/octet-stream"),
+                truncated,
+            ),
+        ),
+        (
+            "noexe",
+            Route::new(
+                "/cdn/asset.zip",
+                200,
+                Some("application/octet-stream"),
+                zip_without_core(),
+            ),
+        ),
+    ];
+
+    for (tag, bad) in bad_forms {
+        let serving = good.clone();
+        let declared = good.len();
+        let server = FakeServer::start(move |addr| {
+            let asset_url = format!("http://{addr}/asset.zip");
+            vec![
+                Route::json(
+                    "/api",
+                    &api_json("1.36.0", &asset_url, declared, &asset_name("1.36.0")),
+                ),
+                bad,
+                Route::file("/asset.zip", serving),
+            ]
+        });
+
+        let (lines, order_warnings) = ariahost_core::lines_from("cdn,github", &server.url("/cdn/"));
+        assert!(
+            order_warnings.is_empty(),
+            "{tag}: 合法顺序不该有告警：{order_warnings:?}"
+        );
+        assert_eq!(lines.len(), 2, "{tag}: 顺序解析应给出两条线路");
+
+        let dir = TestDir::new(&format!("degrade-{tag}"));
+        let store = VersionStore::new(dir.path());
+        let fetcher = Fetcher::with_parts(test_client(), lines).with_api_url(server.url("/api"));
+
+        let outcome = fetcher
+            .fetch(&store, None)
+            .unwrap_or_else(|error| panic!("{tag}: 坏 CDN 应降级成功，实际 {error}"));
+
+        assert_eq!(
+            outcome.line,
+            ariahost_core::DIRECT_LINE_NAME,
+            "{tag}: 必须已降级到 GitHub 直连线路"
+        );
+        assert!(
+            !outcome.warnings.is_empty(),
+            "{tag}: 降级必须留下可见告警（试过哪条线路、为什么失败）"
+        );
+        assert!(
+            std::fs::read(&outcome.exe_path).expect("读 exe") == b"core-bytes-ok".to_vec(),
+            "{tag}: 装上的必须是 GitHub 那份好包"
+        );
+    }
+
+    // 第五种：CDN 正常 → 不得降级。
+    let serving = good.clone();
+    let declared = good.len();
+    let server = FakeServer::start(move |addr| {
+        let asset_url = format!("http://{addr}/asset.zip");
+        vec![
+            Route::json(
+                "/api",
+                &api_json("1.36.0", &asset_url, declared, &asset_name("1.36.0")),
+            ),
+            Route::file("/cdn/asset.zip", serving),
+        ]
+    });
+    let (lines, order_warnings) = ariahost_core::lines_from("cdn,github", &server.url("/cdn/"));
+    assert!(
+        order_warnings.is_empty(),
+        "合法顺序不该有告警：{order_warnings:?}"
+    );
+    assert_eq!(lines.len(), 2);
+    let dir = TestDir::new("degrade-ok");
+    let store = VersionStore::new(dir.path());
+    let fetcher = Fetcher::with_parts(test_client(), lines).with_api_url(server.url("/api"));
+    let outcome = fetcher.fetch(&store, None).expect("CDN 正常时应成功");
+    assert_eq!(
+        outcome.line,
+        ariahost_core::CDN_LINE_NAME,
+        "CDN 正常时不该降级"
+    );
+}
+
+#[test]
+fn default_lines_cdn_first_then_direct() {
+    // 守住默认顺序（task-72 / Q17 拍板）：**自带 CDN 优先，官方直连兜底**。
+    // 来由（真机实测）：用户网络下 `api.github.com` 与 `r.alusss.cn` 镜像都拿不到包，
+    // CDN 是唯一可用线路；但 CDN 是第三方主机（可能挂/可能被劫），
+    // 一旦它失败必须能退回官方直连，所以两条都在、顺序固定。
     let lines = default_lines();
+    assert_eq!(lines.len(), 2, "默认只应有 cdn + github 两条：{lines:?}");
+    assert_eq!(lines[0].name, "CDN ah.335772.xyz");
+    assert_eq!(
+        lines[0].template,
+        format!("{}{FILE_PLACEHOLDER}", ariahost_core::DEFAULT_CDN_BASE)
+    );
+    assert_eq!(lines[1].name, "直连 GitHub");
+    assert_eq!(lines[1].template, ariahost_core::URL_PLACEHOLDER);
+}
+
+#[test]
+fn ci_lines_keep_direct_first() {
+    // CI 的发布流程不走第三方 CDN：`release.yml` 里用 `ci_lines()`，
+    // 直连优先、CDN 兜底（runner 在 GitHub 网络内，直连更可信）。
+    let lines = ci_lines();
     assert_eq!(lines[0].name, "直连 GitHub");
-    assert_eq!(lines[1].template, ariahost_core::DEFAULT_MIRROR_TEMPLATE);
+    assert_eq!(lines[1].name, "CDN ah.335772.xyz");
 }
 
 #[test]

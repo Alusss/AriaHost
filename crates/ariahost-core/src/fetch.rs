@@ -15,9 +15,10 @@
 //! 所以任何一步失败都不会留下半装版本，也不会改 `active.json`。
 
 use ariahost_aria2::Aria2Version;
+use ariahost_common::config::NetSection;
 use sha2::{Digest, Sha256};
 
-use crate::download::{default_lines, download_zip, DownloadLine};
+use crate::download::{download_zip, lines_from, DownloadLine};
 use crate::error::CoreError;
 use crate::http::{self, HttpClient};
 use crate::release::{
@@ -109,6 +110,8 @@ pub struct FetchOutcome {
 pub struct Fetcher {
     client: HttpClient,
     lines: Vec<DownloadLine>,
+    /// 造线路时产生的告警（非法 `source_order` 项、回退等），随每次 `fetch` 一并上报。
+    line_warnings: Vec<String>,
     /// releases API 地址（默认 [`crate::release::RELEASES_API`]；测试指向本机假服务器）。
     api_url: String,
 }
@@ -120,13 +123,30 @@ impl Default for Fetcher {
 }
 
 impl Fetcher {
-    /// 生产默认：HTTPS-only 客户端 + 直连/镜像两条线路。
+    /// 生产默认：HTTPS-only 客户端 + 用户机器默认线路顺序（`cdn → github`）。
     pub fn new() -> Self {
+        Self::with_order(
+            crate::download::DEFAULT_SOURCE_ORDER,
+            crate::download::DEFAULT_CDN_BASE,
+        )
+    }
+
+    /// 指定线路顺序：`order` 见 [`lines_from`]（`"cdn,github"` / `"github,cdn"` …）。
+    ///
+    /// CI 用 `github,cdn`（runner 在 GitHub 内网）；用户机器用默认值（CDN 优先）。
+    pub fn with_order(order: &str, cdn_base: &str) -> Self {
+        let (lines, line_warnings) = lines_from(order, cdn_base);
         Self {
             client: HttpClient::new(),
-            lines: default_lines(),
+            lines,
+            line_warnings,
             api_url: crate::release::RELEASES_API.to_owned(),
         }
+    }
+
+    /// 按配置的 `[net]` 段造线路（`net.source_order` + `net.cdn_base`）。
+    pub fn with_net(net: &NetSection) -> Self {
+        Self::with_order(&net.source_order, &net.cdn_base)
     }
 
     /// 注入客户端与线路（测试用：允许明文 HTTP 指向假服务器）。
@@ -134,6 +154,7 @@ impl Fetcher {
         Self {
             client,
             lines,
+            line_warnings: Vec::new(),
             api_url: crate::release::RELEASES_API.to_owned(),
         }
     }
@@ -152,6 +173,14 @@ impl Fetcher {
     /// 当前线路。
     pub fn lines(&self) -> &[DownloadLine] {
         &self.lines
+    }
+
+    /// 造线路时的告警（`source_order` 里有非法项 / 回退到默认顺序等）。
+    ///
+    /// 这些告警与「下载阶段的线路失败」不是一回事：它们说明**配置没被完全照办**，
+    /// 调用方应把它们并进用户可见的告警里（`FetchOutcome::warnings`）。
+    pub fn line_warnings(&self) -> &[String] {
+        &self.line_warnings
     }
 
     /// 拉 releases 目录。
@@ -215,6 +244,8 @@ impl Fetcher {
 
         let (hash, mut warnings) = verify_hash(version, host_bits(), &download.bytes)?;
         warnings.extend(download.warnings);
+        // 线路构造阶段的告警（配置没被完全照办）也要让用户看见，不能只留在 Fetcher 里。
+        warnings.extend(self.line_warnings.iter().cloned());
 
         let extracted = extract_core(&download.bytes)?;
         store.install_core(&version.to_string(), &extracted)?;

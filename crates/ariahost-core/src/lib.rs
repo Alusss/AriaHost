@@ -44,8 +44,9 @@ pub use clean::{
     STAGING_MIN_AGE_SECS, TMP_MAX_AGE_HOURS,
 };
 pub use download::{
-    default_lines, DownloadLine, DownloadOutcome, DEFAULT_MIRROR_TEMPLATE, DIRECT_LINE_NAME,
-    MIRROR_LINE_NAME, URL_PLACEHOLDER,
+    ci_lines, default_lines, lines_from, DownloadLine, DownloadOutcome, CDN_LINE_NAME,
+    CI_SOURCE_ORDER, DEFAULT_CDN_BASE, DEFAULT_MIRROR_TEMPLATE, DEFAULT_SOURCE_ORDER,
+    DIRECT_LINE_NAME, FILE_PLACEHOLDER, MIRROR_LINE_NAME, URL_PLACEHOLDER,
 };
 pub use error::{CoreError, LineAttempt};
 pub use fetch::{

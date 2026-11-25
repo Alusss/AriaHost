@@ -1,9 +1,15 @@
 //! 下载线路：模板拼接 + 逐线路聚合失败（**不静默降级**）。
 //!
-//! 线路语义（架构 §4.7 / R5）：默认**直连** GitHub；镜像前缀只作为**可配模板**存在
-//! （`r.alusss.cn` 2026-11-22 实测整体不可用，不能当默认可用线路卖）。任何一条线路失败都
-//! 必须留下痕迹：成功时进 [`DownloadOutcome::warnings`]（UI 可见信息条），全部失败时进
-//! [`CoreError::AllLinesFailed`]（`AH-E6007`）。
+//! 线路语义（架构 §4.7 / R5；M4-0 起四类来源）：`Cdn`（用户 CDN，**用户机器首选**）→
+//! `Github`（直连官方 release，**CI 首选**）；`Managed` / `External` 是「本机已有核心」，
+//! 不在本模块（见 [`crate::runtime`] 的 `resolve_core`）。
+//!
+//! 顺序来自 `net.source_order`（见 [`lines_from`]）：用户机器默认 `cdn,github`——真实用户网络里
+//! GitHub 的 `release-assets.githubusercontent.com` 实测超时；CI 用 [`CI_SOURCE_ORDER`]，因为
+//! runner 在 GitHub 内网，2.4MB 是秒级，而 CDN 实测 ~19s。
+//!
+//! 任何一条线路失败都必须留下痕迹：成功时进 [`DownloadOutcome::warnings`]（UI 可见信息条），
+//! 全部失败时进 [`CoreError::AllLinesFailed`]（`AH-E6007`）。
 
 use crate::error::{CoreError, LineAttempt};
 use crate::http::{self, HttpClient};
@@ -11,23 +17,41 @@ use crate::http::{self, HttpClient};
 /// 直连 GitHub 的线路名。
 pub const DIRECT_LINE_NAME: &str = "直连 GitHub";
 
+/// 用户 CDN 的线路名。
+pub const CDN_LINE_NAME: &str = "CDN ah.335772.xyz";
+
+/// 用户 CDN 的默认前缀（与 `ariahost-common` 的 `[net] cdn_base` 默认值**同字面量**）。
+///
+/// 为什么不从这里引用到 config：依赖方向是 common ← core，config 不能反向依赖 core。
+pub const DEFAULT_CDN_BASE: &str = "https://ah.335772.xyz/releases/";
+
+/// 用户机器运行时的默认顺序：CDN 优先。
+pub const DEFAULT_SOURCE_ORDER: &str = "cdn,github";
+
+/// CI 构建期的顺序：GitHub 优先（runner 在 GitHub 内网，比 CDN 快一个数量级）。
+pub const CI_SOURCE_ORDER: &str = "github,cdn";
+
 /// 镜像线路的默认模板（`{url}` 会被替换成完整 GitHub 资产 URL）。
 ///
-/// **实测不可用**，只作为可配模板的默认值存在；不要把它当成「可用的备份线路」。
+/// **实测不可用**，只作为可配模板的默认值存在；不要把它当成「可用的备份线路」，
+/// 也不要再把它放进默认顺序（M4-0 起默认顺序只有 cdn / github）。
 pub const DEFAULT_MIRROR_TEMPLATE: &str = "https://r.alusss.cn/{url}";
 
 /// 镜像线路的默认显示名。
 pub const MIRROR_LINE_NAME: &str = "镜像 r.alusss.cn";
 
-/// `{url}` 占位符。
+/// `{url}` 占位符：整条资产 URL。
 pub const URL_PLACEHOLDER: &str = "{url}";
+
+/// `{file}` 占位符：资产 URL 的**最后一段**（CDN 上的文件名与官方资产完全同名）。
+pub const FILE_PLACEHOLDER: &str = "{file}";
 
 /// 一条下载线路。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadLine {
     /// 显示名（进日志/提示，例如「直连 GitHub」）。
     pub name: String,
-    /// URL 模板，必须包含 `{url}`。
+    /// URL 模板，必须包含 [`URL_PLACEHOLDER`] 或 [`FILE_PLACEHOLDER`]。
     pub template: String,
 }
 
@@ -48,28 +72,106 @@ impl DownloadLine {
         }
     }
 
-    /// 默认镜像模板线路（可配入口的初始值）。
+    /// 用户 CDN 线路：`<cdn_base>/<资产文件名>`（末尾斜杠缺了会自动补）。
+    pub fn cdn(base: &str) -> Self {
+        let base = base.trim();
+        let normalized = if base.ends_with('/') {
+            base.to_owned()
+        } else {
+            format!("{base}/")
+        };
+        Self {
+            name: CDN_LINE_NAME.to_owned(),
+            template: format!("{normalized}{FILE_PLACEHOLDER}"),
+        }
+    }
+
+    /// 默认镜像模板线路（历史可配入口的初始值）。
     pub fn default_mirror() -> Self {
         Self::new(MIRROR_LINE_NAME, DEFAULT_MIRROR_TEMPLATE)
     }
 
-    /// 模板是否带 `{url}` 占位符（没有占位符的模板拼不出目标地址，配置校验用）。
+    /// 模板是否带可用占位符（不带占位符的模板拼不出目标地址，配置校验用）。
     pub fn has_placeholder(&self) -> bool {
-        self.template.contains(URL_PLACEHOLDER)
+        self.template.contains(URL_PLACEHOLDER) || self.template.contains(FILE_PLACEHOLDER)
     }
 
-    /// 把模板里的 `{url}` 替换成真实地址。
+    /// 把模板里的占位符替换成真实地址。
     ///
     /// 注意：**不做 URL 归一化/转义**——镜像前缀本来就是「前缀 + 完整 GitHub URL」的形态
     /// （`https://r.alusss.cn/https://github.com/...`），转义反而会把它拼坏。
     pub fn join(&self, url: &str) -> String {
-        self.template.replace(URL_PLACEHOLDER, url)
+        let joined = self.template.replace(URL_PLACEHOLDER, url);
+        if joined.contains(FILE_PLACEHOLDER) {
+            joined.replace(FILE_PLACEHOLDER, asset_file_name(url))
+        } else {
+            joined
+        }
     }
 }
 
-/// 默认线路顺序：直连优先，镜像其次。
+/// 资产 URL 的最后一段（GitHub release 资产名；官方资产 URL 不带 query）。
+fn asset_file_name(url: &str) -> &str {
+    url.rsplit('/').next().unwrap_or(url)
+}
+
+/// 按 `net.source_order` + `net.cdn_base` 造线路。
+///
+/// 规则（与文档一致）：
+/// - 只认 `cdn` / `github` 两个关键字，大小写不敏感；重复项只保留第一次出现；
+/// - `cdn_base` 为空 → **跳过** CDN 线路（等价「只用 github」）；
+/// - 未知关键字忽略并返回一条可见告警；
+/// - 一个可用线路都没有 → 回退 GitHub 直连 + 一条可见告警（绝不静默降级成「无线路」）。
+pub fn lines_from(order: &str, cdn_base: &str) -> (Vec<DownloadLine>, Vec<String>) {
+    let base = cdn_base.trim();
+    let mut lines: Vec<DownloadLine> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
+
+    for token in order.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.to_ascii_lowercase().as_str() {
+            "cdn" => {
+                if !base.is_empty() && !lines.iter().any(|line| line.name == CDN_LINE_NAME) {
+                    lines.push(DownloadLine::cdn(base));
+                }
+            }
+            "github" => {
+                if !lines.iter().any(|line| line.name == DIRECT_LINE_NAME) {
+                    lines.push(DownloadLine::direct());
+                }
+            }
+            _ => unknown.push(token),
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if !unknown.is_empty() {
+        warnings.push(format!(
+            "net.source_order 里的 {} 不是已知线路（只认 cdn / github），已忽略",
+            unknown.join("、")
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(DownloadLine::direct());
+        warnings.push(format!(
+            "net.source_order「{order}」里没有可用线路，已回退为 GitHub 直连"
+        ));
+    }
+
+    (lines, warnings)
+}
+
+/// 用户机器运行时的默认线路：`cdn → github`。
 pub fn default_lines() -> Vec<DownloadLine> {
-    vec![DownloadLine::direct(), DownloadLine::default_mirror()]
+    lines_from(DEFAULT_SOURCE_ORDER, DEFAULT_CDN_BASE).0
+}
+
+/// CI 构建期的线路：`github → cdn`（`release.yml` 的自带核心下载用）。
+pub fn ci_lines() -> Vec<DownloadLine> {
+    lines_from(CI_SOURCE_ORDER, DEFAULT_CDN_BASE).0
 }
 
 /// 一次成功的下载结果。
@@ -141,6 +243,7 @@ mod tests {
     use super::*;
 
     const ASSET_URL: &str = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip";
+    const ASSET_FILE: &str = "aria2-1.37.0-win-64bit-build1.zip";
 
     #[test]
     fn direct_line_keeps_url_untouched() {
@@ -157,10 +260,20 @@ mod tests {
             line.join(ASSET_URL),
             format!("https://r.alusss.cn/{ASSET_URL}")
         );
-        // 前缀形态与侦察记录一致：镜像后面跟的是**完整** GitHub URL。
-        assert!(line
-            .join(ASSET_URL)
-            .starts_with("https://r.alusss.cn/https://github.com/"));
+    }
+
+    /// M4-0 的核心：CDN 线路只换 host 与前缀，文件名与官方资产同名。
+    #[test]
+    fn cdn_line_replaces_only_the_file_name() {
+        let line = DownloadLine::cdn(DEFAULT_CDN_BASE);
+        assert!(line.has_placeholder());
+        assert_eq!(
+            line.join(ASSET_URL),
+            format!("https://ah.335772.xyz/releases/{ASSET_FILE}")
+        );
+        // 缺尾斜杠要自动补，不能拼成 `...releasesaria2-...`。
+        let no_slash = DownloadLine::cdn("https://ah.335772.xyz/releases");
+        assert_eq!(no_slash.join(ASSET_URL), line.join(ASSET_URL));
     }
 
     #[test]
@@ -172,11 +285,57 @@ mod tests {
     }
 
     #[test]
-    fn default_lines_order_is_direct_then_mirror() {
+    fn default_lines_are_cdn_then_github() {
         let lines = default_lines();
+        assert_eq!(lines.len(), 2, "默认只应有 cdn / github 两条");
+        assert_eq!(lines[0].name, CDN_LINE_NAME);
+        assert_eq!(lines[1].name, DIRECT_LINE_NAME);
+    }
+
+    #[test]
+    fn ci_lines_are_github_then_cdn() {
+        let lines = ci_lines();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].name, DIRECT_LINE_NAME);
-        assert_eq!(lines[1].name, MIRROR_LINE_NAME);
+        assert_eq!(lines[1].name, CDN_LINE_NAME);
+    }
+
+    /// `cdn_base` 为空 → 只走 github（任务第 5 条的单测之一）。
+    #[test]
+    fn empty_cdn_base_keeps_only_github() {
+        let (lines, warnings) = lines_from("cdn,github", "   ");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].name, DIRECT_LINE_NAME);
+        assert!(warnings.is_empty(), "跳过 CDN 是配置意图，不该告警");
+    }
+
+    /// 非法值 → 回退默认 + 一条告警（任务第 5 条的单测之一）。
+    #[test]
+    fn unknown_tokens_warn_and_are_ignored() {
+        let (lines, warnings) = lines_from("gerrit, github", DEFAULT_CDN_BASE);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].name, DIRECT_LINE_NAME);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("gerrit"), "{}", warnings[0]);
+    }
+
+    /// 一个可用线路都没有 → 回退 github + 告警，绝不返回空线路表。
+    #[test]
+    fn empty_order_falls_back_to_github_with_warning() {
+        let (lines, warnings) = lines_from(" , ", "");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].name, DIRECT_LINE_NAME);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("回退"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn duplicate_tokens_are_deduped_in_order() {
+        let (lines, warnings) = lines_from("github,cdn,github,github", DEFAULT_CDN_BASE);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].name, DIRECT_LINE_NAME);
+        assert_eq!(lines[1].name, CDN_LINE_NAME);
+        assert!(warnings.is_empty());
     }
 
     #[test]

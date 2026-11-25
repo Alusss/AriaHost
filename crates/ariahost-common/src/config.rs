@@ -2,7 +2,8 @@
 //!
 //! ## 定版 schema
 //!
-//! 键名、分节与默认值**逐条照抄**架构 §4.11.1 的 52 键清单（`schema_version` 不计入）。
+//! 键名、分节与默认值**逐条照抄**架构 §4.11.1 的 52 键清单（`schema_version` 不计入）；
+//! M4-0 另加两键 `net.cdn_base` / `net.source_order`（同属 §4.11.1 的注），合计 54。
 //! 不在这里自创键名：改名等于迁移，必须有 §7-R 的裁决。
 //!
 //! ## 三条硬要求
@@ -156,6 +157,16 @@ pub struct NetSection {
     pub proxy: String,
     /// 面板文案必须写「内存缓存」（架构 §4.11 注释）。
     pub disk_cache: String,
+    /// 核心获取的 CDN 线路前缀（M4-0，定版新增键）。
+    ///
+    /// 空字符串 = **跳过 CDN 线路**（只用 `source_order` 里的其它线路）。
+    /// 只换 host 与前缀：资产名与 GitHub 官方完全同名，所以模板是 `{base}{asset}`。
+    pub cdn_base: String,
+    /// 核心获取的线路顺序（M4-0，定版新增键），逗号分隔的 `cdn` / `github`。
+    ///
+    /// 非法项会被丢弃并回退到默认 `cdn,github`，同时给一条可见告警
+    /// （见 `arihost-core` 的 [`crate::fetch::source_plan`]）。
+    pub source_order: String,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -400,6 +411,8 @@ impl Default for NetSection {
             max_tries: 5,
             proxy: String::new(),
             disk_cache: "16M".to_owned(),
+            cdn_base: "https://ah.335772.xyz/releases/".to_owned(),
+            source_order: "cdn,github".to_owned(),
             extra: Extra::new(),
         }
     }
@@ -1062,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_52_key_schema() {
+    fn defaults_match_the_schema_key_count_54() {
         let config = Config::default();
         assert_eq!(config.schema_version, SCHEMA_VERSION);
         assert_eq!(config.aria2.source, Aria2Source::Auto);
@@ -1089,6 +1102,9 @@ mod tests {
         assert_eq!(config.net.connect_timeout, 60);
         assert_eq!(config.net.max_tries, 5);
         assert_eq!(config.net.disk_cache, "16M");
+        // M4-0 两个新增键：CDN 前缀 + 线路顺序。
+        assert_eq!(config.net.cdn_base, "https://ah.335772.xyz/releases/");
+        assert_eq!(config.net.source_order, "cdn,github");
         assert_eq!(config.queue.max_concurrent, 5);
         assert_eq!(config.queue.max_download_result, 1000);
         assert!(config.queue.keep_unfinished_result);
@@ -1100,15 +1116,17 @@ mod tests {
         assert_eq!(config.lifecycle.quit_default, "pause");
     }
 
-    /// 架构 §4.11.1 的「计数断言」：序列化出来的叶子键必须正好 52 个。
+    /// 架构 §4.11.1 的「计数断言」：序列化出来的叶子键必须正好 54 个。
+    ///
+    /// 52（定版）+ `net.cdn_base` / `net.source_order`（M4-0 新增，见架构 §4.11.1 注）。
     #[test]
-    fn serialized_schema_has_exactly_52_leaf_keys() {
+    fn serialized_schema_has_exactly_54_leaf_keys() {
         let text = toml::to_string_pretty(&Config::default()).expect("序列化");
         let value: toml::Value = toml::from_str(&text).expect("回读");
         let mut count = 0usize;
         collect_leaf_keys(&value, &mut count);
-        // schema_version 不计入 52 键。
-        assert_eq!(count - 1, 52, "键数应与架构 §4.11.1 一致：\n{text}");
+        // schema_version 不计入键数。
+        assert_eq!(count - 1, 54, "键数应与架构 §4.11.1 一致：\n{text}");
     }
 
     fn collect_leaf_keys(value: &toml::Value, count: &mut usize) {

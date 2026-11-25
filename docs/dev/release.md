@@ -141,6 +141,22 @@ Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知
 
 改这条口径（尤其是去掉核心或去掉许可文件）**必须先确认**。
 
+### 7.1 在线下载线路（M4-0）
+
+随包分发覆盖了「装完即用」，但**在线获取仍然存在**（32 位、`--aria2-fetch`、核心缺失时的首次运行引导）。线路口径在 M4-0 定版：
+
+| 场景 | 顺序 | 依据 |
+|---|---|---|
+| 用户机（默认） | `cdn → github` | `net.source_order` 默认值；用户 CDN 在国内网络可达，直连 `release-assets.githubusercontent.com` 实测超时 |
+| CI / 测试 | `github → cdn` | `CI_SOURCE_ORDER` / `ci_lines()`；`release.yml` 自带核心的下载步骤写死 GitHub release URL（第 232 行），**不依赖 CDN** |
+
+URL 形态只有两种，不要混：
+
+- CDN 行：`<net.cdn_base><文件名>`（基址默认 `https://ah.335772.xyz/releases/`，`net.cdn_base = ""` 即跳过该行）；
+- 直连行：`{url}` 占位符替换成 GitHub 资产完整 URL；旧的「前缀 + 完整 URL」镜像模板保留在代码里（`DEFAULT_MIRROR_TEMPLATE`），但**不进默认顺序**（该镜像已整体 404）。
+
+哈希纪律（与随包分发同一套）：`KNOWN_SHA256` 锁死 **1.37.0 的 64 位与 32 位两个包**。命中则硬校验，不符即 `AH-E6003`，**且在装库之前失败**（旧版本原封不动）；没有已知哈希的版本走 `HashState::Unverified` + 一条进 `FetchOutcome::warnings` 的显式告警（UI 不得声称「已校验」），这是既定的诚实降级，**不要为了「看起来更严」去编造校验值**。新增线路或放宽哈希等于打开供应链口子，改之前必须确认。
+
 ## 8. 重发与回滚
 
 - tag 已存在时 `gh release create --verify-tag` 会失败：要改内容就编辑 Release / 重传附件，不要移动 tag。
