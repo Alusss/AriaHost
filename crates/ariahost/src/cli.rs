@@ -1054,7 +1054,16 @@ fn run_aria2_fetch(version: Option<&str>) -> i32 {
     };
 
     let store = ariahost_core::VersionStore::new(&dir);
-    let fetcher = ariahost_core::Fetcher::new();
+    // 线路顺序与 CDN 地址**来自配置**（task-75）：面板读 `config.net`，命令行也必须读同一份，
+    // 否则「设置里把 source_order 改成 github」之后 `--aria2-fetch` 仍走 CDN，行为对不上。
+    let fetcher = match ariahost_common::config::load() {
+        Ok(config) => ariahost_core::Fetcher::with_net(&config.net),
+        // 读不到配置不挡下载：退回产品默认（CDN → GitHub），但必须说出来。
+        Err(error) => {
+            eprintln!("警告：读配置失败，线路退回产品默认（CDN → GitHub）：{error}");
+            ariahost_core::Fetcher::new()
+        }
+    };
     match fetcher.fetch(&store, requested) {
         Ok(outcome) => {
             println!("已安装 aria2 {}（线路：{}）", outcome.version, outcome.line);
@@ -1068,6 +1077,10 @@ fn run_aria2_fetch(version: Option<&str>) -> i32 {
         Err(error) => {
             // Display 已带 `AH-Exxxx` 前缀。
             eprintln!("{error}");
+            // 失败路径没有 `warnings` 通道：线路配置本身的告警必须在这里补出来，不许吞。
+            for warning in fetcher.line_warnings() {
+                eprintln!("配置告警：{warning}");
+            }
             EXIT_ERR
         }
     }

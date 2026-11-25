@@ -6,10 +6,11 @@
 //! 主线程只 `try_recv` 事件。这与 M2-1 的 worker 是同一套模式。
 //!
 //! **复用而不是重写**：下载、sha256 校验、解压、切换 active、回滚指针，全在
-//! `ariahost_core::Fetcher::fetch` 里；**线路自动回退也在 core 里**
-//! （`download::default_lines` 直连优先、镜像其次，失败线路进 `FetchOutcome::warnings`，
-//! 全失败是 `AH-E6007`）。本模块只做两件事：决定**哪条线路排前面**、把结果翻译成事件。
-//! 这里**没有**第二份下载/校验/解压逻辑——那样将来必然与 core 漂移。
+//! `ariahost_core::Fetcher::fetch` 里；**线路与自动回退也在 core 里**
+//! （`download::lines_from` 按 `net.source_order` 排线路，失败线路进
+//! `FetchOutcome::warnings`，全失败是 `AH-E6007`）。本模块只做两件事：决定
+//! **哪条线路排前面**（M4-2 起这个选择只来自配置，见 [`LineChoice::from_net`]）、
+//! 把结果翻译成事件。这里**没有**第二份下载/校验/解压逻辑——那样将来必然与 core 漂移。
 //!
 //! # 进度与取消的诚实边界
 //!
@@ -36,42 +37,152 @@ use ariahost_common::paths::Plane;
 use ariahost_core::CREATE_NO_WINDOW;
 use ariahost_core::{CoreError, DownloadLine, Fetcher, HashState, HttpClient, VersionStore};
 
-/// 线路选择：**默认直连**（Q2 裁决；镜像 `r.alusss.cn` 是可选前缀，不当默认卖）。
+/// 一条**真实可用**的线路。
+///
+/// 只有这两种：core 的 [`ariahost_core::lines_from`] 也只认这两个关键字
+/// （`cdn` / `github`）。UI **不再自己拼 URL**，也不再出现 `r.alusss.cn` 或
+/// 「线路1 / 线路2」这类会与真实请求 host 对不上的说法。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineChoice {
-    /// 线路1：镜像前缀 `https://r.alusss.cn/`。
-    Line1,
-    /// 线路2：直连 GitHub（默认）。
-    Line2,
+pub enum LineKind {
+    /// 用户 CDN（`net.cdn_base`，默认 `https://ah.335772.xyz/releases/`）。
+    Cdn,
+    /// 官方 GitHub release 直连。
+    Github,
+}
+
+impl LineKind {
+    /// 与 core 的 `FetchOutcome::line` / `DownloadLine::name` **同一字面量**。
+    ///
+    /// 那两个常量是 core 的公开契约；名字对不上就等于把线路说错了。
+    fn from_core_name(name: &str) -> Option<Self> {
+        if name == ariahost_core::CDN_LINE_NAME {
+            Some(Self::Cdn)
+        } else if name == ariahost_core::DIRECT_LINE_NAME {
+            Some(Self::Github)
+        } else {
+            None
+        }
+    }
+
+    /// 用户看到的线路名：**必须能对上真实请求的 host**。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cdn => "CDN（ah.335772.xyz）",
+            Self::Github => "直连 GitHub（github.com）",
+        }
+    }
+}
+
+/// 引导页的线路集合：**来自 `config.net`**，不是 UI 自己编的。
+///
+/// 为什么不再用「线路1 / 线路2」枚举：`task-72` 之后线路顺序由
+/// `net.source_order` 决定，`net.cdn_base` 为空时 CDN 根本不参与。
+/// UI 若写死两条线路，就会在「只剩直连」的机器上给出一个并不存在的选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineChoice {
+    /// 首选线路（配置顺序里的第一条可用线路）。
+    primary: LineKind,
+    /// 备选（配置顺序里的第二条；只有一条可用线路时为 `None`）。
+    fallback: Option<LineKind>,
 }
 
 impl LineChoice {
-    /// 线路的中文说法。**用户看到的就是这个**，别在别处另写一套字面量。
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Line1 => "线路1（代理 r.alusss.cn）",
-            Self::Line2 => "线路2（直连 GitHub）",
-        }
-    }
-
-    /// 另一条线路（看门狗兜底的「换线路」用它）。
-    pub const fn other(self) -> Self {
-        match self {
-            Self::Line1 => Self::Line2,
-            Self::Line2 => Self::Line1,
-        }
-    }
-
-    /// 按本选择排出线路**优先顺序**：选中的那条在前，另一条作为自动回退。
+    /// 产品默认（`DEFAULT_SOURCE_ORDER = cdn,github` 的顺序）。
     ///
-    /// 回退本身由 core 完成；这里只是把顺序交给它。
-    fn lines(self) -> Vec<DownloadLine> {
-        let direct = DownloadLine::direct();
-        let mirror = DownloadLine::default_mirror();
-        match self {
-            Self::Line2 => vec![direct, mirror],
-            Self::Line1 => vec![mirror, direct],
+    /// 只作 `CoreGuide::new` 的占位；真正开工前由 [`Self::reconcile`] 按配置重算。
+    pub const DEFAULT: Self = Self {
+        primary: LineKind::Cdn,
+        fallback: Some(LineKind::Github),
+    };
+
+    /// 按配置算出可选线路：**唯一来源**是 core 的 [`ariahost_core::lines_from`]。
+    ///
+    /// 返回 `(线路集合, 配置告警)`。告警属于「配置没被完全照办」（非法关键字 /
+    /// 无可用线路而回退），必须进用户可见的日志，不许吞。
+    pub fn from_net(net: &ariahost_common::config::NetSection) -> (Self, Vec<String>) {
+        let (lines, warnings) = ariahost_core::lines_from(&net.source_order, &net.cdn_base);
+        let kinds: Vec<LineKind> = lines
+            .iter()
+            .filter_map(|line| LineKind::from_core_name(&line.name))
+            .collect();
+        let plan = match kinds.first() {
+            Some(&primary) => Self {
+                primary,
+                fallback: kinds.get(1).copied(),
+            },
+            // 理论上不可达（`lines_from` 至少回退直连）；保守退回直连并留痕。
+            None => Self {
+                primary: LineKind::Github,
+                fallback: None,
+            },
+        };
+        (plan, warnings)
+    }
+
+    /// 用户看到的（首选线路的）名字。
+    pub const fn label(self) -> &'static str {
+        self.primary.label()
+    }
+
+    /// 「换一条」时的目标；只有一条可用线路时返回自己。
+    ///
+    /// 那种情况下 `app.rs` 的「换 X 再试」按钮文案会与当前线路相同——它应当在
+    /// [`Self::has_alternative`] 为 `false` 时隐藏，那属于 `app.rs` 的一行改动，
+    /// 本批（写作用域不含 `app.rs`）不动，已在交付报告里点出。
+    pub const fn other(self) -> Self {
+        match self.fallback {
+            Some(fallback) => Self {
+                primary: fallback,
+                fallback: Some(self.primary),
+            },
+            None => self,
         }
+    }
+
+    /// 是否真有第二条线路可换（`app.rs` 可据此隐藏「换线路」按钮）。
+    ///
+    /// `allow(dead_code)` 的原因：目前只有单测在用它——产品侧接线（按钮显隐）要改
+    /// `app.rs`，而本批写作用域**不含** `app.rs`，已在交付报告里点出。接线落地后
+    /// 删掉这个标注（它是「待接线」的唯一痕迹，别让它悄悄变永久）。
+    #[allow(dead_code)]
+    pub const fn has_alternative(self) -> bool {
+        self.fallback.is_some()
+    }
+
+    /// 在有 `available` 这套线路的前提下尽量保留当前选择（看门狗「换线路」不被配置重置）。
+    pub fn reconcile(self, available: Self) -> Self {
+        let slots = [Some(available.primary), available.fallback];
+        if slots.contains(&Some(self.primary)) {
+            let fallback = slots
+                .into_iter()
+                .flatten()
+                .find(|kind| *kind != self.primary);
+            Self {
+                primary: self.primary,
+                fallback,
+            }
+        } else {
+            available
+        }
+    }
+
+    /// 按本选择排出线路**优先顺序**，并带回配置告警。
+    ///
+    /// 线路对象全部来自 `lines_from`（UI 不拼任何 URL），这里只做重排。
+    pub fn lines(
+        self,
+        net: &ariahost_common::config::NetSection,
+    ) -> (Vec<DownloadLine>, Vec<String>) {
+        let (mut lines, warnings) = ariahost_core::lines_from(&net.source_order, &net.cdn_base);
+        let rank = |name: &str| -> u8 {
+            match LineKind::from_core_name(name) {
+                Some(kind) if kind == self.primary => 0,
+                Some(kind) if Some(kind) == self.fallback => 1,
+                _ => 2,
+            }
+        };
+        lines.sort_by_key(|line| rank(&line.name));
+        (lines, warnings)
     }
 
     /// 把「实际命中的线路名」翻译成一句人话，并显式说出是否发生了回退。
@@ -81,10 +192,12 @@ impl LineChoice {
         let failed_first = warnings
             .iter()
             .any(|w| w.contains("失败") || w.contains("改用"));
+        let hit = LineKind::from_core_name(line)
+            .map_or_else(|| line.to_owned(), |kind| kind.label().to_owned());
         if failed_first {
-            format!("{} 失败，已自动改用「{line}」重试成功", self.label())
+            format!("{} 失败，已自动改用「{hit}」重试成功", self.primary.label())
         } else {
-            format!("由「{line}」提供")
+            format!("由「{hit}」提供")
         }
     }
 }
@@ -159,14 +272,14 @@ pub struct SetupWorker {
 }
 
 impl SetupWorker {
-    /// 在线安装（指定线路优先，另一条作为回退）。
-    pub fn online(line: LineChoice) -> Self {
+    /// 在线安装（按配置的线路顺序，首选在前、备选随后）。
+    pub fn online(plan: LineChoice) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         thread::Builder::new()
             .name("ariahost-core-setup".to_owned())
-            .spawn(move || run_online(line, &tx, &flag))
+            .spawn(move || run_online(plan, &tx, &flag))
             .ok();
         Self {
             rx,
@@ -223,7 +336,7 @@ pub fn user_store() -> Option<VersionStore> {
     ariahost_common::paths::versions_dir(Plane::User).map(VersionStore::new)
 }
 
-fn run_online(line: LineChoice, tx: &mpsc::Sender<SetupEvent>, cancel: &AtomicBool) {
+fn run_online(plan: LineChoice, tx: &mpsc::Sender<SetupEvent>, cancel: &AtomicBool) {
     let Some(store) = user_store() else {
         let _ = tx.send(SetupEvent::Failed {
             step: Step::Checking,
@@ -242,7 +355,20 @@ fn run_online(line: LineChoice, tx: &mpsc::Sender<SetupEvent>, cancel: &AtomicBo
     }
     let _ = tx.send(SetupEvent::Step(Step::Checking));
 
-    let fetcher = Fetcher::with_parts(HttpClient::new(), line.lines());
+    // 线路与回退**只**来自 `config.net`（经 core 的 `lines_from`），UI 不拼 URL。
+    // 读配置失败不该挡住装核心：退回产品默认线路，但把这件事如实记进告警。
+    let mut config_warnings = Vec::new();
+    let net = match config::load() {
+        Ok(config) => config.net,
+        Err(error) => {
+            config_warnings.push(format!("读配置失败，线路退回产品默认：{error}"));
+            ariahost_common::config::NetSection::default()
+        }
+    };
+    // 配置侧告警（非法关键字 / 无可用线路而回退）与下载阶段的线路失败一样必须可见。
+    let (lines, line_warnings) = plan.lines(&net);
+    config_warnings.extend(line_warnings);
+    let fetcher = Fetcher::with_parts(HttpClient::new(), lines);
 
     // Checking 与 Fetching 之间没有可观测边界：core 的 fetch 内部才拉版本目录。
     // 所以这里**连着发**，让 UI 立刻显示「下载并校验」——不许假装中间有进度。
@@ -261,7 +387,7 @@ fn run_online(line: LineChoice, tx: &mpsc::Sender<SetupEvent>, cancel: &AtomicBo
             let _ = tx.send(SetupEvent::Failed {
                 step: Step::Fetching,
                 message: error.to_string(),
-                hint: hint_for(&error),
+                hint: with_config_warnings(hint_for(&error), &config_warnings),
                 retry_with_other_line: matches!(
                     error,
                     CoreError::NetworkUnreachable { .. }
@@ -279,7 +405,7 @@ fn run_online(line: LineChoice, tx: &mpsc::Sender<SetupEvent>, cancel: &AtomicBo
         let _ = tx.send(SetupEvent::Online {
             version: outcome.version.to_string(),
             line: outcome.line.clone(),
-            warnings: outcome.warnings.clone(),
+            warnings: merged_warnings(&outcome.warnings, &config_warnings),
             exe: outcome.exe_path.clone(),
             hash_note: hash_note(&outcome.hash),
             bytes: None,
@@ -301,7 +427,7 @@ fn run_online(line: LineChoice, tx: &mpsc::Sender<SetupEvent>, cancel: &AtomicBo
     let _ = tx.send(SetupEvent::Online {
         version: outcome.version.to_string(),
         line: outcome.line.clone(),
-        warnings: outcome.warnings.clone(),
+        warnings: merged_warnings(&outcome.warnings, &config_warnings),
         exe: outcome.exe_path.clone(),
         hash_note: hash_note(&outcome.hash),
         bytes: None,
@@ -376,6 +502,22 @@ pub fn hint_for(error: &CoreError) -> String {
         CoreError::ExeInUse { .. } => "先把正在运行的 aria2c 停掉，再重试".to_owned(),
         CoreError::StoreIo { .. } => "检查版本库目录的写权限".to_owned(),
         _ => "稍后重试；如果一直不行，指定本地 aria2c 路径".to_owned(),
+    }
+}
+
+/// 成功时把**配置侧告警**排在下载侧告警前面（配置是「一开始就不对」，先看到它）。
+fn merged_warnings(download: &[String], config: &[String]) -> Vec<String> {
+    let mut out = config.to_vec();
+    out.extend(download.iter().cloned());
+    out
+}
+
+/// 失败时没有 `warnings` 通道，配置告警只能并进这一行——**不许吞**。
+fn with_config_warnings(hint: String, config: &[String]) -> String {
+    if config.is_empty() {
+        hint
+    } else {
+        format!("{hint}（另有配置告警：{}）", config.join("；"))
     }
 }
 
@@ -513,7 +655,7 @@ pub struct CoreGuide {
     pub open: bool,
     /// 用户选了「稍后再说」。
     pub dismissed: bool,
-    /// 当前选中的线路（默认直连）。
+    /// 当前选中的线路（初值是产品默认；[`Self::start_online`] 开工前按配置重算）。
     pub line: LineChoice,
     /// 当前步骤（卡片进度行用）。
     pub step: Step,
@@ -537,7 +679,7 @@ impl CoreGuide {
         Self {
             open: missing,
             dismissed: false,
-            line: LineChoice::Line2,
+            line: LineChoice::DEFAULT,
             step: Step::Checking,
             cancel_requested: false,
             slow: false,
@@ -588,6 +730,15 @@ impl CoreGuide {
         self.last_event_at = Instant::now();
         self.open = true;
         self.dismissed = false;
+        // 开工前按配置重算「有哪些线路可选」：改了 `net.source_order` 不必重启面板。
+        // 这里的告警不丢——后台线程会用同一份配置再算一次线路，并把它带进事件流。
+        let available = match config::load() {
+            Ok(config) => LineChoice::from_net(&config.net).0,
+            // 读不到配置不挡住开工：产品默认（CDN → GitHub）与 `NetSection::default()` 一致，
+            // 真实的读盘失败由后台线程记进告警。
+            Err(_) => LineChoice::DEFAULT,
+        };
+        self.line = self.line.reconcile(available);
         self.worker = Some(SetupWorker::online(self.line));
         true
     }
@@ -740,45 +891,133 @@ impl CoreGuide {
 mod tests {
     use super::*;
 
+    /// 产品默认（`cdn,github`）：CDN 首选、GitHub 备选，且文案对上真实 host。
     #[test]
-    fn line_choice_parses_and_labels() {
-        assert!(LineChoice::Line1.label().contains("线路1"));
-        assert!(LineChoice::Line2.label().contains("线路2"));
-        assert_eq!(LineChoice::Line1.other(), LineChoice::Line2);
+    fn plan_from_default_net_is_cdn_then_github() {
+        let net = ariahost_common::config::NetSection::default();
+        let (plan, warnings) = LineChoice::from_net(&net);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(plan.label(), LineKind::Cdn.label());
+        assert!(plan.label().contains("ah.335772.xyz"), "{}", plan.label());
+        assert!(plan.has_alternative());
+        assert_eq!(plan.other().label(), LineKind::Github.label());
+        // 「线路1 / 线路2」这类与真实请求对不上的说法必须绝迹。
+        assert!(!plan.label().contains("线路"), "{}", plan.label());
     }
 
-    /// 默认必须是直连优先（Q2 裁决），镜像只作回退。
+    /// 用户把 `net.source_order` 改成 `github` 就只剩一条线路——UI 不许再给「换线路」。
     #[test]
-    fn default_line_is_direct_first() {
-        let lines = LineChoice::Line2.lines();
+    fn plan_without_cdn_has_no_alternative() {
+        let net = ariahost_common::config::NetSection {
+            source_order: "github".to_owned(),
+            ..ariahost_common::config::NetSection::default()
+        };
+        let (plan, warnings) = LineChoice::from_net(&net);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(plan.label(), LineKind::Github.label());
+        assert!(!plan.has_alternative());
+        assert_eq!(plan.other(), plan, "没有备选时「换一条」只能返回自己");
+    }
+
+    /// `net.cdn_base = ""` 等同禁用 CDN（core 的 `lines_from` 就是这么做的）。
+    #[test]
+    fn empty_cdn_base_removes_the_cdn_line() {
+        let net = ariahost_common::config::NetSection {
+            source_order: "cdn,github".to_owned(),
+            cdn_base: String::new(),
+            ..ariahost_common::config::NetSection::default()
+        };
+        let (plan, _warnings) = LineChoice::from_net(&net);
+        assert_eq!(plan.label(), LineKind::Github.label());
+        assert!(!plan.has_alternative());
+    }
+
+    /// 非法关键字必须变成**用户可见**的告警，同时线路回退到直连。
+    #[test]
+    fn invalid_order_keyword_is_reported_not_swallowed() {
+        let net = ariahost_common::config::NetSection {
+            source_order: "mirror,github".to_owned(),
+            ..ariahost_common::config::NetSection::default()
+        };
+        let (plan, warnings) = LineChoice::from_net(&net);
+        assert_eq!(plan.label(), LineKind::Github.label());
+        assert!(!warnings.is_empty(), "非法关键字必须留告警");
+        assert!(
+            warnings.iter().any(|w| w.contains("mirror")),
+            "{warnings:?}"
+        );
+    }
+
+    /// 实际下发的线路对象来自 core（模板里带 CDN base / `{url}`），UI 不拼 URL。
+    #[test]
+    fn lines_come_from_config_and_put_primary_first() {
+        let net = ariahost_common::config::NetSection::default();
+        let (plan, _) = LineChoice::from_net(&net);
+        let (lines, warnings) = plan.lines(&net);
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].name, ariahost_core::DIRECT_LINE_NAME);
-        assert_eq!(lines[1].name, ariahost_core::MIRROR_LINE_NAME);
-        assert!(lines[1].has_placeholder(), "镜像模板必须带 {{url}}");
+        assert_eq!(lines[0].name, ariahost_core::CDN_LINE_NAME);
+        assert!(
+            lines[0].template.contains(&net.cdn_base),
+            "{}",
+            lines[0].template
+        );
+        assert_eq!(lines[1].name, ariahost_core::DIRECT_LINE_NAME);
+        assert!(lines[1].template.contains("{url}"), "{}", lines[1].template);
+
+        // 选了 GitHub 之后顺序反过来（CDN 仍留着当备选）。
+        let (flipped, _) = plan.other().lines(&net);
+        assert_eq!(flipped[0].name, ariahost_core::DIRECT_LINE_NAME);
+        assert_eq!(flipped[1].name, ariahost_core::CDN_LINE_NAME);
     }
 
-    /// 选线路1 时镜像排前，但直连仍在（否则没有回退）。
+    /// 看门狗「换线路」不能被下一轮配置重算抹掉。
     #[test]
-    fn choosing_mirror_keeps_direct_as_fallback() {
-        let lines = LineChoice::Line1.lines();
-        assert_eq!(lines[0].name, ariahost_core::MIRROR_LINE_NAME);
-        assert_eq!(lines[1].name, ariahost_core::DIRECT_LINE_NAME);
+    fn reconcile_keeps_the_user_choice_while_available() {
+        let net = ariahost_common::config::NetSection::default();
+        let (available, _) = LineChoice::from_net(&net);
+        let chosen = available.other();
+        let kept = chosen.reconcile(available);
+        assert_eq!(kept.label(), LineKind::Github.label());
+
+        // 换到只剩直连的机器上：选择必须被纠正，而不是继续指向不存在的 CDN。
+        let single = LineChoice {
+            primary: LineKind::Github,
+            fallback: None,
+        };
+        let corrected = chosen.reconcile(single);
+        assert_eq!(corrected.label(), LineKind::Github.label());
+        assert!(!corrected.has_alternative());
     }
 
     /// 回退必须在文案里说出来，不能只写「由 X 提供」。
     #[test]
     fn fallback_is_spelled_out() {
-        let note = LineChoice::Line2.describe_hit(
-            ariahost_core::MIRROR_LINE_NAME,
-            &["线路「直连 GitHub」失败：连接超时".to_owned()],
+        let note = LineChoice::DEFAULT.describe_hit(
+            ariahost_core::DIRECT_LINE_NAME,
+            &["线路「CDN ah.335772.xyz」失败：连接超时".to_owned()],
         );
         assert!(note.contains("失败"), "{note}");
         assert!(note.contains("已自动改用"), "{note}");
-        assert!(note.contains(ariahost_core::MIRROR_LINE_NAME), "{note}");
+        assert!(note.contains(LineKind::Github.label()), "{note}");
 
-        let clean = LineChoice::Line2.describe_hit(ariahost_core::DIRECT_LINE_NAME, &[]);
+        let clean = LineChoice::DEFAULT.describe_hit(ariahost_core::CDN_LINE_NAME, &[]);
         assert!(!clean.contains("失败"), "{clean}");
-        assert!(clean.contains(ariahost_core::DIRECT_LINE_NAME), "{clean}");
+        assert!(clean.contains(LineKind::Cdn.label()), "{clean}");
+    }
+
+    /// 配置告警不许被下载告警挤掉，也不许在失败路径上消失。
+    #[test]
+    fn config_warnings_survive_both_paths() {
+        let merged = merged_warnings(&["下载告警".to_owned()], &["配置告警".to_owned()]);
+        assert_eq!(merged, vec!["配置告警", "下载告警"]);
+
+        let hint = with_config_warnings("重试即可".to_owned(), &[]);
+        assert_eq!(hint, "重试即可");
+
+        let hint = with_config_warnings("重试即可".to_owned(), &["配置告警".to_owned()]);
+        assert!(hint.contains("重试即可"), "{hint}");
+        assert!(hint.contains("配置告警"), "{hint}");
     }
 
     /// `Unverified` 绝不能说成「已校验」。
@@ -855,10 +1094,10 @@ mod tests {
         let mut guide = CoreGuide::new(true);
         guide.request_cancel(); // 没任务时是空操作
         assert!(!guide.cancel_requested);
-        assert_eq!(guide.line, LineChoice::Line2);
+        assert_eq!(guide.line, LineChoice::DEFAULT);
         // 正式开工会起线程；这里只验线路切换本身（不调 switch_line，避免真联网）。
         guide.line = guide.line.other();
-        assert_eq!(guide.line, LineChoice::Line1);
+        assert_eq!(guide.line, LineChoice::DEFAULT.other());
     }
 
     #[test]
