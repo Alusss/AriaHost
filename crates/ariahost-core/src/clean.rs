@@ -17,7 +17,7 @@
 //! | 枚举 | 是什么 | 判定 |
 //! |---|---|---|
 //! | `OrphanControlFile` | 下载目录里的孤儿 `*.aria2` | 见该变体文档的判定表（**最容易写错的一类**） |
-//! | `RotatedLog` | 超出 `clean.log_keep_files` 的 `*.log.N` | 轮转序号 > 保留份数 |
+//! | `RotatedLog` | 超出 `clean.log_keep_files` 的 `*.log.N` | 轮转序号 >= 保留份数（份数含当前文件） |
 //! | `AbandonedVersion` | 版本库里既非 `active` 也非 `previous` 的版本目录 | **结构性判定**，不使用天数阈值 |
 //! | `StaleStaging` | 安装残渣 `.staging-<ver>-<pid>-<seq>` | mtime 超 1 小时 **且** 目录名里的 pid 不存活 |
 //! | `TmpFile` | `tmp\` 下 mtime 超 24 小时的文件 | [`TMP_MAX_AGE_HOURS`]（**本版不可配**） |
@@ -120,7 +120,10 @@ pub enum CleanTarget {
     OrphanControlFile,
     /// 超出 `clean.log_keep_files` 份数的轮转日志（`*.log.N`）。
     ///
-    /// 只有序号 > 保留份数的才会被选中；`.log.1..=keep` 与当前 `*.log` 都保留。
+    /// `log_keep_files` 是**总文件数**（当前 `*.log` + 轮转文件），所以保留 `.log.1..=keep-1`，
+    /// 序号 >= keep 的都是超出份数。这样 `clean.log_max_size_mb × clean.log_keep_files`
+    /// 就是该类日志的磁盘上限（默认 10 MB × 5 = 50 MB）——口径必须唯一，
+    /// 否则这个乘法对不上。
     RotatedLog,
     /// 版本库里既非 `active` 也非 `previous` 的版本目录。
     ///
@@ -1008,7 +1011,8 @@ fn scan_logs(
         let Some(index) = rotated_index(&name) else {
             continue;
         };
-        if index <= keep_files {
+        // keep_files 是总份数（含当前 *.log），所以序号 >= keep_files 的轮转文件都超出。
+        if index < keep_files {
             continue;
         }
         let path = entry.path();
@@ -1021,7 +1025,7 @@ fn scan_logs(
             &path,
             meta.len(),
             meta.modified().ok(),
-            "轮转序号超出 clean.log_keep_files",
+            "轮转序号已达 clean.log_keep_files（总份数上限）",
         );
     }
 }
@@ -1653,11 +1657,16 @@ mod tests {
             ..ScanRoots::default()
         };
         let report = scan(&context(&live, roots, limits()));
+        // 总份数 = 5（当前 ariahost.log + .1..=4），所以 .5/.6/.7 超出。
         assert_eq!(
             item_names(&report, CleanTarget::RotatedLog),
-            vec!["ariahost.log.6".to_owned(), "ariahost.log.7".to_owned()]
+            vec![
+                "ariahost.log.5".to_owned(),
+                "ariahost.log.6".to_owned(),
+                "ariahost.log.7".to_owned()
+            ]
         );
-        assert_eq!(report.summary(CleanTarget::RotatedLog).bytes, 200);
+        assert_eq!(report.summary(CleanTarget::RotatedLog).bytes, 300);
     }
 
     #[test]
@@ -1675,9 +1684,14 @@ mod tests {
         let mut limits = limits();
         limits.log_keep_files = 2;
         let report = scan(&context(&live, roots, limits));
+        // keep_files = 2 → 总份数 2（当前 + .1），所以 .2/.3/.4 全部超出。
         assert_eq!(
             item_names(&report, CleanTarget::RotatedLog),
-            vec!["aria2.log.3".to_owned(), "aria2.log.4".to_owned()]
+            vec![
+                "aria2.log.2".to_owned(),
+                "aria2.log.3".to_owned(),
+                "aria2.log.4".to_owned()
+            ]
         );
     }
 
