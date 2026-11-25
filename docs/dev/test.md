@@ -258,4 +258,16 @@ Get-Counter '\Process(ariahost)\Working Set - Private'
 
 **实例（task-58，2026-11-25）**：原判据 2 是「用 `--panel-selftest` 跑一次，再检查落盘日志」。但 `--panel-selftest` **有意不落盘**（`cli::inits_file_log` 只对 `Panel | Service` 返回真）——这是**安全不变量**：并发 CI 自检会互踩同一个日志文件，短命自检会污染用户日志。替代证据拆成两条：`--log-selftest --dir <隔离目录>` 验写入器与脱敏（exit 0、500 行、`leak=false`、落盘可见 `token:***`）；真面板（隔离 `APPDATA`、45 s）验探针轨迹上盘 + 写盘有界。**替代证据比原判据更强**：原判据只要求「轨迹在文件里」，后一条还证明「日志不会把磁盘写爆」（30 s 只多 2 行，每帧写则约 1800 行）。逐项账见 `build.md` §4.4。
 
+### 6.12 退出有两条路径，并发时靠「幂等 + 单点 exit」而不是靠互斥
+
+`--quit` 的收尾有两条路：**帧路径**（`draw()` 消费 `take_quit_request()` 后停核心、关窗）与**兜底路径**（ctl 线程等 2s 没等到消费就自己收尾）。两者**可能同时命中**——最典型的是取证开关 `ARIAHOST_QUIT_SIMULATE=fallback`（旧名 `ARIAHOST_QUIT_FALLBACK_SIMULATE=1` 仍兼容）：它短路的是「那 2s 等待」，不是「让 UI 永不出帧」，所以日志里会**同时**出现兜底段与 `走退出档`。
+
+看到双份日志**不是竞态**，别当 bug 修。语义是：
+
+- `CoreRuntime::stop` **幂等**：第二次调用看到已停止就直接返回，不会二次 `save session`、不会二次 kill；
+- `exit(0)` **只由兜底路径负责**（帧路径只在没有兜底时才会走到 `ViewportCommand::Close`），所以进程退出既不会被提前掐断，也不会有人替它决定退出码；
+- **会话不丢**：兜底走的是同一条 `CoreRuntime::stop`（三段优雅停止），不是 `kill`。
+
+生产路径下两者**不会**并发：兜底只在「2s 内没人消费」时触发，而那意味着帧路径没在跑。所以这条只影响取证，不影响用户。
+
 ---
