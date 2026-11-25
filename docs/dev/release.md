@@ -115,6 +115,24 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 
 编译通过不等于能装：**必须在干净虚拟机（无管理员、无已有安装）实测**，见 `docs/dev/test.md` 验收 #1–#3。
 
+### 5.2 makensis 从哪来（两条线路，2026-11-26 定）
+
+历史：`v0.1.3` 的第一次发布 **两条腿同时红在「安装 NSIS」这一步**，上游是 `community.chocolatey.org` 先 503 再 504。红点在整条 Windows 编译**之后**——私有仓按 2× 分钟计费，等于一次上游抖动烧掉两轮全量编译。现在的顺序是三条，前两条都不依赖 chocolatey.org：
+
+| 顺序 | 来源 | 失败即转下一条 | 证据 |
+|---|---|---|---|
+| 1 | `actions/cache`（键 `nsis-3.13.0-<os>`，缓存目录 `C:\Program Files (x86)\NSIS`） | 未命中 | 命中时零网络 |
+| 2 | **SourceForge 官方便携 zip**：`https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13.zip`，钉 SHA-256 `ba63dffc…b3d8` | 下载失败 / 哈希不符（各重试 2 次） | 本机实测：`curl -L` exit 0、2,363,925 B、哈希一致、解包树含 `Bin/`+`Stubs/`+`Include/`、用它编出 6,334,401 B 安装包 |
+| 3 | `choco install nsis --version=3.13.0`（钉版本 + 10/30/60 s 三次退避） | 三次全败 → 本步 fail-closed | 2026-11-26 实测可恢复 |
+
+**三个坑，都别再踩**（本机实测，不是推断）：
+
+1. **便携包的 `Bin\makensis.exe` 没有版本资源**：`VersionInfo.FileVersion` 与 `ProductVersion` 都是空。原先「读 FileVersion 断言 3.13」的写法在便携包上会**假红**。现在以 `makensis /VERSION` 的运行时输出（`v3.13`）为主判据，FileVersion 仅兜底。
+2. **不要把 `Bin\makensis.exe` 挪到安装根**去凑 choco 的布局：实测以 `0xC0000135`（`STATUS_DLL_NOT_FOUND`）退出。便携包必须整树落地，`makensis` 留在 `Bin\` 下；根的 2.5 KB `makensis.exe` 是官方转发器，`/VERSION` 正常，但**不要指望它能编译**。所以「找 makensis」的候选列表要同时认 `\NSIS\Bin\makensis.exe`（便携布局）与 `\NSIS\makensis.exe`（choco 布局）。
+3. **本地跑 makensis 必须把 `TMP`/`TEMP` 指到工作区内**：本仓的取证 shell 在沙箱里，`%TEMP%` 下的写入/mmap 会被拒，makensis 报的是 `Internal compiler error #12345: error creating mmap the size of NNNNN` 或 `Can't open output file`——看起来像 makensis 的 bug，其实是环境。见 `.scratch/m4/local-nsis-gate.ps1`（跑之前先设 `$env:TEMP`）。
+
+同理，**两份 workflow 的 pwsh 内联脚本在推送前必须做语法检查**：`.scratch/m4/psblocks/` 这套做法是先用 PyYAML 把所有 `shell: pwsh` 的 `run:` 抽出来，把 `${{ … }}` 替换成占位符，再用 `[Parser]::ParseInput` 过一遍（2026-11-26 实测 14 块全过）。`${{ }}` 不替换会必然假红。
+
 ## 6. 代码签名（首版不启用）
 
 Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知发布者」。启用步骤（`release.yml` 已有占位步骤，`if: env.SIGN_CERT != ''`）：
