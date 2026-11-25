@@ -23,6 +23,7 @@ mod instance;
 mod logbuf;
 mod metrics;
 mod tasks;
+mod tray;
 mod view;
 mod window;
 mod worker;
@@ -45,6 +46,106 @@ pub use worker::{
 
 /// 面板单实例已被占用时的提示（中文，退出码 [`EXIT_ERR`]）。
 pub const DUPLICATE_INSTANCE_HINT: &str = "AriaHost 面板已在运行，本次不再重复开窗。";
+
+/// 「在浏览器打开」的注入点：由 bin 提供实现（ui 不链 ariahost-web）。
+///
+/// 返回网页管理页的 URL；失败给一句人话原因（面板会按 `AH-E3001` 上屏）。
+pub type OpenWebFn = Box<dyn Fn() -> Result<String, String> + Send + Sync>;
+
+/// 点 X 时的三档行为（配置 `ui.close_action`，架构 §4.11 第 37 项：`tray | ask | exit`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// 隐藏到托盘，不退出（默认）。
+    Tray,
+    /// 面板内对话框询问。
+    Ask,
+    /// 直接退出（按退出流程处理 aria2）。
+    Exit,
+}
+
+impl CloseAction {
+    /// 按配置字符串解析；非法值退回默认 `tray`（不因为一个拼错的值让面板关不掉）。
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ask" => Self::Ask,
+            "exit" => Self::Exit,
+            _ => Self::Tray,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tray => "tray",
+            Self::Ask => "ask",
+            Self::Exit => "exit",
+        }
+    }
+}
+
+/// 面板行为偏好（从 `config.toml` 的 `[ui]`/`[web]` 读；读不到就用默认值）。
+///
+/// 说明：`ui.quit_stops_aria2` 在定版 schema（52 项）里**没有**这个键，按需求第 7 条
+/// 「退出时承诺不中断下载」的口径固定为「先优雅停止、再退出」；是否真退出由
+/// [`CloseAction`] 决定，所以不需要自造配置键。
+#[derive(Debug, Clone)]
+pub struct UiPrefs {
+    /// 点 X 的行为。
+    pub close_action: CloseAction,
+    /// 网页管理页端口（`web.port`，默认 6875）。
+    pub web_port: u16,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            close_action: CloseAction::Tray,
+            web_port: 6875,
+        }
+    }
+}
+
+impl UiPrefs {
+    /// 读配置；任何失败都退回默认值并写日志（面板行为不该因为配置坏了就失灵）。
+    pub fn load(log: &LogBuffer) -> Self {
+        match ariahost_common::config::load() {
+            Ok(config) => {
+                let action = CloseAction::parse(&config.ui.close_action);
+                log.push(format!(
+                    "界面行为：关闭动作 {}（ui.close_action）、网页端口 {}（web.port）",
+                    action.as_str(),
+                    config.web.port
+                ));
+                Self {
+                    close_action: action,
+                    web_port: config.web.port,
+                }
+            }
+            Err(error) => {
+                log.push(format!("读取界面行为失败：{error}（用默认值）"));
+                Self::default()
+            }
+        }
+    }
+
+    /// 把「记住我的选择」写回 `ui.close_action`（失败只记日志，不打断退出）。
+    pub fn remember_close_action(&self, action: CloseAction, log: &LogBuffer) {
+        let mut config = match ariahost_common::config::load() {
+            Ok(config) => config,
+            Err(error) => {
+                log.push(format!("记住关闭选择失败（配置读取）：{error}"));
+                return;
+            }
+        };
+        config.ui.close_action = action.as_str().to_owned();
+        match ariahost_common::config::save(&config) {
+            Ok(()) => log.push(format!(
+                "已记住关闭选择：ui.close_action = {}",
+                action.as_str()
+            )),
+            Err(error) => log.push(format!("记住关闭选择失败（配置保存）：{error}")),
+        }
+    }
+}
 
 /// wgpu 设备的 `max_texture_dimension_2d`（交换链/窗口物理像素的上限）。
 ///
@@ -96,8 +197,8 @@ pub const DEFAULT_SELFTEST_FRAMES: u32 = 120;
 pub const MAX_SEED_ROWS: usize = 5000;
 
 /// 启动面板（无参数入口）；返回进程退出码。
-pub fn run_panel(backend: Backend) -> i32 {
-    run(None, None, backend, None)
+pub fn run_panel(backend: Backend, open_web: Option<OpenWebFn>) -> i32 {
+    run(None, None, backend, None, open_web)
 }
 
 /// `--panel-selftest [--frames N] [--size WxH] [--backend ...] [--seed-rows N]`：
@@ -112,7 +213,7 @@ pub fn run_selftest(
     backend: Backend,
     seed_rows: Option<usize>,
 ) -> i32 {
-    run(Some(frames), size, backend, seed_rows)
+    run(Some(frames), size, backend, seed_rows, None)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。
@@ -121,6 +222,7 @@ fn run(
     requested_size: Option<(u32, u32)>,
     backend: Backend,
     seed_rows: Option<usize>,
+    open_web: Option<OpenWebFn>,
 ) -> i32 {
     let log = Arc::new(LogBuffer::new());
     log.push(format!(
@@ -196,6 +298,13 @@ fn run(
         }
     };
 
+    // 界面行为（关闭三档 / 网页端口）：自测与灌行模式不读配置，用默认值。
+    let prefs = if selftest_frames.is_none() && seed_rows.is_none() {
+        UiPrefs::load(&log)
+    } else {
+        UiPrefs::default()
+    };
+
     let options = native_options(&log, backend, saved_geometry);
     let facts = Arc::new(Mutex::new(RuntimeFacts::default()));
     let app_log = Arc::clone(&log);
@@ -218,6 +327,8 @@ fn run(
                     seed_rows,
                     setup,
                     worker_options,
+                    prefs,
+                    open_web,
                 },
             );
             Ok(Box::new(panel))

@@ -19,5 +19,7 @@ winresource = "0.1"
 ariahost-common = { path = "../ariahost-common" }
 ariahost-core = { path = "../ariahost-core" }
 ariahost-svc = { path = "../ariahost-svc" }
+# M2-3：`--web-selftest` 接 M2-5 的网页管理页自检（同仓 path 依赖）。
+ariahost-web = { path = "../ariahost-web" }
 # 面板入口：M2 起「无参数启动」真的开窗（含 --panel-selftest 隐藏自测入口）。
 ariahost-ui = { path = "../ariahost-ui" }

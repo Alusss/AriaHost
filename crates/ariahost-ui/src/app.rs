@@ -32,6 +32,7 @@ use crate::worker::{
     self, ActionOutcome, AddOutcome, Aria2Update, ServiceSnapshot, TaskRequest, Worker,
     WorkerOptions,
 };
+use crate::{CloseAction, UiPrefs};
 
 /// 请求窗口尺寸后最多尝试多少帧（约 3 秒 @60fps）；超过就放弃并把 `ok=0`。
 const MAX_SIZE_ATTEMPTS: u32 = 200;
@@ -42,6 +43,9 @@ const SIZE_TOLERANCE: i64 = 2;
 /// 空闲时的重绘周期：worker 是 `mpsc`，没有事件能唤醒 egui，所以只能定时轮询一次
 /// 「通道里有没有新结果」。500ms 足够跟手（刷新本身是 2s 一次），又不会烧 CPU。
 const IDLE_REPAINT: Duration = Duration::from_millis(500);
+
+/// 退出流程的总兜底时间（停止链自身有 15s+10s 两段超时，再加余量）。
+const QUIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 忙态的重绘周期（启动/停止/行操作期间）。
 ///
@@ -141,6 +145,20 @@ struct Optimistic {
 }
 
 /// 建面板所需的一切（参数多到必须打包，`too_many_arguments` 会让 CI 的 clippy 失败）。
+/// 退出流程状态。
+struct QuitFlow {
+    started: Instant,
+    /// 为真 = 退出时不停 aria2（让它继续下载）。
+    keep_running: bool,
+}
+
+/// 「ask」档的面板内关闭对话框状态。
+#[derive(Debug, Clone, Copy)]
+struct ClosePrompt {
+    /// 「记住我的选择」复选框。
+    remember: bool,
+}
+
 pub struct PanelInit {
     /// 内部日志环。
     pub log: Arc<LogBuffer>,
@@ -162,6 +180,10 @@ pub struct PanelInit {
     pub setup: Option<core_host::HostSetup>,
     /// worker 参数（端口 / secret / 刷新间隔）。
     pub worker_options: WorkerOptions,
+    /// 界面行为（关闭三档 / 网页端口）。
+    pub prefs: UiPrefs,
+    /// 「在浏览器打开」的注入实现（`None` = 本构建没有网页管理页）。
+    pub open_web: Option<crate::OpenWebFn>,
 }
 
 /// 面板状态。
@@ -235,6 +257,24 @@ pub struct PanelApp {
     geometry_restored: bool,
     /// `--seed-rows N`：自测假数据行数（`None` = 正常模式）。
     seed_rows: Option<usize>,
+    /// 界面行为偏好（关闭三档 / 网页端口）。
+    prefs: UiPrefs,
+    /// 托盘句柄（仅 Windows；建失败为 `None`，面板照常开）。
+    tray: Option<crate::tray::Tray>,
+    /// 托盘只尝试建一次（失败不要每帧重试）。
+    tray_tried: bool,
+    /// 面板窗口当前是否被藏到托盘（左键切换用）。
+    window_hidden: bool,
+    /// 退出流程（`Some` = 正在「保存会话并停止」）。
+    quit: Option<QuitFlow>,
+    /// 「ask」档的面板内关闭对话框。
+    close_prompt: Option<ClosePrompt>,
+    /// 启动时检测到的未完成任务数（信息条用；`None` = 不显示）。
+    session_pending: Option<usize>,
+    /// 「在浏览器打开」的注入回调（由 bin 提供：只有它链着 ariahost-web/rustls）。
+    open_web: Option<crate::OpenWebFn>,
+    /// 退出流程已经决定关窗：本帧要抢在 `Close` 生效前把窗口几何写盘。
+    quit_save_pending: bool,
 }
 
 impl PanelApp {
@@ -251,6 +291,8 @@ impl PanelApp {
             seed_rows,
             setup,
             worker_options,
+            prefs,
+            open_web,
         } = init;
 
         let font = crate::fonts::install(&cc.egui_ctx, &log);
@@ -387,6 +429,15 @@ impl PanelApp {
             geometry_checks: 0,
             geometry_restored: saved_geometry.is_some(),
             seed_rows,
+            prefs,
+            tray: None,
+            tray_tried: false,
+            window_hidden: false,
+            quit: None,
+            close_prompt: None,
+            session_pending: None,
+            open_web,
+            quit_save_pending: false,
         }
     }
 
@@ -395,6 +446,210 @@ impl PanelApp {
         self.seed_rows.is_some()
     }
 
+    /// 纯自测模式（`--panel-selftest`）：不建托盘、不拦关窗、不读 session。
+    fn selftest_mode(&self) -> bool {
+        self.selftest_frames.is_some()
+    }
+
+    /// 托盘：建一次（失败不重试），每帧同步菜单启用状态并取事件。
+    fn pump_tray(&mut self, ctx: &egui::Context) {
+        if self.seed_mode() || self.selftest_mode() {
+            return;
+        }
+        if !self.tray_tried {
+            self.tray_tried = true;
+            self.tray = crate::tray::Tray::new(&self.log);
+        }
+        let Some(tray) = self.tray.as_mut() else {
+            return;
+        };
+        tray.set_state(self.core.is_running(), self.core.is_busy());
+        let actions = tray.poll();
+        for action in actions {
+            self.log
+                .push(format!("托盘：{}", crate::tray::TrayAction::label(action)));
+            match action {
+                crate::tray::TrayAction::ToggleWindow => {
+                    let hidden = self.window_hidden;
+                    self.set_window_hidden(ctx, !hidden);
+                }
+                crate::tray::TrayAction::ShowWindow => self.set_window_hidden(ctx, false),
+                crate::tray::TrayAction::Start => self.request_core_start(),
+                crate::tray::TrayAction::Stop => self.request_core_stop(),
+                crate::tray::TrayAction::OpenWeb => self.open_web_page(),
+                crate::tray::TrayAction::Quit => self.begin_quit(ctx, false),
+            }
+        }
+    }
+
+    /// 显示/隐藏面板窗口（托盘左键与菜单「显示面板」共用）。
+    fn set_window_hidden(&mut self, ctx: &egui::Context, hidden: bool) {
+        self.window_hidden = hidden;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(!hidden));
+        if !hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if hidden {
+            self.notify("已最小化到托盘（左键托盘图标可再打开）");
+        }
+    }
+
+    /// 启动核心（按钮/托盘的公共入口）。
+    fn request_core_start(&mut self) {
+        match &self.host {
+            Some(host) => {
+                host.start();
+                self.busy_since = Some(Instant::now());
+                self.banner = None;
+            }
+            None => self.set_banner(Banner::new(
+                Tone::Bad,
+                "当前是自测模式（--seed-rows），没有连接 aria2 核心。",
+            )),
+        }
+    }
+
+    /// 停止核心（按钮/托盘/退出流程的公共入口）。
+    fn request_core_stop(&mut self) {
+        if let Some(host) = &self.host {
+            host.stop();
+            self.busy_since = Some(Instant::now());
+            self.banner = None;
+        }
+    }
+
+    /// 开始退出流程：先优雅停止 aria2（实测约 4 秒），停完再关窗。
+    ///
+    /// `keep_running = true` 用于「退出但让 aria2 继续下载」（本批默认不提供该档，
+    /// 由配置 `ui.close_action` 三档决定，保留参数是为了将来加键时不改调用点）。
+    fn begin_quit(&mut self, ctx: &egui::Context, keep_running: bool) {
+        if self.quit.is_some() {
+            return;
+        }
+        if !keep_running && self.host.is_some() && !self.core.is_stopped() {
+            self.request_core_stop();
+        }
+        self.log.push(if keep_running {
+            "退出：按配置不停 aria2（让它继续在后台下载）".to_owned()
+        } else {
+            format!(
+                "退出：先优雅停止 aria2（约需 {} 秒），停完再关面板",
+                core_host::STOP_EXPECTED_SECS
+            )
+        });
+        self.quit = Some(QuitFlow {
+            started: Instant::now(),
+            keep_running,
+        });
+        self.close_prompt = None;
+        // 退出流程要立刻出一帧，否则用户看到的是「点了没反应」。
+        ctx.request_repaint();
+    }
+
+    /// 退出流程推进：核心停了（或超时兜底）就真的关窗。
+    fn pump_quit(&mut self, ctx: &egui::Context) {
+        let Some(flow) = &self.quit else {
+            return;
+        };
+        let elapsed = flow.started.elapsed();
+        let stopped = flow.keep_running || self.core.is_stopped();
+        // 兜底：停止链本身有 15s+10s 的两段超时，再加 5s 余量后无论如何都关窗。
+        let timed_out = elapsed > QUIT_TIMEOUT;
+        if stopped || timed_out {
+            if timed_out && !stopped {
+                self.log.push(format!(
+                    "退出：等待停止超时（{:.1}s），强制关窗（孤儿由 Job Object 兜底）",
+                    elapsed.as_secs_f32()
+                ));
+            }
+            self.quit = None;
+            // 先让本帧把几何写盘，再关窗：退出后不该丢窗口位置。
+            self.quit_save_pending = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        // 停止过程中持续出帧：既显示「正在保存会话并停止…」，也让忙态计数器走字。
+        ctx.request_repaint_after(BUSY_REPAINT);
+    }
+
+    /// 点 X 的处理（三档；自测与灌行模式直接放行）。
+    fn pump_close(&mut self, ctx: &egui::Context) {
+        if self.selftest_mode() || self.seed_mode() || self.quit.is_some() {
+            return;
+        }
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        // 先撤销本次关闭，改由三档策略决定（进程内对话框也不能靠系统 MessageBox）。
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        match self.prefs.close_action {
+            CloseAction::Tray => {
+                self.log
+                    .push("关闭请求：ui.close_action = tray → 隐藏到托盘".to_owned());
+                self.set_window_hidden(ctx, true);
+            }
+            CloseAction::Exit => {
+                self.log
+                    .push("关闭请求：ui.close_action = exit → 直接退出".to_owned());
+                self.begin_quit(ctx, false);
+            }
+            CloseAction::Ask => {
+                self.log
+                    .push("关闭请求：ui.close_action = ask → 面板内询问".to_owned());
+                self.close_prompt = Some(ClosePrompt { remember: false });
+            }
+        }
+    }
+
+    /// 启动检测：`session\aria2.session` 非空 → 顶部信息条（不是弹窗）。
+    fn detect_pending_session(&mut self) {
+        if self.seed_mode() || self.selftest_mode() || self.session_pending.is_some() {
+            return;
+        }
+        let count = pending_session_count();
+        match count {
+            Some(0) | None => {}
+            Some(count) => {
+                self.log
+                    .push(format!("启动检测：session 里有 {count} 个未完成任务"));
+                self.session_pending = Some(count);
+            }
+        }
+    }
+
+    /// 打开网页管理页：真正起服务由 bin 注入的回调负责（ui 不链 ariahost-web）。
+    fn open_web_page(&mut self) {
+        let Some(open) = &self.open_web else {
+            self.set_banner(Banner::new(
+                Tone::Warn,
+                "当前构建没有接入网页管理页（命令行/自测模式下没有注入）。",
+            ));
+            return;
+        };
+        match open() {
+            Ok(url) => {
+                self.log.push(format!("网页管理页：{url}"));
+                match open_url(&url) {
+                    Ok(()) => self.notify(format!("已在浏览器打开 {url}")),
+                    Err(error) => self.set_banner(Banner::new(
+                        Tone::Warn,
+                        format!("打不开浏览器（{error}）；手工访问 {url}"),
+                    )),
+                }
+            }
+            Err(detail) => {
+                let code = ErrorCode::PortConflict;
+                self.set_banner(
+                    Banner::with_code(
+                        Tone::Bad,
+                        Some(code),
+                        format!("{} 网页管理页启动失败：{detail}", code.code()),
+                    )
+                    .and_next("改 web.port 换一个端口，或关掉占着它的程序后重试"),
+                );
+            }
+        }
+    }
     /// 表里实际渲染的行数（乐观行 + 真实行）。
     fn row_count(&self) -> usize {
         self.optimistic.len() + self.tasks.len()
@@ -782,6 +1037,124 @@ impl PanelApp {
         }
     }
 
+    /// 退出流程的可见证据：**不能直接消失**（需求第 7 条）。
+    fn show_quit_line(&mut self, ui: &mut egui::Ui) {
+        let Some(flow) = &self.quit else {
+            return;
+        };
+        let waited = flow.started.elapsed().as_secs_f32();
+        let text = if flow.keep_running {
+            "正在退出；aria2 继续在后台下载（按配置不停止）".to_owned()
+        } else {
+            format!(
+                "正在保存会话并停止 aria2，约需 {} 秒…（已等待 {waited:.1} 秒）",
+                core_host::STOP_EXPECTED_SECS
+            )
+        };
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(RichText::new(text).color(tone_color(Tone::Warn)).small());
+        });
+    }
+
+    /// 启动检测信息条（不是弹窗）：继续 = 启动 aria2 读 session 续传；忽略 = 收起。
+    fn show_session_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(count) = self.session_pending else {
+            return;
+        };
+        let mut start = false;
+        let mut dismiss = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("检测到 {count} 个未完成任务，是否继续？"))
+                    .color(tone_color(Tone::Good))
+                    .small(),
+            );
+            if ui.small_button("继续").clicked() {
+                start = true;
+            }
+            if ui.small_button("忽略").clicked() {
+                dismiss = true;
+            }
+        });
+        if start {
+            self.session_pending = None;
+            self.log
+                .push("启动检测：用户选择继续未完成任务（启动 aria2 读 session 续传）".to_owned());
+            self.request_core_start();
+        }
+        if dismiss {
+            self.session_pending = None;
+            self.log.push("启动检测：用户选择忽略未完成任务".to_owned());
+        }
+    }
+
+    /// `ask` 档的面板内对话框（绝不用系统 MessageBox，且必须带真实任务数）。
+    fn show_close_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut prompt) = self.close_prompt.take() else {
+            return;
+        };
+        let downloading = self.downloading_count();
+        let mut to_tray = false;
+        let mut quit = false;
+        let mut cancel = false;
+        egui::Window::new("退出 AriaHost？")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "aria2 正在下载 {downloading} 个任务，退出会中断它们。"
+                    ))
+                    .small(),
+                );
+                ui.label(
+                    RichText::new("最小化到托盘可以让下载继续；退出会先优雅停止 aria2。")
+                        .weak()
+                        .small(),
+                );
+                ui.checkbox(&mut prompt.remember, "记住我的选择");
+                ui.horizontal(|ui| {
+                    if ui.button("最小化到托盘").clicked() {
+                        to_tray = true;
+                    }
+                    if ui.button("退出并停止下载").clicked() {
+                        quit = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.close_prompt = if cancel || to_tray || quit {
+            None
+        } else {
+            Some(prompt)
+        };
+        if to_tray {
+            if prompt.remember {
+                self.prefs.close_action = CloseAction::Tray;
+                self.prefs
+                    .remember_close_action(CloseAction::Tray, &self.log);
+            }
+            self.set_window_hidden(ctx, true);
+        }
+        if quit {
+            if prompt.remember {
+                self.prefs.close_action = CloseAction::Exit;
+                self.prefs
+                    .remember_close_action(CloseAction::Exit, &self.log);
+            }
+            self.begin_quit(ctx, false);
+        }
+    }
+
+    /// 正在下载的任务数（对话框文案用真实数，不编）。
+    fn downloading_count(&self) -> usize {
+        let real = self.tasks.iter().filter(|row| row.kind.can_pause()).count();
+        real.max(self.optimistic.len())
+    }
     /// 内联错误条（不弹窗）。
     fn show_banner(&mut self, ui: &mut egui::Ui) {
         let Some((banner, at)) = &self.banner else {
@@ -871,6 +1244,8 @@ impl PanelApp {
         let mut refresh = false;
         let mut open_config = false;
         let mut copy_endpoint = false;
+        let mut open_web = false;
+        let mut quit_now = false;
 
         ui.horizontal(|ui| {
             ui.heading(format!("任务（{total}）"));
@@ -882,8 +1257,25 @@ impl PanelApp {
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("退出").on_hover_text("关闭面板").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                if ui
+                    .button("退出")
+                    .on_hover_text(format!(
+                        "退出面板：先优雅停止 aria2（约需 {} 秒）再关窗",
+                        core_host::STOP_EXPECTED_SECS
+                    ))
+                    .clicked()
+                {
+                    quit_now = true;
+                }
+                if ui
+                    .button("在浏览器打开")
+                    .on_hover_text(format!(
+                        "起本机网页管理页（127.0.0.1:{}）并用默认浏览器打开",
+                        self.prefs.web_port
+                    ))
+                    .clicked()
+                {
+                    open_web = true;
                 }
                 if ui
                     .button("打开配置目录")
@@ -904,6 +1296,13 @@ impl PanelApp {
                 }
             });
         });
+
+        if quit_now {
+            self.begin_quit(ui.ctx(), false);
+        }
+        if open_web {
+            self.open_web_page();
+        }
 
         if let Some((text, at)) = &self.notice {
             if at.elapsed() < NOTICE_TIMEOUT {
@@ -1496,6 +1895,13 @@ impl eframe::App for PanelApp {
         self.drain_worker();
         self.drain_core();
         self.expire_optimistic();
+        // M2-3：托盘 / 关闭三档 / 退出流程 / 启动检测（全部非阻塞）。
+        self.pump_tray(ui.ctx());
+        self.pump_close(ui.ctx());
+        self.pump_quit(ui.ctx());
+        if self.frames <= 2 {
+            self.detect_pending_session();
+        }
         self.fix_restored_geometry(ui);
         self.apply_requested_size(ui);
         if self.requested_size.is_none() || self.size_settled {
@@ -1503,8 +1909,9 @@ impl eframe::App for PanelApp {
         }
 
         // 关窗时保存几何；eframe 本帧之后就退出主循环，所以必须在这里同步写完。
-        if ui.ctx().input(|input| input.viewport().close_requested()) {
+        if self.quit_save_pending || ui.ctx().input(|input| input.viewport().close_requested()) {
             self.persist_geometry(ui);
+            self.quit_save_pending = false;
         }
 
         // 交互模式下通道是 mpsc，没有人能「推醒」egui，只能定时问一次（不是忙轮询）。
@@ -1527,6 +1934,8 @@ impl eframe::App for PanelApp {
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.show_status(ui);
+                self.show_quit_line(ui);
+                self.show_session_bar(ui);
                 self.show_banner(ui);
                 if !self.seed_mode() {
                     self.show_new_task(ui);
@@ -1544,6 +1953,7 @@ impl eframe::App for PanelApp {
             self.show_tasks(ui);
         });
 
+        self.show_close_prompt(ui.ctx());
         self.maybe_finish_selftest(ui);
     }
 }
@@ -1617,6 +2027,42 @@ fn config_dir() -> Option<PathBuf> {
     ariahost_common::paths::config_file()
         .and_then(|file| file.parent().map(Path::to_path_buf))
         .filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// 用默认浏览器打开 URL（不新增依赖：explorer/xdg-open 都能吃 URL）。
+fn open_url(url: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+    }
+}
+
+/// `%APPDATA%\AriaHost\session\aria2.session` 里的未完成任务数（`None` = 文件不存在）。
+///
+/// aria2 的 session 文件一行一个 URI，`#` 开头是注释；只数非空非注释行。
+fn pending_session_count() -> Option<usize> {
+    let dir = ariahost_common::paths::session_dir(ariahost_common::paths::Plane::User)?;
+    let file = dir.join(ariahost_core::SESSION_FILE_NAME);
+    let text = std::fs::read_to_string(&file).ok()?;
+    Some(count_session_lines(&text))
+}
+
+/// 数 session 文件里的任务行（`#` 注释与空行不算）——单独拆出来是为了能纯函数测。
+fn count_session_lines(text: &str) -> usize {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .count()
 }
 
 /// 用系统文件管理器打开目录（只要求「进程起来了」；explorer 的退出码不可靠）。
@@ -1780,6 +2226,25 @@ mod tests {
         .and_next("先启动 aria2");
         assert_eq!(coded.code, Some("AH-E2003"));
         assert_eq!(coded.next.as_deref(), Some("先启动 aria2"));
+    }
+
+    #[test]
+    fn close_action_parses_the_three_documented_modes() {
+        assert_eq!(CloseAction::parse("tray"), CloseAction::Tray);
+        assert_eq!(CloseAction::parse("ASK"), CloseAction::Ask);
+        assert_eq!(CloseAction::parse(" exit "), CloseAction::Exit);
+        // 拼错不能把面板搞成关不掉：退回默认 tray（架构 §4.11 默认值）。
+        assert_eq!(CloseAction::parse("quit"), CloseAction::Tray);
+        assert_eq!(CloseAction::Tray.as_str(), "tray");
+    }
+
+    #[test]
+    fn session_line_count_ignores_comments_and_blank_lines() {
+        let text = "# AriaHost session\n\nhttp://a/1.bin\ngid=abc\n  \nhttp://a/2.bin\n";
+        // ariahost 的 session 一行一个 URI / 选项，注释与空行不计数。
+        assert_eq!(count_session_lines(text), 3);
+        assert_eq!(count_session_lines(""), 0);
+        assert_eq!(count_session_lines("# only comments\n\n"), 0);
     }
 
     #[test]

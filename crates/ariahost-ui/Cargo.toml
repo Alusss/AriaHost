@@ -14,6 +14,7 @@ ariahost-common = { path = "../ariahost-common" }
 ariahost-core = { path = "../ariahost-core" }
 ariahost-aria2 = { path = "../ariahost-aria2" }
 ariahost-svc = { path = "../ariahost-svc" }
+
 # EG-1：egui 整条栈 pin 0.37（防版本漂移）；eframe 默认 features 已含 wgpu 与 system_fonts。
 eframe.workspace = true
 egui.workspace = true
@@ -25,6 +26,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# M2-3：托盘图标（只 Windows 目标；Linux 侧 WSL 的 cargo check 不进这条分支）。
+tray-icon.workspace = true
 # EG-4 内存口径：K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize
 # （≈任务管理器「内存」列）。只用官方轻量绑定 windows-sys（已在依赖树内：winit/wgpu 间接依赖），
 # 不引入 windows crate，也不新增供应链面。

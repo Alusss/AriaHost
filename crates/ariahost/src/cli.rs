@@ -54,6 +54,8 @@ pub enum Command {
         /// 灌入多少行假任务（EG-8/EG-9 的 200 行内存闸门）；`None` = 不灌。
         seed_rows: Option<usize>,
     },
+    /// `--web-selftest`：隐藏自检入口，跑一遍网页管理页的端到端自检（不出现在 `--help`）。
+    WebSelftest,
     /// `--service`：ServiceHost。
     Service,
     /// `--install-service`：注册 Windows 服务（短命助手）。
@@ -196,6 +198,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
 
     let command = match first.as_str() {
         "--service" => Command::Service,
+        "--web-selftest" => Command::WebSelftest,
         "--install-service" => Command::InstallService,
         "--uninstall-service" => Command::UninstallService,
         "--quit" => Command::Quit,
@@ -406,7 +409,7 @@ fn execute(command: &Command) -> i32 {
     match command {
         // 面板：M2 起真的起窗（eframe/egui + wgpu）。这里不再有「等待回车」的占位逻辑——
         // 双击快捷方式时用户看到的是窗口，不是控制台输出。
-        Command::Panel { backend } => ariahost_ui::run_panel(*backend),
+        Command::Panel { backend } => ariahost_ui::run_panel(*backend, Some(web_open_hook())),
         Command::PanelSelftest {
             frames,
             size,
@@ -420,20 +423,19 @@ fn execute(command: &Command) -> i32 {
                 EXIT_ERR
             }
         },
-        Command::InstallService => {
-            println!("install-service: not implemented (M1 skeleton)");
-            EXIT_OK
-        }
-        Command::UninstallService => {
-            println!("uninstall-service: not implemented (M1 skeleton)");
-            EXIT_OK
-        }
+        Command::WebSelftest => run_web_selftest(),
+        Command::InstallService => run_install_service(),
+        Command::UninstallService => run_uninstall_service(),
         Command::WriteAumid { lnk } => {
+            // 留桩是**有意**的：AUMID 只在 MSI/安装器建快捷方式时才有意义（M3），
+            // 面板/CLI 现在写它没有消费方。别让用户以为这里能用。
             println!(
-                "write-aumid: not implemented (M1 skeleton): {}",
+                "{} write-aumid 尚未接入：{}",
+                ErrorCode::Usage.code(),
                 lnk.display()
             );
-            EXIT_OK
+            println!("它由 M3 安装器（installer/ariahost.nsi）在创建开始菜单快捷方式时调用，命令行不单独提供该功能。");
+            EXIT_ERR
         }
         Command::Aria2Fetch { version } => run_aria2_fetch(version.as_deref()),
         Command::RuntimeSelftest { seconds } => run_runtime_selftest(*seconds),
@@ -450,6 +452,139 @@ fn execute(command: &Command) -> i32 {
         Command::Help => {
             println!("{USAGE}");
             EXIT_OK
+        }
+    }
+}
+
+/// 面板「在浏览器打开」的实现：真正起 `Server` 的是 bin（ui 层不链 ariahost-web）。
+///
+/// 惰性启动 + 只启动一次：第一次点按钮才建服务，之后复用同一个 URL。
+fn web_open_hook() -> ariahost_ui::OpenWebFn {
+    let holder: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    Box::new(move || {
+        if let Some(url) = holder.lock().ok().and_then(|guard| guard.clone()) {
+            return Ok(url);
+        }
+        let mut config = ariahost_common::config::load().map_err(|error| error.to_string())?;
+        let secret = ariahost_common::config::resolve_secret(
+            &mut config,
+            &arihost_common::paths::default_secret_path()
+                .ok_or_else(|| "取不到 secret.bin 路径".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let web = ariahost_web::WebConfig {
+            bind: "127.0.0.1".to_owned(),
+            port: config.web.port,
+            rpc_port: config.aria2.rpc.port,
+            secret,
+        };
+        let url = web.url();
+        // Server 一旦 drop 就停服：面板活的这段时间必须一直持有，所以漏给一个常驻线程。
+        let server = ariahost_web::Server::start(web).map_err(|error| error.detail())?;
+        std::thread::spawn(move || {
+            let _keep = server;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        });
+        if let Ok(mut guard) = holder.lock() {
+            *guard = Some(url.clone());
+        }
+        Ok(url)
+    })
+}
+
+/// `--web-selftest`：跑一遍网页管理页自检（建服务 → 拉页面 → 反代一条只读 RPC）。
+fn run_web_selftest() -> i32 {
+    match ariahost_web::selftest() {
+        Ok(()) => {
+            println!("网页管理页自检通过：静态页 + 反代 + 只读方法白名单都正常。");
+            EXIT_OK
+        }
+        Err(detail) => {
+            eprintln!("{} 网页管理页自检失败：{detail}", ErrorCode::Usage.code());
+            eprintln!("排查：确认 web.port（默认 6875）没被别的程序占着；面板「在浏览器打开」用同一个端口。");
+            EXIT_ERR
+        }
+    }
+}
+
+/// `--install-service`：注册 Windows 服务（需要管理员）。
+fn run_install_service() -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!(
+                "{} 取不到本程序路径：{error}",
+                ErrorCode::ServiceRegisterPrereq.code()
+            );
+            return EXIT_ERR;
+        }
+    };
+    match ariahost_svc::install(&exe) {
+        Ok(outcome) => {
+            let text = match outcome {
+                ariahost_svc::InstallOutcome::Created => "服务已注册（AriaHost）",
+                ariahost_svc::InstallOutcome::AlreadyExisted => "服务本来就在（已注册，无需重装）",
+            };
+            println!("{text}：{}", exe.display());
+            println!(
+                "下一步：`ariahost --service` 由系统拉起；面板里点「启动 aria2」不需要管理员。"
+            );
+            EXIT_OK
+        }
+        Err(error) => {
+            report_service_error("注册服务失败", &error);
+            EXIT_ERR
+        }
+    }
+}
+
+/// `--uninstall-service`：注销 Windows 服务（需要管理员）。
+fn run_uninstall_service() -> i32 {
+    match ariahost_svc::uninstall() {
+        Ok(outcome) => {
+            let text = match outcome {
+                ariahost_svc::UninstallOutcome::Removed => "服务已注销（AriaHost）",
+                ariahost_svc::UninstallOutcome::NotInstalled => "服务本来就没装（幂等成功）",
+            };
+            println!("{text}");
+            EXIT_OK
+        }
+        Err(error) => {
+            report_service_error("注销服务失败", &error);
+            EXIT_ERR
+        }
+    }
+}
+
+/// 服务操作失败的统一上屏口径：`AH-E` 码 + 一句人话 + 可执行建议。
+fn report_service_error(headline: &str, error: &ariahost_svc::ServiceError) {
+    let code = error.code();
+    eprintln!("{} {headline}：{}", code.code(), error.detail());
+    if matches!(error, ariahost_svc::ServiceError::NeedsAdmin { .. }) {
+        eprintln!("请以管理员身份运行（右键「以管理员身份运行」或从提升的命令行执行）。");
+        return;
+    }
+    match error {
+        ariahost_svc::ServiceError::NotFromScm { .. } => {
+            eprintln!("提示：`--service` 只由 Windows 服务控制管理器拉起，不要手工双击运行。");
+        }
+        ariahost_svc::ServiceError::NotInstalled { .. } => {
+            eprintln!("下一步：先 `ariahost --install-service`（需要管理员）。");
+        }
+        ariahost_svc::ServiceError::Unsupported => {
+            eprintln!("本产品只发 Windows；当前平台不支持注册服务。");
+        }
+        ariahost_svc::ServiceError::RegisterPrereq { .. } => {
+            eprintln!("下一步：确认 %ProgramData%\\AriaHost 可写，并以管理员身份重试。");
+        }
+        ariahost_svc::ServiceError::StartupFailed { .. } => {
+            eprintln!("下一步：看 %ProgramData%\\AriaHost\\logs 下的服务日志。");
+        }
+        _ => {
+            eprintln!("下一步：以管理员身份重试；仍失败就看事件查看器里 AriaHost 的条目。");
         }
     }
 }
@@ -965,8 +1100,10 @@ mod tests {
             parse_args(&["--uninstall-service"]),
             Ok(Command::UninstallService)
         );
-        assert_eq!(run_args(&["--install-service"]), EXIT_OK);
-        assert_eq!(run_args(&["--uninstall-service"]), EXIT_OK);
+        // 平台相关：Windows 非管理员下是「需要管理员」失败（EXIT_ERR），
+        // 非 Windows 上是 Unsupported（也是 EXIT_ERR）；绝不能再是「假装成功」。
+        assert_eq!(run_args(&["--install-service"]), EXIT_ERR);
+        assert_eq!(run_args(&["--uninstall-service"]), EXIT_ERR);
     }
 
     #[test]
@@ -978,7 +1115,16 @@ mod tests {
                 lnk: PathBuf::from(path)
             })
         );
-        assert_eq!(run_args(&["--write-aumid", path]), EXIT_OK);
+        // 留桩但必须**明确失败**：不能让用户以为 AUMID 已经写进快捷方式了。
+        assert_eq!(run_args(&["--write-aumid", path]), EXIT_ERR);
+    }
+
+    #[test]
+    fn web_selftest_is_parsed_and_runs() {
+        assert_eq!(parse_args(&["--web-selftest"]), Ok(Command::WebSelftest));
+        // 自检自己会绑一个临时端口；通了就是 0，占端口等环境问题就是 1。
+        let code = run_args(&["--web-selftest"]);
+        assert!(code == EXIT_OK || code == EXIT_ERR);
     }
 
     #[test]

@@ -77,6 +77,11 @@ impl HostState {
     }
 
     /// 是否正在运行（RPC 应可用）。
+    /// 是否处于「没在跑」的终态（`Idle` 也算：还没起过就没有可停的东西）。
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Idle | Self::Stopped { .. })
+    }
+
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running { .. })
     }

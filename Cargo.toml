@@ -50,10 +50,17 @@ toml = "1.2"
 # **只开这四个 feature**，理由逐条见 crates/ariahost-core/src/runtime.rs 与 worklog。
 windows-sys = { version = "0.61", default-features = false, features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_Security_Cryptography",
 ] }
+
+# ---- M2-3（托盘 + 关闭行为）新增依赖 ----
+# 托盘图标：只发 Windows，windows 目标才编；默认 features 已够（不需要 libappindicator 那条
+# Linux 链）。图标解码不引 `image`（几 MB），走本 crate 自带的 `Icon::from_rgba` +
+# 我们自己的 ICO/PNG 解码（见 crates/ariahost-ui/src/tray.rs 头注释）。
+tray-icon = "0.26"
 
 [profile.release]
 lto = "thin"
