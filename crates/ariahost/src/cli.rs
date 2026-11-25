@@ -148,8 +148,25 @@ pub enum QuitOutcome {
     Signalled,
     /// 管道存在但拒绝了请求（原因为对端应答原文）。
     Refused(String),
-    /// 管道存在但握手或等待退出超时。
-    Timeout,
+    /// 管道存在但握手或等待退出超时；附**是哪一段**超时。
+    Timeout(TimeoutPhase),
+}
+
+/// 超时发生在哪一段——**只影响 stderr 的人话，不碰 stdout 契约与退出码**。
+///
+/// 为什么要把一个码分成两种事实：`quit: timeout` 既可能是「请求根本没送达」（握手就
+/// 没完成，面板可能压根没收到 quit），也可能是「请求送达了、面板在退但没退完」
+/// （在存会话 / 停 aria2c）。前者该查管道、权限与版本；后者该再等或转人工。
+/// 压成一个码，排障时只能猜；而 stdout 又不能加字段（安装器按全等比对）。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutPhase {
+    /// 握手阶段超时：没拿到 `ok pid=` 应答（或读管道出错）。
+    Handshake,
+    /// 已收到 `ok pid=`，等该进程消失超时。
+    ExitWait,
+    /// 外层看门狗到期 / 起不了工作线程（理论上不该出现）。
+    Watchdog,
 }
 
 impl QuitOutcome {
@@ -158,7 +175,8 @@ impl QuitOutcome {
         match self {
             Self::NoInstance | Self::Signalled => EXIT_OK,
             Self::Refused(_) => EXIT_ERR,
-            Self::Timeout => EXIT_TIMEOUT,
+            // 两个超时段共用同一个退出码：安装器只看 0/1/2，不解析细分。
+            Self::Timeout(_) => EXIT_TIMEOUT,
         }
     }
 
@@ -168,7 +186,8 @@ impl QuitOutcome {
             Self::NoInstance => "no-instance",
             Self::Signalled => "accepted",
             Self::Refused(_) => "refused",
-            Self::Timeout => "timeout",
+            // 细分只进 stderr，键值仍是 timeout（契约不变）。
+            Self::Timeout(_) => "timeout",
         }
     }
 }
@@ -567,9 +586,18 @@ fn execute(command: &Command) -> i32 {
 
 /// `--quit` 的握手与等退出总预算。
 ///
-/// 安装器自己的等待超时是 15s，这里留 5s 余量：宁可我们先回「超时」，也别让安装器
-/// 在它那边超时后杀掉我们、留下半保存的会话。
-const QUIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// **三个预算的大小关系（都不是拍脑袋，各有实测来源）**：
+/// - **面板自己**的退出上限 30s（`ariahost-ui` 的 ctl 收尾：存会话 → 优雅停 aria2c →
+///   forceShutdown）；实测最坏约 **19s**（面板 19s 级收尾 + `--quit` 客户端 10s 旧的
+///   早期放弃，见 task-65 背景）。
+/// - **本客户端 25s**：必须**大于**面板的实测最坏 19s，留 6s 余量——10s 时出现过
+///   「面板其实正在退，CLI 先放弃回 timeout，安装器随即判定仍在运行」的假失败。
+/// - **安装器**在 `--quit` 返回后自己再等 20s（`STOP_APP_BUDGET_MS`）；它串在本预算
+///   **之后**，不重叠，所以总最坏 ≈ 25s + 20s。
+///
+/// 知情接受：25s **不覆盖**面板理论硬上限 30s——极端慢（接近 30s）时本客户端仍会先回
+/// `quit: timeout`。那一刻面板通常已经在退了，安装器的 20s 复查会把这段时间吃掉。
+const QUIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// `--quit`：请运行中的面板退出（架构 §4.1.4 + 控制管道 §3.1）。
 ///
@@ -609,8 +637,30 @@ fn quit_stderr_lines(outcome: &QuitOutcome) -> Vec<String> {
             format!("退出请求被拒绝：{reason}"),
             "  → 面板与命令行版本可能不一致：装回同一版本后重试".to_owned(),
         ],
-        QuitOutcome::Timeout => vec![
-            format!("与控制管道握手/等退出超时（{}s）", QUIT_BUDGET.as_secs()),
+        // 「没送达」与「送达但没退完」是两种完全不同的处置，文案必须分开。
+        QuitOutcome::Timeout(TimeoutPhase::Handshake) => vec![
+            format!(
+                "与控制管道握手超时（{}s 内没收到面板应答）",
+                QUIT_BUDGET.as_secs()
+            ),
+            "  → 退出请求可能根本没送达：先确认面板还在跑（任务管理器里有 ariahost.exe）；\
+             仍不行就结束它，下次启动会自动降级未保存的会话"
+                .to_owned(),
+        ],
+        QuitOutcome::Timeout(TimeoutPhase::ExitWait) => vec![
+            format!(
+                "已收到面板应答，但它在 {}s 内没退完（多在保存会话 / 停 aria2c）",
+                QUIT_BUDGET.as_secs()
+            ),
+            "  → 请求已送达、退出未完成：再等一会通常就退了；**别急着强杀**，\
+             强杀会丢会话并留下 aria2c 孤儿"
+                .to_owned(),
+        ],
+        QuitOutcome::Timeout(TimeoutPhase::Watchdog) => vec![
+            format!(
+                "与控制管道交互超时（{}s，外层看门狗到期）",
+                QUIT_BUDGET.as_secs()
+            ),
             "  → 面板可能卡在保存会话：不动它会让下次启动自动降级；急的话在任务管理器结束它"
                 .to_owned(),
         ],
@@ -660,7 +710,7 @@ mod platform_quit {
 
 #[cfg(windows)]
 mod platform_quit {
-    use super::QuitOutcome;
+    use super::{QuitOutcome, TimeoutPhase};
     use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -677,11 +727,11 @@ mod platform_quit {
                 let _ = sender.send(handshake(deadline));
             });
         if spawned.is_err() {
-            return QuitOutcome::Timeout;
+            return QuitOutcome::Timeout(TimeoutPhase::Watchdog);
         }
         receiver
             .recv_timeout(budget + Duration::from_millis(500))
-            .unwrap_or(QuitOutcome::Timeout)
+            .unwrap_or(QuitOutcome::Timeout(TimeoutPhase::Watchdog))
     }
 
     fn handshake(deadline: Instant) -> QuitOutcome {
@@ -703,7 +753,7 @@ mod platform_quit {
         let read = match pipe.read(&mut buffer) {
             Ok(0) => return QuitOutcome::Refused("对端没应答就断开".to_owned()),
             Ok(read) => read,
-            Err(_) => return QuitOutcome::Timeout,
+            Err(_) => return QuitOutcome::Timeout(TimeoutPhase::Handshake),
         };
         let ack = String::from_utf8_lossy(&buffer[..read]).trim().to_owned();
         if ack.starts_with("refused") {
@@ -740,7 +790,8 @@ mod platform_quit {
         if waited == WAIT_OBJECT_0 {
             QuitOutcome::Signalled
         } else {
-            QuitOutcome::Timeout
+            // 应答收到了、进程却到点还在：这是「送达但没退完」，处置与握手超时不同。
+            QuitOutcome::Timeout(TimeoutPhase::ExitWait)
         }
     }
 }
@@ -1653,7 +1704,9 @@ mod tests {
             QuitOutcome::NoInstance,
             QuitOutcome::Signalled,
             QuitOutcome::Refused("version-mismatch".to_owned()),
-            QuitOutcome::Timeout,
+            QuitOutcome::Timeout(TimeoutPhase::Handshake),
+            QuitOutcome::Timeout(TimeoutPhase::ExitWait),
+            QuitOutcome::Timeout(TimeoutPhase::Watchdog),
         ];
         for outcome in &outcomes {
             let line = quit_stdout_line(outcome);
@@ -1675,13 +1728,37 @@ mod tests {
                 ),
             }
         }
+        // 三种 timeout 共用同一个 stdout 键（安装器契约不变），但 stderr 的处置建议必须不同——
+        // 「没送达」要用户去确认面板在不在，「送达未退完」要用户别强杀。
+        assert_eq!(
+            quit_stdout_line(&QuitOutcome::Timeout(TimeoutPhase::Handshake)),
+            quit_stdout_line(&QuitOutcome::Timeout(TimeoutPhase::ExitWait))
+        );
+        let handshake =
+            quit_stderr_lines(&QuitOutcome::Timeout(TimeoutPhase::Handshake)).join("\n");
+        let exit_wait = quit_stderr_lines(&QuitOutcome::Timeout(TimeoutPhase::ExitWait)).join("\n");
+        assert_ne!(
+            handshake, exit_wait,
+            "「没送达」与「送达未退完」必须给出不同处置文案"
+        );
+        assert!(
+            handshake.contains("没收到"),
+            "未送达要说明是握手阶段：{handshake}"
+        );
+        assert!(
+            exit_wait.contains("已收到面板应答"),
+            "退不完要说明应答已收到：{exit_wait}"
+        );
         // 四态的键值本身也是契约（安装器按它判断）。
         assert_eq!(
             quit_stdout_line(&QuitOutcome::NoInstance),
             "quit: no-instance"
         );
         assert_eq!(quit_stdout_line(&QuitOutcome::Signalled), "quit: accepted");
-        assert_eq!(quit_stdout_line(&QuitOutcome::Timeout), "quit: timeout");
+        assert_eq!(
+            quit_stdout_line(&QuitOutcome::Timeout(TimeoutPhase::Handshake)),
+            "quit: timeout"
+        );
         assert!(
             quit_stdout_line(&QuitOutcome::Refused("x".to_owned())).starts_with("quit: refused ")
         );
@@ -1807,7 +1884,14 @@ mod tests {
             QuitOutcome::Refused("refused unknown-command:x".to_owned()).exit_code(),
             EXIT_ERR
         );
-        assert_eq!(QuitOutcome::Timeout.exit_code(), EXIT_TIMEOUT);
+        // 三种超时阶段共用同一个退出码（安装器只认 0/1/2）。
+        for phase in [
+            TimeoutPhase::Handshake,
+            TimeoutPhase::ExitWait,
+            TimeoutPhase::Watchdog,
+        ] {
+            assert_eq!(QuitOutcome::Timeout(phase).exit_code(), EXIT_TIMEOUT);
+        }
     }
 
     #[test]
@@ -1819,7 +1903,10 @@ mod tests {
             QuitOutcome::Refused("refused x".to_owned()).as_str(),
             "refused"
         );
-        assert_eq!(QuitOutcome::Timeout.as_str(), "timeout");
+        assert_eq!(
+            QuitOutcome::Timeout(TimeoutPhase::Handshake).as_str(),
+            "timeout"
+        );
     }
 
     #[test]
