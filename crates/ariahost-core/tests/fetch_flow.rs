@@ -234,9 +234,22 @@ fn build_core_zip(payload: &[u8]) -> Vec<u8> {
     writer.finish().expect("finish").into_inner()
 }
 
-/// 资产名（64 位 / 任意版本）。
+/// 与生产选择器同源的架构标签（`32bit` / `64bit`）。
+///
+/// **为什么不能写死 64**：`windows / x86` job 真跑时，fixture 里只有 `win-64bit` 资产，
+/// 生产代码正确地判「该版本没有匹配本机架构的安装包」→ 9 个用例集体判红。
+/// **产品行为是对的，夹具是错的**：夹具必须跟着目标架构走。
+fn arch_tag() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86" => "32bit",
+        "x86_64" => "64bit",
+        other => panic!("fetch_flow 夹具未覆盖的目标架构：{other}"),
+    }
+}
+
+/// 资产名（按本机目标架构 / 任意版本）。
 fn asset_name(version: &str) -> String {
-    format!("aria2-{version}-win-64bit-build1.zip")
+    format!("aria2-{version}-win-{}-build1.zip", arch_tag())
 }
 
 /// 构造一份「一个版本 + 一个 64 位资产」的 API JSON，资产 URL 指向假服务器。
@@ -500,16 +513,13 @@ fn too_old_version_is_rejected_without_any_request() {
 #[test]
 fn whitelist_filters_debug_packages() {
     // API 只给了 -debug 包：白名单必须拒绝，且**不发起下载**。
+    // 资产名按本机架构生成，好让「被拒的唯一理由」就是 `-debug` 后缀（而不是架构不匹配）。
+    let debug_asset = format!("aria2-1.36.0-win-{}-build1-debug.zip", arch_tag());
     let server = FakeServer::start(|addr| {
         let asset_url = format!("http://{addr}/asset.zip");
         vec![Route::json(
             "/api",
-            &api_json(
-                "1.36.0",
-                &asset_url,
-                10,
-                "aria2-1.36.0-win-64bit-build1-debug.zip",
-            ),
+            &api_json("1.36.0", &asset_url, 10, &debug_asset),
         )]
     });
     let dir = TestDir::new("debug");
