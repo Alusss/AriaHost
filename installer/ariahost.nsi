@@ -713,7 +713,22 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   SetOutPath "$INSTDIR"
   File "..\THIRD-PARTY-NOTICES.md"
   !else
-    !error "缺 ${SRCDIR}\aria2c.exe：本安装包默认**必须**带 aria2 核心（task-54 B3）。带核心：先跑 release.yml 的下载+SHA-256 校验步骤，或手工放入并核对 KNOWN_SHA256；确实要出无核心包：显式传 /DNO_BUNDLED_ARIA2=1（Finish 页会提示需联网下载）"
+    ; 为什么这条 !error 只能是 ASCII 英文（真 CI 实证，run 45598611141 step 11）：
+    ; makensis 的**编译期**消息走 ANSI 代码页（Windows runner 是 en-US，ACP=1252），
+    ; 中文在 WideCharToMultiByte 阶段直接变成 `?`，日志里读到的是
+    ; `!error: ? D:\a\...\dist\x64\aria2c.exe:??????**??**? aria2 ??(task-54 B3)…`
+    ; ——一条等于没有信息量的红。`Unicode true` 只保证**装出来的界面**中文正常，
+    ; 管不到编译期输出；`/INPUTCHARSET UTF8` 也不管（那是脚本源文件的读取编码）；
+    ; `chcp 65001` 同样无效（转换发生在控制台代码页之前的那一层）。
+    ; 读者是半年后看 CI 日志的人、日志要跨机器跨代码页，所以：文案 ASCII，解释留注释。
+    ;
+    ; 这条闸门的语义（task-54 B3）：默认**必须**带 aria2 核心，缺了就不许编过——
+    ; 免得产出一个「用户机器上首次启动还要联网下载」的包（真实用户网络下双线路
+    ; 均不可用，见 docs/dev/release.md §7）。两条出路：
+    ; 1) 带核心：先跑 release.yml 的下载 + SHA-256 硬校验步骤，或手工放入并按
+    ;    crates/ariahost-core/src/fetch.rs 的 KNOWN_SHA256 核对；
+    ; 2) 确实要出无核心包：显式传 /DNO_BUNDLED_ARIA2=1（Finish 页会明说需联网下载）。
+    !error "aria2c.exe is missing from the payload (${SRCDIR}\aria2c.exe). This installer requires the bundled aria2 core by default; a core-less package must opt in explicitly. Fix: let release.yml download and SHA-256-verify the core into dist/, or place aria2c.exe there manually and check it against KNOWN_SHA256. To build a core-less installer on purpose, pass /DNO_BUNDLED_ARIA2=1."
   !endif
 !endif
 
