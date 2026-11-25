@@ -193,6 +193,8 @@ pub struct Settings {
     pub notice: Option<Notice>,
     /// 是否正在问「有未保存改动，确定离开？」。
     pub leaving: bool,
+    /// 上次读盘失败（配置坏了）：这时允许用默认值直接覆盖保存，否则用户没有自救入口。
+    load_failed: bool,
 }
 
 impl Default for Settings {
@@ -207,6 +209,7 @@ impl Default for Settings {
             errors: BTreeMap::new(),
             notice: None,
             leaving: false,
+            load_failed: false,
         }
     }
 }
@@ -232,15 +235,37 @@ impl Settings {
                 self.baseline = config;
                 self.texts = texts_from(&self.draft);
                 self.notice = None;
+                self.load_failed = false;
             }
             Err(error) => {
                 let next = config_hint(error.kind());
                 self.notice = Some(Notice::err(format!("读取配置失败：{error}"), next));
                 self.texts = texts_from(&self.draft);
+                // 配置坏掉时设置页是唯一的自救入口：允许把默认值直接保存下去覆盖坏文件。
+                self.load_failed = true;
             }
         }
         self.errors.clear();
         self.revalidate();
+    }
+
+    /// 测试用：模拟「读盘成功」之后的状态。
+    ///
+    /// 不用 `ensure_loaded()` 是因为它真的去读 `%APPDATA%`：在 CI/Linux 上读不到就会
+    /// 走「读盘失败」分支（`load_failed = true`，被判成脏），测试会变成环境依赖。
+    #[cfg(test)]
+    pub fn loaded_for_test(config: Config) -> Self {
+        Self {
+            loaded: true,
+            baseline: config.clone(),
+            texts: texts_from(&config),
+            draft: config,
+            group: Group::Download,
+            errors: BTreeMap::new(),
+            notice: None,
+            leaving: false,
+            load_failed: false,
+        }
     }
 
     /// 当前分组。
@@ -283,7 +308,7 @@ impl Settings {
     /// 注意：**加载时就已经不合法的项（比如 `~/Downloads` 不存在）不算「改动」** ——
     /// 否则一打开设置页就显示「有未保存的改动」，用户会以为是自己碰坏了什么。
     pub fn is_dirty(&self) -> bool {
-        self.draft != self.baseline
+        self.load_failed || self.draft != self.baseline
     }
 
     /// 输入框内容变了：解析成功就写回副本，失败就留错误（副本保持上一次合法值）。
@@ -364,6 +389,7 @@ impl Settings {
                 self.baseline = self.draft.clone();
                 self.texts = texts_from(&self.draft);
                 self.errors.clear();
+                self.load_failed = false;
                 self.notice = Some(Notice::ok("已保存到 config.toml（原子写）"));
                 Ok(())
             }
@@ -868,8 +894,7 @@ mod tests {
 
     #[test]
     fn dirty_tracks_edits_and_undo_clears_them() {
-        let mut settings = Settings::new();
-        settings.ensure_loaded();
+        let mut settings = Settings::loaded_for_test(Config::default());
         assert!(!settings.is_dirty(), "刚加载不该是脏的");
 
         settings.set_text("net.split", "8".to_owned());
@@ -883,8 +908,7 @@ mod tests {
 
     #[test]
     fn invalid_text_keeps_last_good_value_and_blocks_save() {
-        let mut settings = Settings::new();
-        settings.ensure_loaded();
+        let mut settings = Settings::loaded_for_test(Config::default());
         let before = settings.draft().net.connect_timeout;
         settings.set_text("net.connect_timeout", "9999".to_owned());
         assert_eq!(
@@ -906,8 +930,7 @@ mod tests {
 
     #[test]
     fn reset_defaults_only_touches_visible_keys() {
-        let mut settings = Settings::new();
-        settings.ensure_loaded();
+        let mut settings = Settings::loaded_for_test(Config::default());
         settings.draft_mut().clean.scan_interval_hours = 99;
         settings.draft_mut().queue.max_concurrent = 9;
         settings.draft_mut().net.split = 12;
@@ -933,9 +956,22 @@ mod tests {
     }
 
     #[test]
-    fn interface_domains_are_validated() {
+    fn broken_config_can_still_be_overwritten_from_the_settings_page() {
+        // 配置坏掉时 ensure_loaded 用默认值继续，并把自己标成「可以保存」（自救入口）。
         let mut settings = Settings::new();
-        settings.ensure_loaded();
+        settings.load_failed = true;
+        assert!(
+            settings.is_dirty(),
+            "读盘失败时应允许直接保存默认值覆盖坏文件"
+        );
+        settings.notice = None;
+        settings.load_failed = false;
+        assert!(!settings.is_dirty(), "标记清掉后回到干净状态");
+    }
+
+    #[test]
+    fn interface_domains_are_validated() {
+        let mut settings = Settings::loaded_for_test(Config::default());
         for value in ["auto", "wgpu", "glow"] {
             settings.draft_mut().ui.renderer = value.to_owned();
             settings.revalidate();
