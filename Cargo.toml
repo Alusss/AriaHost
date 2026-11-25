@@ -18,7 +18,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/doaio/wasm"
 
 [workspace.dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 # 面板 UI 栈：整条 pin 在 0.37（EG-1，防版本漂移；MSRV 1.95 与本仓库工具链 pin 一致）。
 # eframe 用默认 features（含 wgpu 后端）；不要单独关 wgpu——EG-3 的 MemoryHints 走的就是它。
 eframe = "0.37"
@@ -31,7 +30,6 @@ egui_extras = { version = "0.37", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.0", features = ["net"] }
 windows-service = "0.8"
 
 # ---- M1-3（aria2 核心获取与版本管理）新增依赖 ----

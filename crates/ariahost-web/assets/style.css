@@ -1,0 +1,122 @@
+/* AriaHost 网页管理页 —— 一屏够用的样式，不引任何框架/字体/图标。
+   CSP 是 default-src 'self'：所以这张表是唯一的外部资源，且不允许内联样式。 */
+
+:root {
+  --bg: #14161a;
+  --panel: #1d2027;
+  --line: #2b303a;
+  --text: #e6e8ee;
+  --muted: #9aa2b1;
+  --accent: #4c9aff;
+  --ok: #46c37b;
+  --bad: #ff6b6b;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0 16px 48px;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+  padding: 18px 0 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+h1 { margin: 0; font-size: 18px; font-weight: 600; }
+
+.status { margin: 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+.status.bad { color: var(--bad); }
+
+main { max-width: 1080px; }
+
+.add { display: flex; gap: 8px; margin: 16px 0; }
+
+.add input {
+  flex: 1;
+  min-width: 240px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+}
+
+.add input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+button {
+  padding: 6px 12px;
+  color: var(--text);
+  background: #262b34;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover { background: #303644; border-color: var(--accent); }
+
+.add button { background: var(--accent); border-color: var(--accent); color: #08101c; font-weight: 600; }
+.add button:hover { filter: brightness(1.08); }
+
+.notice {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  color: #ffd9d9;
+  background: #3a1f22;
+  border: 1px solid #6d3338;
+  border-radius: 6px;
+}
+
+table { width: 100%; border-collapse: collapse; }
+
+thead th {
+  padding: 8px 10px;
+  color: var(--muted);
+  font-weight: 500;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+tbody td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+
+.name {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta { color: var(--muted); font-size: 12px; }
+
+.bar {
+  width: 160px;
+  height: 6px;
+  margin-bottom: 4px;
+  background: #262b34;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.fill { height: 100%; width: 0; background: var(--ok); transition: width 0.3s ease; }
+
+.percent { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.empty { color: var(--muted); padding: 24px 4px; }
+
+@media (max-width: 760px) {
+  .bar { width: 96px; }
+  .name { max-width: 180px; }
+}

@@ -5,10 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "AriaHost 网页管理页骨架：axum 路由与 healthz"
+description = "AriaHost 网页管理页：手写阻塞 HTTP/1.1 + 同源反代注入 token（零异步运行时）"
 
 [dependencies]
 ariahost-common = { path = "../ariahost-common" }
-axum.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+
+[[example]]
+name = "web_selftest"
+path = "examples/web_selftest.rs"
