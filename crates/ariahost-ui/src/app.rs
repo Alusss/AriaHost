@@ -2489,6 +2489,13 @@ impl eframe::App for PanelApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frames = self.frames.saturating_add(1);
+        // 控制管道（M3-f）：`ariahost --quit` 由 ctl 线程置位，这里消费并走退出档。
+        // 必须放在最前面：晚一帧消费就可能让客户端多等一轮握手。
+        if self.quit.is_none() && crate::ctl::take_quit_request() {
+            self.log
+                .push("控制管道：收到 quit，走退出档（保存会话 → 停 aria2c → 关窗）".to_owned());
+            self.begin_quit(ui.ctx(), false);
+        }
         self.sample_memory();
         self.drain_worker();
         self.drain_core();
