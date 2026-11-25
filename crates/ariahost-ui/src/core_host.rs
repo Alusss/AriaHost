@@ -19,9 +19,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use ariahost_common::config::{self as config_layer, Config};
+use ariahost_common::paths::Plane;
 use ariahost_common::ErrorCode;
 use ariahost_core::{
-    launch_spec, prepare_conf, resolve_core_exe, CoreRuntime, ProcessSpawner, RpcProbe,
+    launch_spec, prepare_conf, resolve_core_in, CoreOrigin, CoreRuntime, ProcessSpawner, RpcProbe,
     RuntimeEvent, RuntimePaths, Timeouts,
 };
 
@@ -126,6 +127,18 @@ pub enum HostCommand {
 pub struct CoreProbe {
     /// 定位到的 aria2c（失败为 `None`）。
     pub exe: Option<PathBuf>,
+    /// 核心来源（`aria2.source` 解析结果；`exe = None` 时为 `None`）。
+    ///
+    /// M3-j（task-54 C-UI）：面板必须能看出当前用的是**内置随包 / 版本库托管 /
+    /// 用户指定的外部**哪一种——否则「安装包自带核心」这条在界面上就无法证实。
+    pub origin: Option<CoreOrigin>,
+    /// `aria2c --version` 解析出的版本（`X.Y.Z`）。
+    ///
+    /// **只在启动准备阶段跑一次**（实测 ~40ms），不参与每帧渲染：
+    /// 面板每帧做子进程 IO 会把 UI 卡住，也会污染内存基线。
+    pub version: Option<String>,
+    /// 版本探针失败的原因（**不影响启动**：由 `start` 自己再判一次）。
+    pub version_problem: Option<String>,
     /// 下载目录（`dl.dir` 展开成绝对路径）。
     pub download_dir: Option<PathBuf>,
     /// RPC 端口（`aria2.rpc.port`）。
@@ -140,6 +153,9 @@ impl Default for CoreProbe {
     fn default() -> Self {
         Self {
             exe: None,
+            origin: None,
+            version: None,
+            version_problem: None,
             download_dir: None,
             port: ariahost_aria2::DEFAULT_PORT,
             missing: None,
@@ -153,6 +169,15 @@ impl CoreProbe {
     /// 用户可能刚在引导卡里把核心装好，点击时线程会重新定位）。
     pub fn ready(&self) -> bool {
         self.missing.is_none()
+    }
+}
+
+/// 核心来源的中文名（面板、日志共用；**不要解析** [`CoreOrigin::as_str`] 的英文值）。
+pub const fn origin_label_zh(origin: CoreOrigin) -> &'static str {
+    match origin {
+        CoreOrigin::Bundled => "内置",
+        CoreOrigin::Managed => "托管",
+        CoreOrigin::External => "外部",
     }
 }
 
@@ -264,10 +289,36 @@ impl HostSetup {
             }
         };
 
-        let exe = match resolve_core_exe(&config) {
-            Ok(exe) => {
-                log.push(format!("aria2 核心：{}", exe.display()));
-                Some(exe)
+        let mut origin: Option<CoreOrigin> = None;
+        let mut version: Option<String> = None;
+        let mut version_problem: Option<String> = None;
+        let exe = match resolve_core_in(&config, Plane::User) {
+            Ok(resolved) => {
+                // 日志里同时给中文名与稳定英文值：中文给人看，英文值给排障/诊断包对齐。
+                log.push(format!(
+                    "aria2 核心：{}（{} / {}）",
+                    resolved.path.display(),
+                    origin_label_zh(resolved.origin),
+                    resolved.origin.as_str()
+                ));
+                origin = Some(resolved.origin);
+                // 版本探针：一次 `--version`。失败**不阻断启动**——真坏了 `start` 自己会报，
+                // 这里只是让「核心」区能显示版本、让诊断包里带上它。
+                let started = std::time::Instant::now();
+                match crate::core_setup::probe_external(&resolved.path) {
+                    Ok(parsed) => {
+                        log.push(format!(
+                            "aria2 版本：{parsed}（--version 用时 {} ms）",
+                            started.elapsed().as_millis()
+                        ));
+                        version = Some(parsed.to_string());
+                    }
+                    Err(why) => {
+                        log.push(format!("aria2 版本探测失败：{why}"));
+                        version_problem = Some(why);
+                    }
+                }
+                Some(resolved.path)
             }
             Err(error) => {
                 let code = error.code();
@@ -287,6 +338,9 @@ impl HostSetup {
             missing: problem.as_ref().map(|(_, detail)| detail.clone()),
             code: problem.as_ref().and_then(|(code, _)| *code),
             exe: exe.clone(),
+            origin,
+            version,
+            version_problem,
             download_dir: download_dir.clone(),
             port,
         };
@@ -564,8 +618,18 @@ fn start_once(
         return;
     }
 
-    let exe = match resolve_core_exe(&inputs.config) {
-        Ok(exe) => exe,
+    // 启动时**重新定位一次**（不是复用 `CoreProbe.exe`）：用户可能刚在引导卡里把核心装好，
+    // 或刚从设置里切到外部 aria2c——按钮不该因为「启动时的探测结果」而永久失效。
+    let exe = match resolve_core_in(&inputs.config, Plane::User) {
+        Ok(core) => {
+            log.push(format!(
+                "核心：{}（{} / {}）",
+                core.path.display(),
+                origin_label_zh(core.origin),
+                core.origin.as_str()
+            ));
+            core.path
+        }
         Err(error) => {
             let detail = error.to_string();
             log.push(format!("启动失败：{detail}"));
@@ -848,9 +912,24 @@ fn failure_hint(code: Option<ErrorCode>) -> String {
 mod tests {
     use super::*;
 
+    /// 三种来源的中文名必须与 `CoreOrigin` 一一对上（面板与日志共用这份口径）。
+    #[test]
+    fn origin_labels_are_pinned_to_the_three_variants() {
+        assert_eq!(origin_label_zh(CoreOrigin::Bundled), "内置");
+        assert_eq!(origin_label_zh(CoreOrigin::Managed), "托管");
+        assert_eq!(origin_label_zh(CoreOrigin::External), "外部");
+        // 英文值只用于日志/诊断包，界面不许拿它当人话。
+        assert_eq!(CoreOrigin::Bundled.as_str(), "bundled");
+        assert_eq!(CoreOrigin::Managed.as_str(), "managed");
+        assert_eq!(CoreOrigin::External.as_str(), "external");
+    }
+
     fn probe_ok() -> CoreProbe {
         CoreProbe {
             exe: Some(PathBuf::from("C:\\cache\\aria2c.exe")),
+            origin: Some(CoreOrigin::Managed),
+            version: Some("1.37.0".to_owned()),
+            version_problem: None,
             download_dir: Some(PathBuf::from("C:\\Users\\Alusss\\Downloads")),
             port: 6800,
             missing: None,
@@ -861,6 +940,9 @@ mod tests {
     fn probe_missing() -> CoreProbe {
         CoreProbe {
             exe: None,
+            origin: None,
+            version: None,
+            version_problem: None,
             download_dir: Some(PathBuf::from("C:\\Users\\Alusss\\Downloads")),
             port: 6800,
             missing: Some("找不到 aria2c：版本库下没有 active.json".to_owned()),

@@ -2890,6 +2890,21 @@ impl PanelApp {
 
     /// 折叠区：运行信息 / 输入法自检 / 内部日志。
     fn show_footer(&mut self, ui: &mut egui::Ui) {
+        // 「关于」常显一行（不折叠）：用户报障时第一句要能抄出「产品版本 + 核心来源与版本」，
+        // 否则「安装包自带核心」这条在界面上无从证实（task-54 C-UI）。
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!("{PRODUCT_NAME} {VERSION}"))
+                    .small()
+                    .weak(),
+            );
+            ui.label(RichText::new("·").small().weak());
+            ui.label(
+                RichText::new(format!("aria2 核心：{}", core_summary(&self.core_probe)))
+                    .small()
+                    .weak(),
+            );
+        });
         egui::CollapsingHeader::new("运行信息、输入法自检与日志")
             .id_salt("ariahost_diag")
             .show(ui, |ui| {
@@ -2910,6 +2925,11 @@ impl PanelApp {
             .show(ui, |ui| {
                 ui.label("渲染后端");
                 ui.label(RichText::new(format!("{}（{}）", facts.adapter, facts.backend)).small());
+                ui.end_row();
+
+                // M3-j（task-54 C-UI）：「核心」区必须能看出内置 / 托管 / 外部 + 版本。
+                ui.label("aria2 核心");
+                ui.label(RichText::new(core_summary(&self.core_probe)).small());
                 ui.end_row();
 
                 ui.label("字形图集上限");
@@ -3440,6 +3460,47 @@ fn banner_level(tone: Tone) -> Option<Level> {
     }
 }
 
+/// 「核心」一行的人话总结（信息区与「关于」**共用同一份**，不各写一套）。
+///
+/// 口径（M3-j / task-54 C-UI）：
+/// - 未就绪 → `未就绪（<首句原因>）`；
+/// - 就绪 → `<内置|托管|外部> · 版本 X.Y.Z`；版本探针失败 → `<来源> · 版本未知（<短因>）`。
+///
+/// 来源取的是 `resolve_core_in` 的**实际解析结果**（`CoreOrigin`），不是配置里那个
+/// 可能写着 `auto` 的原始值——`auto` 到底落成内置还是托管，只有解析后才知道。
+fn core_summary(probe: &CoreProbe) -> String {
+    if probe.exe.is_none() {
+        let why = probe
+            .missing
+            .as_deref()
+            .map_or_else(|| "未定位到 aria2c".to_owned(), short_reason);
+        return format!("未就绪（{why}）");
+    }
+    let origin = probe.origin.map_or("来源未知", core_host::origin_label_zh);
+    match (&probe.version, &probe.version_problem) {
+        (Some(version), _) => format!("{origin} · 版本 {version}"),
+        (None, Some(why)) => format!("{origin} · 版本未知（{}）", short_reason(why)),
+        (None, None) => format!("{origin} · 版本未知"),
+    }
+}
+
+/// 取首句并截到一行宽度，用于界面（日志里保留全文，不要在这里省信息）。
+fn short_reason(text: &str) -> String {
+    // 冒号后面往往还有一长串 detail；界面只需要第一句。
+    let first = text
+        .split(['\n', '；', '。', '：'])
+        .next()
+        .unwrap_or(text)
+        .trim();
+    const MAX_CHARS: usize = 40;
+    if first.chars().count() <= MAX_CHARS {
+        return first.to_owned();
+    }
+    let mut out: String = first.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
 /// 任务列表读取失败是否只是噪音（核心没在跑时的连接类报错）。
 ///
 /// 规则（Lead 缺陷 2）：`已停止` 之后不该继续挂着「连不上 aria2」；但用户主动刷新
@@ -3683,6 +3744,66 @@ mod tests {
         let title = title_text();
         assert!(title.starts_with(PRODUCT_NAME), "{title}");
         assert!(title.contains(VERSION), "{title}");
+    }
+
+    /// 「核心」一行在三种来源下都要如实写出来源与版本（task-54 C-UI 的可执行判据）。
+    #[test]
+    fn core_summary_names_origin_and_version() {
+        let mut probe = CoreProbe {
+            version: Some("1.37.0".to_owned()),
+            ..CoreProbe::default()
+        };
+        probe.exe = Some(std::path::PathBuf::from("C:/AriaHost/aria2c.exe"));
+        probe.origin = Some(ariahost_core::CoreOrigin::Bundled);
+        assert_eq!(core_summary(&probe), "内置 · 版本 1.37.0");
+
+        probe.origin = Some(ariahost_core::CoreOrigin::Managed);
+        assert_eq!(core_summary(&probe), "托管 · 版本 1.37.0");
+
+        probe.origin = Some(ariahost_core::CoreOrigin::External);
+        assert_eq!(core_summary(&probe), "外部 · 版本 1.37.0");
+    }
+
+    /// 版本探针失败不许把整行变成「未就绪」：核心是能用的，只是版本没探到。
+    #[test]
+    fn core_summary_keeps_origin_when_version_probe_failed() {
+        let mut probe = CoreProbe {
+            version_problem: Some("退出码 1：不是 aria2c".to_owned()),
+            origin: Some(ariahost_core::CoreOrigin::Bundled),
+            ..CoreProbe::default()
+        };
+        probe.exe = Some(std::path::PathBuf::from("C:/AriaHost/aria2c.exe"));
+        let text = core_summary(&probe);
+        assert!(text.starts_with("内置"), "{text}");
+        assert!(text.contains("版本未知"), "{text}");
+        assert!(!text.contains("未就绪"), "{text}");
+    }
+
+    /// 未就绪时给出首句原因（截断到一行），且不会出现「来源 · 版本」这种误导组合。
+    #[test]
+    fn core_summary_for_missing_core_is_short_and_honest() {
+        let probe = CoreProbe {
+            missing: Some(
+                "AH-E2001 找不到 aria2c：未就绪：exe 同目录没有 aria2c.exe；版本库也没有可用版本"
+                    .to_owned(),
+            ),
+            ..CoreProbe::default()
+        };
+        let text = core_summary(&probe);
+        assert!(text.starts_with("未就绪（AH-E2001 找不到 aria2c"), "{text}");
+        assert!(!text.contains('；'), "应只留首句：{text}");
+        assert!(!text.contains('：'), "应只留首句：{text}");
+    }
+
+    /// 截断只在超长时发生，且按字符而不是字节切（中文不会被劈开）。
+    #[test]
+    fn short_reason_truncates_on_char_boundary() {
+        let long = "错".repeat(60);
+        let text = short_reason(&long);
+        assert_eq!(text.chars().count(), 41, "40 字 + 省略号");
+        assert!(text.ends_with('…'), "{text}");
+
+        assert_eq!(short_reason("短原因"), "短原因");
     }
 
     /// 装/卸走**我们自己的** CLI 契约（定版参数，别改名）。
