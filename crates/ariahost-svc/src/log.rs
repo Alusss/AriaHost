@@ -28,27 +28,12 @@ use std::time::{Duration, Instant, SystemTime};
 use ariahost_common::redact::redact;
 use ariahost_common::time::utc_stamp;
 
-/// 日志级别。只留三档：服务日志是给排障看的，不需要 TRACE/DEBUG 的花活。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    /// 正常节点（进入、命令、状态迁移、就绪）。
-    Info,
-    /// 可继续但需要注意（降级、轮转失败、幂等重试）。
-    Warn,
-    /// 出错（启动失败、停止失败、上报失败）。
-    Error,
-}
-
-impl Level {
-    /// 行内固定文本（对齐、可 grep）。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Info => "INFO",
-            Self::Warn => "WARN",
-            Self::Error => "ERROR",
-        }
-    }
-}
+/// 日志级别（**唯一定义在 `common::logfile`**，这里只做转发）。
+///
+/// 服务日志、`ariahost.log`、任务历史共用一份 `Level`：三份日志的级别文本必须同名，
+/// 否则同一套 grep/解析器吃不下。`service.log` 只用 Info/Warn/Error 三档，
+/// `Debug` 是面板排障细节用的第四档（服务侧不用）。
+pub use ariahost_common::logfile::Level;
 
 /// 日志去处。抽象出来是为了能在 Linux 单测里断言「该记的都记了」。
 ///
