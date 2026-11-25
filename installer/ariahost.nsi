@@ -41,7 +41,7 @@
 ;        注册表 → 删 $INSTDIR → 用户数据默认保留（问过才删）。
 ;        残留的 aria2c 只在其映像路径位于 AriaHost 数据目录下时才 taskkill，
 ;        否则只告警（可能是用户自己的 aria2 实例，杀了是数据损失）。
-;     D. 升级停进程改成「--quit + 每 250ms 真实复查，墙钟上限 15s」，不再 Sleep 假同步。
+;     D. 升级停进程改成「--quit + 每 250ms 真实复查，墙钟上限 20s」，不再 Sleep 假同步。
 ;     另：删除 A6 的 HidePerUserServiceSection（per-user 现在可以注册服务）。
 ;
 ;     历史修复（2026-11-23 独立审计 .scratch/wasm-design/review-exec-v2.md，静态）：
@@ -273,6 +273,15 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
   !macroend
 !endif
 
+; task-61 取证：TRACE 构建下额外记录「整个停进程步」的墙钟（含 --quit 阻塞的那几秒）。
+; 为什么需要：`$R1` 只夹住 `--quit` **之后**的复查等待（面板正常退出时它就是 0），
+; 看不出用户实际等多久；而验收要的正是「面板在下载 → 覆盖升级」这一档的端到端读数。
+; 实现约束：只新增一个具名变量（不占用 $R0–$R9/$0–$9 已有的借用约定），并且整段
+; 包在 `!ifdef TRACE` 里——不给 /DTRACE 时既不声明变量，也不多一次系统调用。
+!ifdef TRACE
+  Var StopStepStartTick
+!endif
+
 ; ---- 通用：去掉字符串首尾的 CR/LF/空格 ------------------------------------
 ; cmd 的 echo、sc/tasklist/wmic 的输出都带行尾换行（wmic 还会在前面空一行），
 ; 比较前必须先裁掉。首部用 `StrCpy … 1024 1` 逐字符前移（NSIS 不支持"取剩余全部"）。
@@ -305,7 +314,7 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
 
 ; ---- 通用：停掉正在运行的实例（不 Sleep 假同步）---------------------------
 ; MODE = "install"：安装/覆盖前调用。检测到在跑 → 提示 → --quit → **每 250ms
-;        真实复查、墙钟上限 15s**；仍活着才 Abort（否则 File 必然失败）。
+;        真实复查、墙钟上限 20s**；仍活着才 Abort（否则 File 必然失败）。
 ; MODE = "uninstall"：卸载时调用。不提示、不 Abort；停完等 2s 让 Job Object
 ;        收掉 aria2c 子进程，再复查 aria2c 是否残留。
 ;
@@ -313,29 +322,55 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
 ; 早期 A4 实现都吃过这个亏——睡眠时长与真实退出时间无关，睡完照样占用文件。
 ; 这里的 Sleep 只用作两次探测之间的间隔（250ms），判定依据始终是 tasklist 结果。
 ;
-; 为什么等待预算是 15s（原为 40×250ms=10s）：`--quit` 客户端自己的握手/等退出
-; 预算就是 10s（cli.rs 的 QUIT_TIMEOUT），10s 等于和客户端同刻赛跑——先到的
-; 那一方随机，属于设计缺陷。加 5s 余量。
+; 为什么等待预算是 20s（task-61 从 15s 抬上来；再往前是 40×250ms=10s）：
+; 三个预算必须形成 **CLI < 安装器 < 面板** 的阶梯，否则最内层还没走完，外层先
+; 判失败——用户看到的是「安装器说失败、其实装成了」这种最难解释的误判。
 ;
-; 已知边界（不改数，仅登记）：面板侧最坏链路约 19s —— 2s 等 UI 线程消费 quit
-; 请求 + 15s 优雅停止（saveSession → shutdown）+ 2s 宽限（见 ariahost-ui/ctl.rs 与
-; app.rs 的退出档）。即「面板有未完成任务且 aria2c 拒不退出」时，15s 预算会先到，
-; 安装器判超时中止（这是**期望**行为：宁可不覆盖也别撞占用）。把预算抬到 19s+
-; 会拉长一切失败路径的静默等待，改数需权衡，故留作单独议题，不在这批里动。
+;   | 谁 | 预算 | 出处 |
+;   |----|------|------|
+;   | `--quit` 客户端 | 10s | cli.rs 的 QUIT_TIMEOUT（握手 + 等面板退出） |
+;   | 安装器等待 | **20s** | 本文件 STOP_APP_BUDGET_MS |
+;   | 面板退出档 | 30s | ariahost-ui 的 QUIT_TIMEOUT（ctl 线程自己的上限） |
 ;
-; **2026-11-25 实测修：预算按"墙钟 15s"算，不按轮次算。** 每轮都要 spawn 一次
+; 为什么 15s 不够（实测依据，不是推算）：`4a` 场景（**下载进行中**、面板不即时
+; 信令）最坏一档实测到 **~19s** —— 2s 等 UI 线程消费 quit 请求 + 15s 优雅停止
+; （saveSession → aria2.shutdown）+ 2s 宽限（见 ariahost-ui/ctl.rs 与 app.rs 的
+; 退出档）。15s 预算会比面板真实退出**早到 2s**：安装器弹出「仍在运行」并 Abort，
+; 而面板 2s 后就退了——差 2 秒的误判。20s 覆盖 19s 最坏档，且仍在面板 30s 之内，
+; 阶梯不倒挂。
+;
+; 代价（知情接受）：所有「面板真的退不掉」的失败路径，静默等待从 15s 变成 20s。
+; 这是把「假失败」换成「晚 5 秒报真失败」，方向对；若将来要缩，必须同时缩 CLI 与
+; 面板侧的预算，别只动这一个数（否则阶梯又倒挂）。
+;
+; **2026-11-25 实测修：预算按"墙钟"算，不按轮次算。** 每轮都要 spawn 一次
 ; tasklist（非控制台上下文一次约 100–150ms），所以「N 轮 × 250ms」必然低估真实
 ; 等待时长，且随机器快慢漂移——静默安装的失败反馈时间会被无声放大。改法：用
-; kernel32!GetTickCount 夹住墙钟，轮次只作为取证计数。实测（面板始终不让出）：
+; kernel32!GetTickCount 夹住墙钟，轮次只作为取证计数。
+;
+; 覆盖面核算（task-61 复核，Sleep 与 GetTickCount 是否仍够 20s）：墙钟差值
+; `$R1 = tick_now - tick_start`，与轮次**完全无关**，所以上限必然被覆盖；每轮
+; ≈ tasklist(100–150ms) + Sleep 250ms ≈ **350–400ms**，20s 预算约 **50–57 轮**，
+; 轮次远未到任何计数器上限（IntOp 是 64 位）。判定在每轮末尾采样，故实际中止
+; 时刻是 20.0s + 末轮残留时间（≤ ~400ms），不会提前。
+; 已知边界（不改数，仅登记）：GetTickCount 是 32 位无符号、按有符号读会在开机
+; 24.8 天后变成负数；但两次采样**同时**平移，差值仍正确——只有「这 20s 恰好跨过
+; 那一个翻转瞬间」才会失效（概率 ~1e-5，且 15s 时代就已存在，非本批引入）。
+;
+; 历史实测（15s 时代留档，用来证明墙钟夹子是有效的）：面板始终不让出时
 ; 15204ms 触发中止、39 轮、退出码 2。
 ;
 ; 入参：$INSTDIR 必须已就位（--quit 要用 $INSTDIR\ariahost.exe）
 ; 出参：$R7 最后一次探测结果（"1"：还在跑）；$R9 实际轮次；$R1 实际等待毫秒
 ; 借用：$R0（起始 tick）、$R1（已等毫秒）——调用方不要依赖这两个寄存器
 ; 复用：安装器（Function StopAppForInstall）、卸载器（Function un.StopAppForUninstall）
-!define STOP_APP_BUDGET_MS 15000
+!define STOP_APP_BUDGET_MS 20000
 !macro StopAppBody MODE
   !insertmacro TraceWrite "[${MODE}] StopAppBody 进入；exedir=$EXEDIR temp=$TEMP instdir=$INSTDIR"
+  !ifdef TRACE
+    System::Call 'kernel32::GetTickCount()i .R2'
+    StrCpy $StopStepStartTick $R2
+  !endif
   !insertmacro ProcessIsRunning ${APP_EXE} 12
   !insertmacro TraceWrite "[${MODE}] 探测 ${APP_EXE} 结果=$R7"
   ${If} $R7 == "0"
@@ -355,7 +390,7 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
       !insertmacro TraceWrite "[${MODE}] 已调用 $INSTDIR\${APP_EXE} --quit，退出码=$R8 输出=$R3"
     ${Else}
       ; 进程在跑但当前安装目录没有 exe（例如从别处跑的便携版）：无法代为退出，
-      ; 直接给出可执行提示，不要空转 10 秒轮询。
+      ; 直接给出可执行提示，不要空转整个等待预算。
       !if "${MODE}" == "install"
         !insertmacro TraceWrite "[${MODE}] 进程在跑但 $INSTDIR\${APP_EXE} 不存在，Abort"
         MessageBox MB_OK|MB_ICONSTOP "检测到 ${APP_EXE} 正在运行，但它不在本次安装目录 $INSTDIR 下，安装程序无法代为关闭。$\r$\n$\r$\n请先从托盘菜单「退出」${APP_NAME}（或在任务管理器结束 ${APP_EXE}），然后重新运行安装程序。" /SD IDOK
@@ -364,14 +399,14 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
         DetailPrint "警告：$INSTDIR\${APP_EXE} 不存在，且仍有 ${APP_EXE} 在运行（可能来自其他目录）；后续删除可能部分失败。"
       !endif
     ${EndIf}
-    ; 真实等待：**墙钟上限 15s**（`STOP_APP_BUDGET_MS`），每轮都以 tasklist 结果判定。
+    ; 真实等待：**墙钟上限 20s**（`STOP_APP_BUDGET_MS`），每轮都以 tasklist 结果判定。
     ; 停机判定只认 tasklist；Sleep 只是两轮之间的间隔，不参与判定。
     StrCpy $R9 0
     ; $R1 预置 0：首轮就判定「已退出」时循环体从不执行，若不预置 TRACE 里会是空串。
     ; 报 0 是诚实的（首轮探测即已退出，墙钟耗时可忽略），不额外采样以免掩盖真实毫秒。
     StrCpy $R1 0
     ; **大小写是语义**：System 插件里 `.r0` 写的是**用户变量 $0**，`.R0` 才是**寄存器 $R0**。
-    ; 2026-11-25 实测：写成 `.r0` 而读 `$R0` → 差值恒为 0，15s 墙钟永不触发，
+    ; 2026-11-25 实测：写成 `.r0` 而读 `$R0` → 差值恒为 0，预算墙钟永不触发，
     ; 等待循环只能靠进程自己退出（实测跑到第 226 轮）。探针对照：`.R1-.R0` 得 1203ms ✓。
     System::Call 'kernel32::GetTickCount()i .R0'
     ${Do}
@@ -388,10 +423,17 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
         ${ExitDo}
       ${EndIf}
     ${Loop}
+    !ifdef TRACE
+      ; 本步合计 = `--quit` 阻塞时长 + `$R1`（--quit 之后才开始的复查等待）。
+      ; 分母固定的那个数才是用户体感；`$R1` 单独看会是 0，容易误读成"没等"。
+      System::Call 'kernel32::GetTickCount()i .R2'
+      IntOp $R2 $R2 - $StopStepStartTick
+      !insertmacro TraceWrite "[${MODE}] 墙钟（本步合计：--quit + 复查）=$R2 ms；复查段=$R1 ms；轮次=$R9"
+    !endif
     ${If} $R7 == "1"
       !insertmacro TraceWrite "[${MODE}] 等待结束：仍在运行（轮次=$R9，实测=$R1 ms）"
       !if "${MODE}" == "install"
-        MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 15 秒），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从托盘菜单「退出」${APP_NAME}，或在任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
+        MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 20 秒），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从托盘菜单「退出」${APP_NAME}，或在任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
         Abort
       !else
         DetailPrint "警告：${APP_NAME} 仍在运行，后续删除可能因文件占用失败；请退出后手工删除残留目录。"
@@ -646,8 +688,8 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   ;
   ; **默认 fail-closed**（task-54 B3 裁定）：没有核心就**编译失败**。
   ; 为什么不是「release 才传 /DBUNDLED_ARIA2_REQUIRED」：那等于把事故责任押在
-  ; 「每个构建入口都记得加那个 define」上——task-61 之类改 15s→20s 的人顺手
-  ; makensis 一次就会产出无核心包，而失败要到用户首启才暴露。默认关死、
+  ; 「每个构建入口都记得加那个 define」上——谁改个数顺手 makensis 一次就会产出
+  ; 无核心包，而失败要到用户首启才暴露。默认关死、
   ; 想要无核心包必须显式写 /DNO_BUNDLED_ARIA2=1，写错方向才安全。
 !ifdef NO_BUNDLED_ARIA2
   ; 显式声明「本包不带核心」：Finish 页文案会明说需要联网下载（见文件头界面段）。
