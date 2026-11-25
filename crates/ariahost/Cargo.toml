@@ -34,5 +34,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Console",
+    # M3-f `--quit` 客户端：OpenProcess(SYNCHRONIZE) + WaitForSingleObject 等面板真的退出。
+    "Win32_System_Threading",
     "Win32_UI_Shell_PropertiesSystem",
 ] }

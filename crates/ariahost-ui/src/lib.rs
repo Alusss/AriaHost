@@ -18,6 +18,7 @@
 mod app;
 mod backend;
 mod core_host;
+pub mod ctl;
 mod fonts;
 mod instance;
 mod logbuf;
@@ -340,6 +341,14 @@ fn run(
         PRODUCT_NAME,
         options,
         Box::new(move |cc| {
+            // 控制管道（架构 §3.1）：`--quit` 的接收端。自测与灌行模式**不启动**——
+            // CI 会并发跑多个自检，同一个 `\\.\pipe\ariahost-ctl` 会互相抢（先连上的那个拿不到 quit）。
+            if selftest_frames.is_none() && seed_rows.is_none() {
+                let started = crate::ctl::serve(cc.egui_ctx.clone(), Arc::clone(&app_log));
+                if !started {
+                    app_log.push("控制管道启动失败：`--quit` 只能报「无实例」".to_owned());
+                }
+            }
             let panel = app::PanelApp::new(
                 cc,
                 PanelInit {

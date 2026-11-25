@@ -25,14 +25,14 @@ AriaHost — aria2 Windows 服务管理器
   ariahost --write-aumid <lnk>     给快捷方式写 AUMID（安装器调用；Toast 的前提）
   ariahost --service-status        打印服务状态（单行 JSON，机器可读；未安装也退出 0）
   ariahost --aria2-fetch [版本]    下载并安装 aria2 核心（省略版本 = 最新，如 1.37.0）
-  ariahost --quit                  请求运行中的面板实例退出
+  ariahost --quit                  请求运行中的面板实例退出（没实例也算成功，安装器用）
   ariahost --version | -V          显示版本
   ariahost --help | -h             显示本帮助
 
 退出码：
-  0  成功
-  1  失败（参数错误以 AH-E1001 开头；其他错误以 AH-E#### 开头）
-  2  --quit 与控制管道握手超时
+  0  成功（含 --quit 的「没有实例」与「已确认退出」）
+  1  失败（参数错误以 AH-E1001 开头；其他错误以 AH-E#### 开头；--quit 被拒绝也回 1）
+  2  --quit 与控制管道握手/等退出超时
 ";
 
 /// 解析后的子命令。
@@ -113,28 +113,47 @@ impl UsageError {
     }
 }
 
-/// `--quit` 与控制管道握手的三种结果（架构 §4.1.4）。
+/// `--quit` 与控制管道握手的结果（架构 §4.1.4）。
 ///
-/// M1 只有 [`QuitOutcome::NoInstance`] 会被构造；另外两态由 M2 的真实握手产生，
-/// 此处保留完整枚举，避免 M2 再改退出码映射。
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// **退出码口径**（M3-f 定版，与 `--help` 文本一致）：
+/// - `NoInstance` → **0**：安装器的卸载/覆盖升级流程会调 `--quit`，机器上本来就没面板
+///   在跑正是它想要的结果；这里回 1 会让安装报假错（M3-f 之前就是这个 bug）。
+/// - `Signalled` → 0：收到 `ok pid=` 且该进程已消失。
+/// - `Refused` → 1：管道回了 `refused ...`（对端不认识 `quit`，通常是版本不匹配）。
+/// - `Timeout` → 2：连上了但握手/等退出超时；调用方应「转人工」而不是重试到底。
+///
+/// 非 Windows 上 `platform_quit` 只会回 `NoInstance`，其余三态在那里「构造不出来」，
+/// 但退出码映射必须与平台无关地保持四态（测试也按四态断言）——所以按平台放行死代码检查。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuitOutcome {
-    /// 没有运行中的面板实例。
+    /// 没有运行中的面板实例（**算成功**）。
     NoInstance,
     /// 握手成功，实例已确认退出。
     Signalled,
-    /// 管道存在但握手超时。
+    /// 管道存在但拒绝了请求（原因为对端应答原文）。
+    Refused(String),
+    /// 管道存在但握手或等待退出超时。
     Timeout,
 }
 
 impl QuitOutcome {
-    /// 映射到进程退出码：无实例=1、成功=0、超时=2。
-    pub const fn exit_code(self) -> i32 {
+    /// 映射到进程退出码：无实例=0、成功=0、被拒=1、超时=2。
+    pub fn exit_code(&self) -> i32 {
         match self {
-            Self::NoInstance => EXIT_ERR,
-            Self::Signalled => EXIT_OK,
+            Self::NoInstance | Self::Signalled => EXIT_OK,
+            Self::Refused(_) => EXIT_ERR,
             Self::Timeout => EXIT_TIMEOUT,
+        }
+    }
+
+    /// 稳定文本前缀（脚本/安装器按它判断，别解析中文）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoInstance => "no-instance",
+            Self::Signalled => "accepted",
+            Self::Refused(_) => "refused",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -455,12 +474,7 @@ fn execute(command: &Command) -> i32 {
         Command::WriteAumid { lnk } => run_write_aumid(lnk),
         Command::Aria2Fetch { version } => run_aria2_fetch(version.as_deref()),
         Command::RuntimeSelftest { seconds } => run_runtime_selftest(*seconds),
-        Command::Quit => {
-            // M1 无控制管道，固定按「无实例」处理；M2 换成真实握手结果。
-            let outcome = QuitOutcome::NoInstance;
-            println!("no instance");
-            outcome.exit_code()
-        }
+        Command::Quit => run_quit(),
         Command::Version => {
             println!("{BINARY_NAME} {VERSION}");
             EXIT_OK
@@ -468,6 +482,146 @@ fn execute(command: &Command) -> i32 {
         Command::Help => {
             println!("{USAGE}");
             EXIT_OK
+        }
+    }
+}
+
+/// `--quit` 的握手与等退出总预算。
+///
+/// 安装器自己的等待超时是 15s，这里留 5s 余量：宁可我们先回「超时」，也别让安装器
+/// 在它那边超时后杀掉我们、留下半保存的会话。
+const QUIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `--quit`：请运行中的面板退出（架构 §4.1.4 + 控制管道 §3.1）。
+///
+/// 输出**一行**且带稳定前缀（脚本按它判断，别解析中文）：
+/// `quit: no-instance` / `quit: accepted` / `quit: refused <应答>` / `quit: timeout`。
+/// 失败分支才多打一行中文建议。**故意不带 AH 码**：错误码注册表里没有「控制管道」段，
+/// 硬套 E1/E2/E5 会让排障时按码搜到错的文档；语义已经由退出码 0/1/2 承担。
+fn run_quit() -> i32 {
+    let outcome = quit_running_panel();
+    match &outcome {
+        QuitOutcome::Refused(reason) => println!("quit: refused {reason}"),
+        other => println!("quit: {}", other.as_str()),
+    }
+    match &outcome {
+        QuitOutcome::NoInstance => {
+            println!("没有运行中的实例（安装器/升级流程视为成功）");
+        }
+        QuitOutcome::Signalled => {}
+        QuitOutcome::Refused(reason) => {
+            eprintln!("退出请求被拒绝：{reason}");
+            eprintln!("  → 面板与命令行版本可能不一致：装回同一版本后重试");
+        }
+        QuitOutcome::Timeout => {
+            eprintln!("与控制管道握手/等退出超时（{}s）", QUIT_BUDGET.as_secs());
+            eprintln!(
+                "  → 面板可能卡在保存会话：不动它会让下次启动自动降级；急的话在任务管理器结束它"
+            );
+        }
+    }
+    outcome.exit_code()
+}
+
+/// 连控制管道、发 `quit`、等目标进程消失（平台分派）。
+fn quit_running_panel() -> QuitOutcome {
+    platform_quit::quit(QUIT_BUDGET)
+}
+
+#[cfg(not(windows))]
+mod platform_quit {
+    use super::QuitOutcome;
+    use std::time::Duration;
+
+    /// 非 Windows：没有命名管道，当作「没有实例」（成功）。
+    pub fn quit(_budget: Duration) -> QuitOutcome {
+        QuitOutcome::NoInstance
+    }
+}
+
+#[cfg(windows)]
+mod platform_quit {
+    use super::QuitOutcome;
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use ariahost_ui::ctl::parse_ack_pid;
+
+    /// 握手 + 等退出的整体入口。整体耗时严格受 `budget` 约束（含线程调度）。
+    pub fn quit(budget: Duration) -> QuitOutcome {
+        let deadline = Instant::now() + budget;
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("ariahost-quit".to_owned())
+            .spawn(move || {
+                let _ = sender.send(handshake(deadline));
+            });
+        if spawned.is_err() {
+            return QuitOutcome::Timeout;
+        }
+        receiver
+            .recv_timeout(budget + Duration::from_millis(500))
+            .unwrap_or(QuitOutcome::Timeout)
+    }
+
+    fn handshake(deadline: Instant) -> QuitOutcome {
+        let name = ariahost_common::paths::control_pipe_name();
+        let mut pipe = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name)
+        {
+            Ok(pipe) => pipe,
+            // 打不开 = 管道不存在 = 没有实例在跑（**不是错误**）
+            Err(_) => return QuitOutcome::NoInstance,
+        };
+        if pipe.write_all(b"quit\n").is_err() || pipe.flush().is_err() {
+            // 连上又被立刻断：按「没有可用实例」处理，让安装器继续往下走
+            return QuitOutcome::NoInstance;
+        }
+        let mut buffer = [0u8; 128];
+        let read = match pipe.read(&mut buffer) {
+            Ok(0) => return QuitOutcome::Refused("对端没应答就断开".to_owned()),
+            Ok(read) => read,
+            Err(_) => return QuitOutcome::Timeout,
+        };
+        let ack = String::from_utf8_lossy(&buffer[..read]).trim().to_owned();
+        if ack.starts_with("refused") {
+            return QuitOutcome::Refused(ack);
+        }
+        let Some(pid) = parse_ack_pid(&ack) else {
+            return QuitOutcome::Refused(format!("应答不可解析：{ack}"));
+        };
+        // `ok` 只代表「收到了」，要等那个进程真的消失才算成功。
+        wait_for_exit(pid, deadline)
+    }
+
+    /// 等 pid 退出到 `deadline` 为止。
+    ///
+    /// 已知窄窗口：pid 可能在「拿到 ack」与「OpenProcess」之间被系统复用。
+    /// 本机、10s 内复用到同一个 pid 的概率可忽略，而且即便复用最多误判一次成功——
+    /// 安装器随后还会自己检查文件占用，兜的住。
+    fn wait_for_exit(pid: u32, deadline: Instant) -> QuitOutcome {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            // 打不开：进程已经没了（这正是我们要的结果）
+            return QuitOutcome::Signalled;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+        let waited = unsafe { WaitForSingleObject(handle, millis) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if waited == WAIT_OBJECT_0 {
+            QuitOutcome::Signalled
+        } else {
+            QuitOutcome::Timeout
         }
     }
 }
@@ -1415,12 +1569,38 @@ mod tests {
     }
 
     #[test]
-    fn quit_has_three_outcomes() {
+    fn quit_has_four_outcomes_with_pinned_exit_codes() {
         assert_eq!(parse_args(&["--quit"]), Ok(Command::Quit));
-        // M1 无 IPC：固定按「无实例」返回 1。
-        assert_eq!(run_args(&["--quit"]), EXIT_ERR);
-        assert_eq!(QuitOutcome::NoInstance.exit_code(), EXIT_ERR);
+        // 没有实例 = 安装器想要的结果 = 成功（M3-f 之前回 1，会让卸载/升级报假错）。
+        assert_eq!(QuitOutcome::NoInstance.exit_code(), EXIT_OK);
         assert_eq!(QuitOutcome::Signalled.exit_code(), EXIT_OK);
+        assert_eq!(
+            QuitOutcome::Refused("refused unknown-command:x".to_owned()).exit_code(),
+            EXIT_ERR
+        );
         assert_eq!(QuitOutcome::Timeout.exit_code(), EXIT_TIMEOUT);
+    }
+
+    #[test]
+    fn quit_text_prefixes_are_stable() {
+        // 脚本/安装器按前缀判断，不接受本地化改动。
+        assert_eq!(QuitOutcome::NoInstance.as_str(), "no-instance");
+        assert_eq!(QuitOutcome::Signalled.as_str(), "accepted");
+        assert_eq!(
+            QuitOutcome::Refused("refused x".to_owned()).as_str(),
+            "refused"
+        );
+        assert_eq!(QuitOutcome::Timeout.as_str(), "timeout");
+    }
+
+    #[test]
+    fn quit_without_instance_succeeds() {
+        // 本机（含 CI）通常没有面板在跑：这条路径必须回 0，且只打一行 quit: 前缀。
+        // 若恰好有实例在跑，真实握手也可能回 0（accepted）或 2（超时）——所以只断言「不是被拒」。
+        let code = run_args(&["--quit"]);
+        assert!(
+            code == EXIT_OK || code == EXIT_TIMEOUT,
+            "--quit 在没有实例时必须回 0（实际 {code}）"
+        );
     }
 }

@@ -40,4 +40,13 @@ windows-sys = { version = "0.59", features = [
     # 也不产生新的 crate（Cargo.lock 不变）。
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # M3-f 控制管道服务端：CreateNamedPipeW / ConnectNamedPipe / ReadFile / WriteFile
+    # 与 SDDL → SECURITY_ATTRIBUTES（拒绝网络登录）。同样只加 feature、不新增依赖。
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    # 0.59 的 ReadFile/WriteFile/ConnectNamedPipe 签名里带 OVERLAPPED（Win32::System::IO），
+    # 这些项按该 feature 门控：不开就「找不到符号」。
+    "Win32_System_IO",
 ] }
