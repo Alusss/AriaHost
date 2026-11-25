@@ -267,18 +267,24 @@ pub fn serve_blocking(config: WebConfig) -> Result<(), WebError> {
 // 自检（真起一个服务，用自己的最小客户端打它）
 // ---------------------------------------------------------------------------
 
-/// 自检：按配置起服务、逐项打点、把结果打到 stdout，然后**继续提供服务**并阻塞。
+/// 自检：按配置起服务、逐项打点、把结果打到 stdout，**跑完即返回，服务随之关闭**。
 ///
-/// 给 `ariahost --web-selftest` 用（CLI 由 Lead 接）。`Ctrl+C` 退出。
+/// 给 `ariahost --web-selftest` 用。自检的语义是「验完就走」；要前台常驻服务请用
+/// [`serve_blocking`]。
+///
+/// 历史教训（2026-11-25，CI run 45524691482）：这里曾经以 `loop { sleep(3600s) }`
+/// 常驻，导致任何调用方——包括 `crates/ariahost/src/cli.rs` 里那条
+/// `web_selftest_is_parsed_and_runs` 单测——**永不返回**。CI 上 6875 端口空闲，
+/// 自检真的把服务起起来了，于是测试挂到 job 超时；本地之所以"通过"，只是那台机器
+/// 的 6875 被残留进程占着，`Server::start` 提前失败返回，纯属撞运气。
+/// **自检函数不得包含无限阻塞。**
 pub fn selftest() -> Result<(), String> {
     let server = selftest_report()?;
     println!(
-        "SELFTEST ready url={}（服务继续运行，Ctrl+C 退出）",
+        "SELFTEST done url={}（自检完成；本函数返回后服务关闭，要常驻请用 serve_blocking）",
         server.url()
     );
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    Ok(())
 }
 
 /// 自检的「只报告不阻塞」版本：起服务、逐项断言并把 `SELFTEST` 行打到 stdout，
