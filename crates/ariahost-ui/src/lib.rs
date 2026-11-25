@@ -30,6 +30,10 @@ mod notify;
 mod service;
 mod settings;
 mod tasks;
+// 设计系统（`docs/design/ui-spec.md`）对外可见：主题 token 与壳/页 frame 是 UI 的公共词汇，
+// 各屏都从这里取，不许各写一套。`pub mod` 同时让「暂时还没被调用的 token 助手函数」
+// 不被 `dead_code` 误判成死代码（它们是设计系统的 API 面，不是残留）。
+pub mod theme;
 mod tray;
 mod view;
 mod window;

@@ -434,6 +434,10 @@ impl PanelApp {
             open_web,
         } = init;
 
+        // 主题必须先装：它写了 `text_styles` 与 `visuals`，晚一步就会先闪一帧黑底。
+        // 之后 `fonts::install` 只补字体数据，不再动样式（顺序写死在这里，别调换）。
+        crate::theme::install(ctx);
+
         let font = crate::fonts::install(ctx, &log);
         log.push(format!(
             "中文字体：{}",
@@ -1162,7 +1166,13 @@ impl PanelApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("状态").weak());
-            let badge = ui.label(RichText::new(label).strong().size(20.0).color(color));
+            let badge = ui.label(
+                RichText::new(label)
+                .strong()
+                // 字号只从 `text_styles` 阶梯取（§2.2 规则 1），不写字面量字号。
+                .font(egui::TextStyle::Heading.resolve(ui.style()))
+                .color(color),
+            );
             self.drive_targets.note("服务状态", badge.rect);
             ui.label(
                 RichText::new(format!("服务名 {}", ariahost_svc::SERVICE_NAME))
@@ -2615,9 +2625,12 @@ impl PanelApp {
                             .small(),
                         );
                         ui.horizontal(|ui| {
-                            if ui
-                                .button(format!("换 {} 再试", self.guide.line.other().label()))
-                                .clicked()
+                            // 只有一条线路时「换线路」会把同一条线路再说一遍（`has_alternative`
+                            // 的文档里就写明了这一点）：宁可不给这个按钮，也不给一个点了等于没点的。
+                            if self.guide.line.has_alternative()
+                                && ui
+                                    .button(format!("换 {} 再试", self.guide.line.other().label()))
+                                    .clicked()
                             {
                                 switch_line = true;
                             }
@@ -3009,14 +3022,11 @@ impl PanelApp {
 
     /// 折叠区：运行信息 / 输入法自检 / 内部日志。
     fn show_footer(&mut self, ui: &mut egui::Ui) {
-        // 「关于」常显一行（不折叠）：用户报障时第一句要能抄出「产品版本 + 核心来源与版本」，
+        // 「关于」常显一行（不折叠）：用户报障时第一句要能抄出「版本 + 核心来源与版本」，
         // 否则「安装包自带核心」这条在界面上无从证实（task-54 C-UI）。
+        // 产品名**不在这里重复**（UI-Spec §6.1 规则 2：产品名只在壳里出现一次）。
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(format!("{PRODUCT_NAME} {VERSION}"))
-                    .small()
-                    .weak(),
-            );
+            ui.label(RichText::new(format!("v{VERSION}")).small().weak());
             ui.label(RichText::new("·").small().weak());
             ui.label(
                 RichText::new(format!("aria2 核心：{}", core_summary(&self.core_probe)))
@@ -3438,6 +3448,46 @@ impl eframe::App for PanelApp {
 }
 
 impl PanelApp {
+    /// 壳（§6.1）：`AriaHost · <页面>` + 右侧页面导航。
+    ///
+    /// 三条规格在这里落地：产品名**只出现一次**；版本号不进标题（只进页脚与「关于」）；
+    /// 返回类按钮统一「← 返回」，口语化的「返回主界面」不再使用。
+    fn show_shell(&mut self, ui: &mut egui::Ui) {
+        let page = if self.service_open {
+            "服务"
+        } else if self.settings_open {
+            "设置"
+        } else {
+            "下载"
+        };
+        ui.horizontal(|ui| {
+            // `heading` 走 `text_styles` 里的 20pt，不写字面量字号（§2.2 规则 1）。
+            ui.heading(format!("{PRODUCT_NAME} · {page}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.service_open || self.settings_open {
+                    if ui.button("← 返回").clicked() {
+                        if self.service_open {
+                            self.toggle_service();
+                        } else {
+                            self.toggle_settings();
+                        }
+                    }
+                } else {
+                    let settings = ui.button("设置");
+                    self.drive_targets.note("设置入口", settings.rect);
+                    if settings.clicked() {
+                        self.toggle_settings();
+                    }
+                    let service = ui.button("服务");
+                    self.drive_targets.note("服务入口", service.rect);
+                    if service.clicked() {
+                        self.toggle_service();
+                    }
+                }
+            });
+        });
+    }
+
     /// 把一帧画完：真实窗口（`eframe::App::ui`）与隐藏自检驱动
     /// （`--panel-selftest --drive`）**共用这一条绘制路径**，避免驱动测到的不是产品代码。
     pub fn draw(&mut self, ui: &mut egui::Ui) {
@@ -3499,38 +3549,24 @@ impl PanelApp {
         };
         ui.ctx().request_repaint_after(repaint_after);
 
-        ui.horizontal(|ui| {
-            ui.heading(format!("{PRODUCT_NAME} {VERSION}"));
-            ui.label(RichText::new("M2-2b 下载面板").weak());
-            // 设置入口放标题栏右侧：不占任务表的地盘，也不改主界面布局。
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.settings_open {
-                    "返回主界面"
-                } else {
-                    "设置"
-                };
-                let entry = ui.button(label);
-                self.drive_targets.note("设置入口", entry.rect);
-                if entry.clicked() {
-                    self.toggle_settings();
-                }
-                let service_label = if self.service_open {
-                    "返回主界面"
-                } else {
-                    "服务"
-                };
-                let service_entry = ui.button(service_label);
-                self.drive_targets.note("服务入口", service_entry.rect);
-                if service_entry.clicked() {
-                    self.toggle_service();
-                }
+        // —— 壳（§6.1）：顶栏 `surface` 底、高 48；产品名与页面导航只在这里出现 ——
+        // 旧版把「产品名+版本 / 主题标签 / 两行 9pt 状态」全塞进一条横排：
+        // 没铺底（露出近黑清屏色，审计实测 2.48:1），版本号还抢占标题位置。
+        egui::Panel::top("ariahost_shell")
+            .frame(crate::theme::top_bar_frame(ui))
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                self.show_shell(ui);
             });
-        });
-        ui.add_space(2.0);
 
-        // 服务页打开时同样替掉主体区（M3-b）。
+        // 服务页 / 设置页同样要**铺底**再画内容：只画内容不铺底，露出的就是交换链清屏色
+        // （近黑），浅色主题下又是黑底深字——那正是审计里 2.48:1 的成因。三屏都必须铺。
         if self.service_open {
-            self.show_service_page(ui);
+            egui::CentralPanel::default()
+                .frame(crate::theme::page_frame(ui))
+                .show(ui, |ui| {
+                    self.show_service_page(ui);
+                });
             self.show_close_prompt(ui.ctx());
             self.maybe_finish_selftest(ui);
             return;
@@ -3538,13 +3574,18 @@ impl PanelApp {
 
         // 设置页打开时替掉主体区（顶部状态栏、任务表都不画）：既省内存，也不重排主界面。
         if self.settings_open {
-            self.show_settings(ui);
+            egui::CentralPanel::default()
+                .frame(crate::theme::page_frame(ui))
+                .show(ui, |ui| {
+                    self.show_settings(ui);
+                });
             self.show_close_prompt(ui.ctx());
             self.maybe_finish_selftest(ui);
             return;
         }
 
         egui::Panel::top("ariahost_status")
+            .frame(crate::theme::page_frame(ui))
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.show_status(ui);
@@ -3560,14 +3601,19 @@ impl PanelApp {
             });
 
         egui::Panel::bottom("ariahost_diag")
+            .frame(crate::theme::bottom_bar_frame(ui))
             .show_separator_line(true)
             .show(ui, |ui| {
                 self.show_footer(ui);
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.show_tasks(ui);
-        });
+        // 页面区：`bg_base` 铺底 + 左右 24。**这就是「黑底灰字」的修复点**——
+        // 不铺底时 egui 会露出交换链清屏色（近黑），浅色主题下永远是黑底深字。
+        egui::CentralPanel::default()
+            .frame(crate::theme::page_frame(ui))
+            .show(ui, |ui| {
+                self.show_tasks(ui);
+            });
 
         self.show_close_prompt(ui.ctx());
         self.maybe_finish_selftest(ui);
