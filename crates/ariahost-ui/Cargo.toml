@@ -35,4 +35,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    # M3-c 通知：`Shell_NotifyIconW` + `NOTIFYICONDATAW`（气泡）在 Win32_UI_Shell，
+    # 其中的 HICON 类型要求 Win32_UI_WindowsAndMessaging。只加 feature、不新增依赖，
+    # 也不产生新的 crate（Cargo.lock 不变）。
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }

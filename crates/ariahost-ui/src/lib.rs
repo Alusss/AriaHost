@@ -22,6 +22,7 @@ mod fonts;
 mod instance;
 mod logbuf;
 mod metrics;
+mod notify;
 mod settings;
 mod tasks;
 mod tray;
@@ -38,8 +39,15 @@ pub use app::{Banner, PanelInit, RuntimeFacts};
 pub use backend::Backend;
 pub use core_host::{CoreHost, CoreProbe, HostState};
 pub use logbuf::LogBuffer;
+pub use notify::{
+    Notification, Notifier, NotifyKind, NotifyLevel, NotifyOutcome, NotifyStats, SuppressReason,
+    COOLDOWN as NOTIFY_COOLDOWN, DAILY_CAP as NOTIFY_DAILY_CAP,
+};
 pub use settings::{Effect, Group, Notice, Settings};
 pub use tasks::{TaskAction, TaskRow, TaskStatus};
+// 托盘与通知的组合入口对外可见：`examples/notify_selftest.rs` 用它做人工目视自检
+// （M3-c 验收要「气泡真的出现」的证据），面板内部本来也走同一个类型。
+pub use tray::Tray;
 pub use view::{StatusView, Tone};
 pub use window::Geometry;
 pub use worker::{
