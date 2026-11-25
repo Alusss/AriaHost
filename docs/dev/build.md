@@ -287,3 +287,4 @@ Remove-Item -Recurse -Force dist  # 清暂存产物
 | `link.exe not found` | 缺 VS Build Tools 的「使用 C++ 的桌面开发」工作负载，见 [setup.md](setup.md) |
 | 自报 `private_kb` 与外部计数器差 3 MB 左右 | 正常：采样点不同（自报 = 结束瞬间单点，外部 = 60s 序列）。**结算一律用外部 `Get-Counter`**，见 §4.2 |
 | 想截图取证却截到锁屏 / 黑屏 | 机器锁屏或无桌面，截图没有意义。改用 UI Automation 读文本节点，见 §4.3 |
+| CI 的**许可逐字节对账**假红（18,431 B vs 18,092 B） | `actions/checkout` 按 autocrlf 把 LF 改写成 CRLF（差 339 B = 行数）。确认 `.gitattributes` 有 `installer/licenses/** -text`，并核 blob 侧应为 **18,092 B / `8177F975…B880643`**；本地复现用 `git -c core.autocrlf=true clone` 再量字节。**不要删这条 `-text`**，详见 [release.md](release.md) §7 |
