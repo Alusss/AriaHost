@@ -38,15 +38,6 @@ pub const DEFAULT_SOURCE_ORDER: &str = "cdn,github";
 /// CI 构建期的顺序：GitHub 优先（runner 在 GitHub 内网，比 CDN 快一个数量级）。
 pub const CI_SOURCE_ORDER: &str = "github,cdn";
 
-/// 镜像线路的默认模板（`{url}` 会被替换成完整 GitHub 资产 URL）。
-///
-/// **实测不可用**，只作为可配模板的默认值存在；不要把它当成「可用的备份线路」，
-/// 也不要再把它放进默认顺序（M4-0 起默认顺序只有 cdn / github）。
-pub const DEFAULT_MIRROR_TEMPLATE: &str = "https://r.alusss.cn/{url}";
-
-/// 镜像线路的默认显示名。
-pub const MIRROR_LINE_NAME: &str = "镜像 r.alusss.cn";
-
 /// `{url}` 占位符：整条资产 URL。
 pub const URL_PLACEHOLDER: &str = "{url}";
 
@@ -93,11 +84,6 @@ impl DownloadLine {
         }
     }
 
-    /// 默认镜像模板线路（历史可配入口的初始值）。
-    pub fn default_mirror() -> Self {
-        Self::new(MIRROR_LINE_NAME, DEFAULT_MIRROR_TEMPLATE)
-    }
-
     /// 模板是否带可用占位符（不带占位符的模板拼不出目标地址，配置校验用）。
     pub fn has_placeholder(&self) -> bool {
         self.template.contains(URL_PLACEHOLDER) || self.template.contains(FILE_PLACEHOLDER)
@@ -105,8 +91,10 @@ impl DownloadLine {
 
     /// 把模板里的占位符替换成真实地址。
     ///
-    /// 注意：**不做 URL 归一化/转义**——镜像前缀本来就是「前缀 + 完整 GitHub URL」的形态
-    /// （`https://r.alusss.cn/https://github.com/...`），转义反而会把它拼坏。
+    /// 注意：**不做 URL 归一化/转义**——`{url}` 形态（前缀 + 完整 GitHub URL）本来就靠
+    /// 原样拼接，转义反而会把它拼坏。
+    ///
+    /// 旧镜像线路（前缀式域名）已废弃并**删除**，勿再引入。
     pub fn join(&self, url: &str) -> String {
         let joined = self.template.replace(URL_PLACEHOLDER, url);
         if joined.contains(FILE_PLACEHOLDER) {
@@ -257,16 +245,6 @@ mod tests {
         let line = DownloadLine::direct();
         assert_eq!(line.join(ASSET_URL), ASSET_URL);
         assert!(line.has_placeholder());
-    }
-
-    #[test]
-    fn mirror_template_prefixes_full_url() {
-        let line = DownloadLine::default_mirror();
-        assert!(line.has_placeholder());
-        assert_eq!(
-            line.join(ASSET_URL),
-            format!("https://r.alusss.cn/{ASSET_URL}")
-        );
     }
 
     /// M4-0 的核心：CDN 线路只换 host 与前缀，文件名与官方资产同名。

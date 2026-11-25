@@ -45,8 +45,8 @@ pub use clean::{
 };
 pub use download::{
     ci_lines, default_lines, lines_from, DownloadLine, DownloadOutcome, CDN_LINE_NAME,
-    CI_SOURCE_ORDER, DEFAULT_CDN_BASE, DEFAULT_MIRROR_TEMPLATE, DEFAULT_SOURCE_ORDER,
-    DIRECT_LINE_NAME, FILE_PLACEHOLDER, MIRROR_LINE_NAME, URL_PLACEHOLDER,
+    CI_SOURCE_ORDER, DEFAULT_CDN_BASE, DEFAULT_SOURCE_ORDER, DIRECT_LINE_NAME, FILE_PLACEHOLDER,
+    URL_PLACEHOLDER,
 };
 pub use error::{CoreError, LineAttempt};
 pub use fetch::{

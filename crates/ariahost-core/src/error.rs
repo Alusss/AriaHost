@@ -27,7 +27,7 @@ use ariahost_common::ErrorCode;
 /// 一条下载线路的失败记录（`AllLinesFailed` 里逐条保留，供 UI 明确展示，不静默降级）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineAttempt {
-    /// 线路名（例如「直连 GitHub」「镜像 r.alusss.cn」）。
+    /// 线路名（例如「直连 GitHub」「CDN」；旧镜像前缀已废弃并删除）。
     pub line: String,
     /// 该线路上实际请求的 URL。
     pub url: String,
@@ -347,7 +347,7 @@ mod tests {
                 },
                 LineAttempt {
                     line: "镜像".to_owned(),
-                    url: "https://r.alusss.cn/https://github.com/x.zip".to_owned(),
+                    url: "https://mirror.invalid/https://github.com/x.zip".to_owned(),
                     detail: "HTTP 404".to_owned(),
                 },
             ],
