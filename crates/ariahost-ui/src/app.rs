@@ -44,6 +44,9 @@ const SIZE_TOLERANCE: i64 = 2;
 /// 「通道里有没有新结果」。500ms 足够跟手（刷新本身是 2s 一次），又不会烧 CPU。
 const IDLE_REPAINT: Duration = Duration::from_millis(500);
 
+/// 隐藏到托盘后的唤醒周期（2Hz：足够及时处理托盘点击，又不会常驻动画）。
+const HIDDEN_WAKE_INTERVAL: Duration = Duration::from_millis(500);
+
 /// 退出流程的总兜底时间（停止链自身有 15s+10s 两段超时，再加余量）。
 const QUIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -275,6 +278,8 @@ pub struct PanelApp {
     open_web: Option<crate::OpenWebFn>,
     /// 退出流程已经决定关窗：本帧要抢在 `Close` 生效前把窗口几何写盘。
     quit_save_pending: bool,
+    /// 窗口藏到托盘后，后台唤醒线程的开关（`true` = 继续唤醒）。
+    hidden_waker: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl PanelApp {
@@ -438,6 +443,7 @@ impl PanelApp {
             session_pending: None,
             open_web,
             quit_save_pending: false,
+            hidden_waker: None,
         }
     }
 
@@ -491,6 +497,49 @@ impl PanelApp {
         }
         if hidden {
             self.notify("已最小化到托盘（左键托盘图标可再打开）");
+            self.start_hidden_waker(ctx);
+        } else if let Some(flag) = self.hidden_waker.take() {
+            // 告诉唤醒线程停：否则它会一直以 2Hz 空转。
+            flag.store(true, Ordering::Relaxed);
+            self.log.push("窗口恢复显示：已停止托盘唤醒".to_owned());
+        }
+    }
+
+    /// 隐藏到托盘后仍要能收到托盘事件：窗口不可见时 eframe 通常不再出帧，
+    /// 而托盘事件只能在帧回调里 `try_recv`（不能另起线程 `recv`，那是 tray-icon 的约束）。
+    /// 所以这里起一个 **2Hz** 的唤醒线程：只 `request_repaint()`，不产生任何动画与绘制负载。
+    ///
+    /// 为什么不是每帧空转：架构要求「托盘常驻时禁止常驻动画」，2Hz 足够让菜单/左键点击
+    /// 在一个周期内被取走，且窗口不可见时 eframe 会把这一帧降到极低开销。
+    fn start_hidden_waker(&mut self, ctx: &egui::Context) {
+        if self.hidden_waker.is_some() {
+            return;
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let ctx = ctx.clone();
+        let log = Arc::clone(&self.log);
+        let spawned = std::thread::Builder::new()
+            .name("ariahost-tray-wake".to_owned())
+            .spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    ctx.request_repaint();
+                    std::thread::sleep(HIDDEN_WAKE_INTERVAL);
+                }
+            });
+        match spawned {
+            Ok(_handle) => {
+                self.hidden_waker = Some(stop);
+                self.log.push(format!(
+                    "已隐藏到托盘：后台每 {}ms 唤醒一次以接收托盘事件（无动画）",
+                    HIDDEN_WAKE_INTERVAL.as_millis()
+                ));
+            }
+            Err(error) => {
+                log.push(format!(
+                    "托盘唤醒线程启动失败：{error}（托盘操作可能无响应）"
+                ));
+            }
         }
     }
 
