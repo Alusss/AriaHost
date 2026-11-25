@@ -216,6 +216,7 @@ dependencies = [
  "ariahost-svc",
  "ariahost-ui",
  "ariahost-web",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
