@@ -236,8 +236,20 @@ impl Tray {
         } | NIIF_RESPECT_QUIET_TIME;
         // 10 秒；Win10/11 会把气泡转成系统通知，实际停留时长由系统策略决定。
         data.Anonymous.uTimeout = 10_000;
-        fill_wide(&mut data.szInfoTitle, title);
-        fill_wide(&mut data.szInfo, body);
+        // 对齐口径按**绑定生成的目标**分叉：windows-sys 在 x86 上把 `NOTIFYICONDATAW`
+        // 声明成 `#[repr(C, packed(1))]`（镜像 shellapi.h 的 pshpack1），x86_64/aarch64
+        // 上是 `#[repr(C)]`（自然对齐）。也就是说 x64 上取字段引用其实是合法的；但一旦
+        // 真编 32 位（`ci.yml` 的 `windows-x86` job 只在每周定时 / dispatch 带 run_x86 /
+        // tag push 时跑，push 到 main 不跑；`release.yml` 的 x86 打包 job 仍注释着），
+        // `&mut data.szInfoTitle` 会变成硬错误 `E0793`。这里统一走裸指针写入：
+        // 两种目标同一份代码，不用到 x86 再改。
+        unsafe {
+            write_wide_field::<SZ_INFO_TITLE>(
+                std::ptr::addr_of_mut!(data.szInfoTitle).cast::<u16>(),
+                title,
+            );
+            write_wide_field::<SZ_INFO>(std::ptr::addr_of_mut!(data.szInfo).cast::<u16>(), body);
+        }
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) != 0 }
     }
 
@@ -373,7 +385,10 @@ fn discover_shell_icon(hwnd: HWND, tooltip: &str) -> Result<ShellIcon, (&'static
         data.hWnd = hwnd;
         data.uID = uid;
         data.uFlags = NIF_TIP;
-        fill_wide(&mut data.szTip, tooltip);
+        // 同上（见 `write_wide_field` 的对齐说明）：裸指针写入，x86 目标下该字段是 packed。
+        unsafe {
+            write_wide_field::<SZ_TIP>(std::ptr::addr_of_mut!(data.szTip).cast::<u16>(), tooltip);
+        }
         if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } != 0 {
             return Ok(ShellIcon { hwnd, uid });
         }
@@ -386,7 +401,9 @@ fn discover_shell_icon(hwnd: HWND, tooltip: &str) -> Result<ShellIcon, (&'static
 ///
 /// 气泡正文上限 255 字符、标题 63 字符（Win32 结构体定长），超长只能截断——
 /// 宁可少几个字，也不要因为超长被系统整条丢掉。
-#[cfg(windows)]
+///
+/// 只在 Windows 上被生产代码调用；test 也编进来是为了让 Linux 侧单测能直接跑它。
+#[cfg(any(windows, test))]
 fn fill_wide(destination: &mut [u16], text: &str) {
     let limit = destination.len().saturating_sub(1);
     let mut written = 0;
@@ -398,6 +415,35 @@ fn fill_wide(destination: &mut [u16], text: &str) {
         written += 1;
     }
     destination[written] = 0;
+}
+
+/// `NOTIFYICONDATAW::{szInfoTitle, szInfo, szTip}` 的定长（`u16` 个数，与 shellapi.h 一致）。
+#[cfg(any(windows, test))]
+const SZ_INFO_TITLE: usize = 64;
+#[cfg(any(windows, test))]
+const SZ_INFO: usize = 256;
+#[cfg(any(windows, test))]
+const SZ_TIP: usize = 128;
+
+/// 把文本写进定长宽字符字段（**不取字段引用**，只按裸指针整段写）。
+///
+/// 为什么不用 `&mut`：`NOTIFYICONDATAW` 在 windows-sys 里按目标分两种声明——
+/// x86 是 `#[repr(C, packed(1))]`（镜像 shellapi.h 的 `pshpack1.h`），
+/// x86_64/aarch64 是 `#[repr(C)]`（自然对齐）。对 packed 结构体字段取引用既可能未对齐、
+/// 又会被 rustc 直接拒（`E0793`，**所有目标都是硬错误**，不是「x64 侥幸能过」）。
+/// 所以同一份代码统一走裸指针：x64 上等价于普通写入，将来补 32 位包也不会炸在编译期。
+///
+/// 做法：先在本地数组里按宽字符填好（截断 + NUL 结尾），再用裸指针整段写回。
+///
+/// # Safety
+/// `field` 必须是 `std::ptr::addr_of_mut!` 取到的、指向 `N` 个 `u16` 的字段存储；
+/// 不能用引用再 `.cast()` 过来。
+#[cfg(any(windows, test))]
+unsafe fn write_wide_field<const N: usize>(field: *mut u16, text: &str) {
+    let mut buffer = [0u16; N];
+    fill_wide(&mut buffer, text);
+    // 结构体本来是 `zeroed()` 的，尾部多余位置两边都是 0，整段复制即可。
+    unsafe { std::ptr::copy_nonoverlapping(buffer.as_ptr(), field, N) };
 }
 
 /// 供面板把动作写进日志时用的中文名。
@@ -412,5 +458,85 @@ impl TrayAction {
             Self::OpenWeb => "在浏览器打开",
             Self::Quit => "退出",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 与 x86 目标下的 `NOTIFYICONDATAW` 同构的最小复刻：`packed(1)` + 定长宽字符字段。
+    ///
+    /// windows-sys 只在 `target_arch = "x86"` 上把真结构体声明成 `packed(1)`，x64 上是
+    /// 自然对齐的 `repr(C)`；本机是 x64，编不到那个分支。所以用这个替身，让
+    /// 「不许对 packed 字段取引用」这条纪律在本机单测里也能真跑。
+    #[repr(C, packed(1))]
+    struct PackedLikeNotifyIconData {
+        header: u32,
+        title: [u16; SZ_INFO_TITLE],
+        body: [u16; SZ_INFO],
+    }
+
+    /// 按 NUL 截断解回字符串。
+    fn text_of(field: &[u16]) -> String {
+        let end = field
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(field.len());
+        String::from_utf16_lossy(&field[..end])
+    }
+
+    #[test]
+    fn wide_field_capacities_match_shellapi() {
+        // shellapi.h 里 `NOTIFYICONDATAW` 的三个定长字段：szTip[128] / szInfo[256] /
+        // szInfoTitle[64]，单位是 WCHAR（含结尾 NUL）。这三个数一旦写错，
+        // `fill_wide` 的截断就会越界或提前丢字，所以在这里钉死。
+        assert_eq!((SZ_TIP, SZ_INFO, SZ_INFO_TITLE), (128, 256, 64));
+    }
+    #[test]
+    fn fill_wide_truncates_and_terminates() {
+        let mut buffer = [0xFFFFu16; SZ_INFO_TITLE];
+        fill_wide(&mut buffer, "下载完成");
+        assert_eq!(text_of(&buffer), "下载完成");
+        assert_eq!(buffer[4], 0, "写完必须留 NUL 结尾");
+
+        // 超长：只能写 len-1 个单元，最后一个位置必须是 NUL（否则 Win32 会读飞）。
+        let mut long = [0xFFFFu16; 8];
+        fill_wide(&mut long, "0123456789");
+        assert_eq!(text_of(&long), "0123456");
+        assert_eq!(long[7], 0);
+    }
+
+    #[test]
+    fn write_wide_field_writes_packed_field_without_taking_references() {
+        let mut data = PackedLikeNotifyIconData {
+            header: 0x0BAD_F00D,
+            title: [0; SZ_INFO_TITLE],
+            body: [0; SZ_INFO],
+        };
+
+        // 关键：字段地址只能靠 `addr_of_mut!` 拿。写成 `&mut data.title` 会直接编译失败
+        // （`E0793`：packed 字段的引用可能未对齐，所有目标都是硬错误）。
+        unsafe {
+            write_wide_field::<SZ_INFO_TITLE>(
+                std::ptr::addr_of_mut!(data.title).cast::<u16>(),
+                "下载完成",
+            );
+            write_wide_field::<SZ_INFO>(
+                std::ptr::addr_of_mut!(data.body).cast::<u16>(),
+                &"正".repeat(SZ_INFO + 10),
+            );
+        }
+
+        // 读 packed 字段也只能按值拷出来（同样不许取引用）。
+        let header = data.header;
+        let title = data.title;
+        let body = data.body;
+
+        assert_eq!(header, 0x0BAD_F00D, "不能越界踩到前面的字段");
+        assert_eq!(text_of(&title), "下载完成");
+        let body_text = text_of(&body);
+        assert_eq!(body_text.chars().count(), SZ_INFO - 1, "正文按定长截断");
+        assert_eq!(body[SZ_INFO - 1], 0, "尾部 NUL 必须落在字段内");
     }
 }
