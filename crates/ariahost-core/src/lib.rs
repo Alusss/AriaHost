@@ -25,6 +25,7 @@
 //! 不碰面板、不装服务、不做命名管道；只提供库 API 与隐藏 CLI 入口
 //! （`ariahost --aria2-fetch <latest|版本号>`）。
 
+pub mod clean;
 pub mod download;
 pub mod error;
 pub mod fetch;
@@ -34,6 +35,12 @@ pub mod runtime;
 pub mod store;
 pub mod zip_extract;
 
+pub use clean::{
+    clean, clean_with, scan, Aria2State, CategorySummary, CleanItem, CleanOutcome, CleanReport,
+    CleanResult, CleanTarget, LiveState, RealLiveState, ScanContext, ScanLimits, ScanRoots,
+    SkippedItem, Urgency, BUBBLE_MAX_BYTES, SCAN_ENTRY_BUDGET, SILENT_MAX_BYTES,
+    STAGING_MIN_AGE_SECS, TMP_MAX_AGE_HOURS,
+};
 pub use download::{
     default_lines, DownloadLine, DownloadOutcome, DEFAULT_MIRROR_TEMPLATE, DIRECT_LINE_NAME,
     MIRROR_LINE_NAME, URL_PLACEHOLDER,
