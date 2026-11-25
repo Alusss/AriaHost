@@ -433,38 +433,16 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
     ${If} $R7 == "1"
       !insertmacro TraceWrite "[${MODE}] 等待结束：仍在运行（轮次=$R9，实测=$R1 ms）"
       !if "${MODE}" == "install"
-        ; 守卫（task-64）：`--quit` 的最坏路径是「客户端自等 10s + ctl 兜底 2s + 保存会话/停 aria2c」，
-        ; 真机 20 连跑里仍偶发超过 20s 墙钟；此时安装器原本直接 Abort，用户看到的是
-        ; 「面板已经退了、安装器却报仍在运行」——差一两秒的假失败。
-        ; 所以最后一道不是继续等，而是**强制收掉本安装目录的实例**（它的退出流程已经没响应了，
-        ; 再等只会把差异放大）。只在 $INSTDIR\ariahost.exe 存在时才 kill：上方已把
-        ; 「同名进程但不装在本目录」分流成提示 + Abort，所以这里不会误杀别人的同名程序。
-        ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
-          !insertmacro TraceWrite "[guard] 20s 内未退出 → taskkill /F /IM ${APP_EXE}"
-          nsExec::ExecToStack 'taskkill /F /IM ${APP_EXE}'
-          Pop $R6
-          Pop $R5
-          !insertmacro TraceWrite "[guard] taskkill 返回码=$R6"
-          StrCpy $R9 0
-          ${Do}
-            !insertmacro ProcessIsRunning ${APP_EXE} 12
-            ${If} $R7 == "0"
-              !insertmacro TraceWrite "[guard] 复查第 $R9 轮：已退出"
-              ${ExitDo}
-            ${EndIf}
-            Sleep 250
-            IntOp $R9 $R9 + 1
-            ${If} $R9 >= 20
-              ${ExitDo}
-            ${EndIf}
-          ${Loop}
-          !insertmacro TraceWrite "[guard] 复查结束：$R7（轮次=$R9）"
-        ${EndIf}
-        ${If} $R7 == "1"
-          MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 20 秒并尝试强制结束仍未成功），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
-          Abort
-        ${EndIf}
-        DetailPrint "${APP_NAME} 未在预算内自行退出，已强制结束（守卫），继续安装。"
+        ; 这里**不** taskkill：task-64 的边界明确禁止（强杀会跳过面板退出流程里的保存会话/停 aria2c，
+        ; 等于让安装器替面板做它自己的责任）。20s 还没退 = 面板卡死在退出流程，唯一诚实的做法是报错。
+        ;
+        ; 文件占用那一类竞态是**另一件事**，交给 File 之前的可写守卫（WaitForFileWritable）：
+        ;   · 这里防「进程还在」；
+        ;   · 那里防「进程已退，但 ariahost.exe 的句柄尚未释放（杀软实时扫描 / 句柄拆除延迟）」。
+        ; task-61 的真机 E2E 里出现过后者：TRACE 明确写「--quit 退出码=0、复查第 0 轮已退出」，
+        ; 但紧接的 File 直接 Abort，复跑即成功——所以两道守卫不能互相替代。
+        MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 20 秒仍未退出），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从托盘菜单「退出」，或从任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
+        Abort
       !else
         DetailPrint "警告：${APP_NAME} 仍在运行，后续删除可能因文件占用失败；请退出后手工删除残留目录。"
       !endif
@@ -707,6 +685,37 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   ; 清错误标志再 File：`${Errors}` 反映的是**最近一次**相关操作的错误标志，若不先清，
   ; 前面任何一次失败（例如 TRACE 文件打不开、CreateDirectory 失败）都会被误判成
   ; "File 失败"——真机实测过这条假阳性（exit 1 而文件其实装好了）。
+  ; ---- 覆盖写之前：等目标 exe 变成「可写」（task-64 守卫）------------------------------
+  ; 为什么需要：面板**逻辑上已退出** ≠ `ariahost.exe` 的**文件句柄已释放**。真机观察到过一次
+  ; Abort（TRACE 写着「--quit 退出码=0、复查第 0 轮已退出」，紧接的 File 却失败），复跑立刻成功——
+  ; 典型成因是杀软实时扫描或句柄拆除延迟，属于必须吸收掉的偶发。
+  ; 判据用「能不能以追加方式打开」而不是 tasklist：进程列表为 0 时句柄仍可能被别的东西持有。
+  ; 只在目标**已存在**（升级/覆盖）时生效：全新安装 $INSTDIR\ariahost.exe 不存在，立刻跳过、不多等。
+  ; 上限 8s（32 × 250ms）；超时**不静默继续**，明确报错 + 非零退出（exit 1）。
+  ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
+    StrCpy $R9 0
+    ${Do}
+      ClearErrors
+      FileOpen $R2 "$INSTDIR\${APP_EXE}" a
+      ${If} ${Errors}
+        Sleep 250
+        IntOp $R9 $R9 + 1
+        ${If} $R9 >= 32
+          ${ExitDo}
+        ${EndIf}
+      ${Else}
+        FileClose $R2
+        ${ExitDo}
+      ${EndIf}
+    ${Loop}
+    !insertmacro TraceWrite "[install] 可写守卫：轮次=$R9（0=立即可写；>0 = 竞态真实存在，已被吸收）"
+    ${If} $R9 >= 32
+      !insertmacro TraceWrite "[install] 可写守卫超时：$INSTDIR\${APP_EXE} 8s 内打不开写句柄"
+      MessageBox MB_OK|MB_ICONSTOP "安装目录下的 ${APP_EXE} 仍被占用（可能是杀毒软件正在扫描），8 秒内无法写入，安装已中止。$\r$\n$\r$\n请稍后重试；若反复出现，把安装目录加入杀毒软件的排除项。" /SD IDOK
+      SetErrorLevel 1
+      Abort
+    ${EndIf}
+  ${EndIf}
   ClearErrors
   File "${SRCDIR}\${APP_EXE}"
   ; 图标：与安装器自己、开始菜单/桌面快捷方式、exe 资源共用同一份 ICO
