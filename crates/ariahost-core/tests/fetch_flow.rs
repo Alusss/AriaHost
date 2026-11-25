@@ -882,7 +882,8 @@ fn bad_cdn_responses_all_degrade_to_github_line() {
 #[test]
 fn default_lines_cdn_first_then_direct() {
     // 守住默认顺序（task-72 / Q17 拍板）：**自带 CDN 优先，官方直连兜底**。
-    // 来由（真机实测）：用户网络下 `api.github.com` 与 `r.alusss.cn` 镜像都拿不到包，
+    // 来由（真机实测）：用户网络下 `api.github.com` 与**旧镜像前缀**都拿不到包
+    // （旧镜像域名已废弃，见 `ariahost-ui` 的 core_setup 说明，此处不再写域名，免得被当成仍可用），
     // CDN 是唯一可用线路；但 CDN 是第三方主机（可能挂/可能被劫），
     // 一旦它失败必须能退回官方直连，所以两条都在、顺序固定。
     let lines = default_lines();
