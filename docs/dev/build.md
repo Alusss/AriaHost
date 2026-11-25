@@ -138,6 +138,7 @@ $s.CounterSamples | Measure-Object -Property CookedValue -Minimum -Maximum
 - **不要指望截图**：锁屏时截出来是锁屏界面，无头环境根本没有桌面。改用 **UI Automation 读 egui（accesskit）暴露的文本节点**——M2-1 实测读到 **46 个可见文本节点**，覆盖服务状态、aria2 版本 / 速率 / 任务计数与四个按钮文案。这足以证明「文案与结构对」，也是 #16 面板形态的取证手段。
 - **反面教训**：假 aria2 把 JSON-RPC `id` 回成数字时，客户端每轮 `getVersion` 失败并按 2s 退避重试。这**恰恰证明退避与失败归类在工作**——取证时要记录调用间隔（实测 **2.1s** = 2s 节流 + 30ms 往返），别把「一直失败」直接当缺陷。
 - **能力边界**：UI Automation 证明不了**字形正确、中文渲染正常、输入法能上屏**。`selftest` 里 `font=Microsoft_YaHei_UI` 只说明字体解析成功 ≠ 字形正确 ≠ 能输入——这三件事必须人眼 + 真机输入法，见验收 #13（**仍未通过**）。
+- **能验「关闭行为」**（2026-11-25 实测）：对窗口发 `WindowPattern.Close`（UIA）**确实会走到 eframe 的 `close_requested`**，不是被 winit 直接吞掉。判据是 `window.json` 被写盘——它只在 close 分支里写。因此 `ui.close_action` 三档（`tray`/`ask`/`exit`）可以在锁屏下真机验证：`tray` 之后进程仍在且窗口 `Visible=false`；`ask` 之后 UIA 树里出现对话框文本；`exit` 之后约 4 秒进程与 `aria2c` 都消失。
 
 ## 5. 本地打安装包
 
