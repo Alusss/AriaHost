@@ -1,18 +1,19 @@
-# AriaHost — 发布流水线（x64 per-user 单包 + NSIS 安装包）
+# AriaHost — 发布流水线（x64 + x86 双 per-user 包 + NSIS 安装包）
 #
 # 触发：推送 v* tag（会创建 GitHub Release）或手动 workflow_dispatch（只出 artifact）。
 #
 # 计费前提：private 仓库，Windows runner 2× 分钟计费（Free 2000 分钟/月 ≈ 1000 分钟实际构建）。
-# 所以本流程**只编 x64 per-user 一个包**；x86 与 /DPER_MACHINE 全机变体在 M4 才进矩阵
-# （Q3/Q15，恢复步骤见下方被注释掉的 build-x86 段落）。
+# 矩阵两条腿（x64 / x86）都真跑：clippy + test + release build + **各自独立的 dumpbin
+# 静态 CRT 门禁**。x86 是交叉编译（host x64 / target i686，rc.exe 走 Hostx64\x86），
+# 首次跑靠 matrix.timeout 留余量。双架构定版见 Q17 / 架构 §4.9.1。
 #
-# 现状：仓库尚无 Rust 工程与 Cargo.toml，本流程待 M1 后首次真跑验证；
-# NSIS 脚本 installer/ariahost.nsi 未经本地 makensis 编译（开发机无 NSIS），
-# 首次编译结果以 M3 的 CI 日志为准。详见 docs/dev/ci.md 与 docs/dev/release.md。
+# 现状（2026-11-26）：Rust 工程与 Cargo.toml 已在；`installer/ariahost.nsi` 已由 CI 的
+# 真实 makensis 编译通过并出过 v0.1.0 / v0.1.1 / v0.1.2 三个 Release。详见
+# docs/dev/ci.md 与 docs/dev/release.md。
 #
 # 为什么这里没有 paths 过滤：tag 推送本身就是一次显式的发布决定，用路径过滤跳过它只会在
 # 「忘了改某文件」时造成「打了 tag 却没有 Release」这种更难查的故障。省分钟靠的是
-# 「只编一个包 + 7 天 artifact 保留」，不是跳过发布。
+# 「双架构必须都在 tag 上验过 + 7 天 artifact 保留」，不是跳过发布。
 name: Release
 
 on:
