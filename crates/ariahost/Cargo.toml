@@ -45,7 +45,9 @@ windows-sys = { workspace = true, features = [
     # M3-f `--quit` 客户端：OpenProcess(SYNCHRONIZE) + WaitForSingleObject 等面板真的退出。
     "Win32_System_Threading",
     "Win32_UI_Shell_PropertiesSystem",
-    # M3-e `--diagnose`：TokenElevation（是否管理员）+ GetVersionExW（OS 版本，仅供参考）。
+    # M3-e `--diagnose`：TokenElevation（是否管理员）+ OS 版本（ntdll!RtlGetVersion 动态解析，
+    # 不能用 GetVersionExW：manifest 未声明 supportedOS 时它会谎报 6.2/9200）。
     "Win32_Security",
     "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
 ] }

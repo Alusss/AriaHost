@@ -329,7 +329,7 @@ fn known_secrets(config: Option<&Config>) -> Vec<String> {
     }
     push_value(&mut values, proxy_password(&config.net.proxy));
     // 长的先换：短值可能是长值的子串，先换短值会把长值切成两半。
-    values.sort_by(|left, right| right.len().cmp(&left.len()));
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values
 }
 
@@ -470,10 +470,14 @@ fn rpc_probe(config: &Config) -> Value {
 }
 
 /// RPC 错误的可读文本：有错误码就带码，没有就用原文（`--diagnose` 不是协议，人可以读）。
+///
+/// `RpcCallError` 的 `Display` 里已经带码，别再加一遍（真机上曾出现
+/// `AH-E2003 AH-E2003 连接 aria2 RPC 失败`）。
 fn rpc_error_text(error: &ariahost_aria2::RpcCallError) -> String {
+    let text = error.to_string();
     match error.code() {
-        Some(code) => format!("{} {error}", code.code()),
-        None => error.to_string(),
+        Some(code) if !text.contains(code.code()) => format!("{} {text}", code.code()),
+        _ => text,
     }
 }
 
@@ -529,7 +533,13 @@ fn env_json(now: SystemTime) -> Value {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "os_version": platform::os_version()
-            .map(|(major, minor, build)| json!({"major": major, "minor": minor, "build": build}))
+            .map(|version| json!({
+                "major": version.major,
+                "minor": version.minor,
+                "build": version.build,
+                // 读包的人必须知道这个数字可不可信（见 `platform::os_version` 的注释）。
+                "source": version.source,
+            }))
             .unwrap_or(Value::Null),
         "is_admin": platform::is_admin(),
         "username": std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok(),
@@ -711,6 +721,16 @@ fn write_zip(dir: &Path, now: SystemTime, entries: Vec<Entry>) -> Result<Report,
 // ---------------------------------------------------------------------------
 
 mod platform {
+    /// Windows 版本三件套 + **这个数字的取法**（`source` 会被写进 `env.json`）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OsVersion {
+        pub major: u32,
+        pub minor: u32,
+        pub build: u32,
+        /// `ntdll-rtlgetversion` = 可信；`fallback-getversionex…` = 可能被 manifest 影响。
+        pub source: &'static str,
+    }
+
     /// 是否以管理员（提升）身份运行；取不到就 `None`（不猜）。
     #[cfg(windows)]
     pub fn is_admin() -> Option<bool> {
@@ -748,29 +768,69 @@ mod platform {
         None
     }
 
-    /// Windows 版本（主/次/构建）。非 Windows 返回 `None`。
+    /// Windows 版本（主/次/构建）+ **这个数字是怎么来的**。
     ///
-    /// 用 `GetVersionExW`：**manifest 未声明 supportedOS 时它会谎报 6.2/9200**。
-    /// 诊断包里这个字段只作参考，`os`/`arch` 才是硬信息；真需要精确版本时看日志里的
-    /// `aria2c --version` 或事件查看器。
+    /// 真机教训：`GetVersionExW` 在本程序上报的是 **6.2 / 9200（Windows 8）**——因为它
+    /// 看的是进程 manifest 里声明的 `supportedOS`，而不是机器真实版本。诊断包把 OS 写错
+    /// 会直接误导排障（「为什么 wgpu 在 Win11 上崩」这种问题的第一现场就是这里）。
+    ///
+    /// 所以先用 `ntdll!RtlGetVersion`：它不读 manifest，返回真实版本；动态解析是为了
+    /// 不把 `ntdll` 变成链接期依赖（它本来也不在 import 表里）。解析失败才退回
+    /// `GetVersionExW`，并**在 `source` 里老实标注**，让读包的人知道这个数字可能不准。
     #[cfg(windows)]
-    pub fn os_version() -> Option<(u32, u32, u32)> {
+    pub fn os_version() -> Option<OsVersion> {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+        /// `NTSTATUS RtlGetVersion(PRTL_OSVERSIONINFOW) -> NTSTATUS`（0 = 成功）。
+        type RtlGetVersionFn = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+
+        // SAFETY: `ntdll.dll` 在 Windows 上恒已加载（只取模块句柄，不增引用计数）；
+        // `RtlGetVersion` 的签名按 WinDDK 声明，调用方给出的结构体已填好大小字段。
+        unsafe {
+            let module_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+            let module = GetModuleHandleW(module_name.as_ptr());
+            if !module.is_null() {
+                if let Some(address) = GetProcAddress(module, b"RtlGetVersion\0".as_ptr()) {
+                    // SAFETY: 地址来自 `GetProcAddress("RtlGetVersion")`，签名与别名一致。
+                    let rtl: RtlGetVersionFn = std::mem::transmute(address);
+                    let mut info = OSVERSIONINFOW::default();
+                    info.dwOSVersionInfoSize =
+                        u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0);
+                    if rtl(&mut info) == 0 {
+                        return Some(OsVersion {
+                            major: info.dwMajorVersion,
+                            minor: info.dwMinorVersion,
+                            build: info.dwBuildNumber,
+                            source: "ntdll-rtlgetversion",
+                        });
+                    }
+                }
+            }
+        }
+        get_version_ex()
+    }
+
+    /// 兜底：`GetVersionExW`（可能因 manifest 谎报，`source` 会标出来）。
+    #[cfg(windows)]
+    fn get_version_ex() -> Option<OsVersion> {
         use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
 
         let mut info = OSVERSIONINFOW::default();
         info.dwOSVersionInfoSize =
             u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0);
-        // SAFETY: 结构体按 SDK 定义填好 `dwOSVersionInfoSize` 后只读查询，不持有任何句柄。
+        // SAFETY: 按 SDK 定义填好 `dwOSVersionInfoSize` 后只读查询，不持有任何句柄。
         let ok = unsafe { GetVersionExW(&mut info) };
-        if ok == 0 {
-            None
-        } else {
-            Some((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
-        }
+        (ok != 0).then(|| OsVersion {
+            major: info.dwMajorVersion,
+            minor: info.dwMinorVersion,
+            build: info.dwBuildNumber,
+            source: "fallback-getversionex（可能受 manifest 影响而不准）",
+        })
     }
 
     #[cfg(not(windows))]
-    pub fn os_version() -> Option<(u32, u32, u32)> {
+    pub fn os_version() -> Option<OsVersion> {
         None
     }
 }
@@ -1069,6 +1129,23 @@ mod tests {
         .expect("env.json 必须是合法 JSON");
         assert_eq!(env["product"], ariahost_common::PRODUCT_NAME);
         assert_eq!(env["version"], ariahost_common::VERSION);
+    }
+
+    #[test]
+    fn rpc_error_text_carries_the_code_only_once() {
+        // 真机撞到的是 `AH-E2003 AH-E2003 连接 aria2 RPC 失败`：Display 已经带码，
+        // 旧实现又拼了一遍。这里钉住「码最多出现一次」。
+        let error = ariahost_aria2::RpcCallError::Connect {
+            detail: "connection timed out".to_owned(),
+            timed_out: true,
+        };
+        let text = rpc_error_text(&error);
+        let code = error.code().expect("Connect 必须映射到错误码");
+        assert_eq!(text.matches(code.code()).count(), 1, "错误码重复了：{text}");
+        assert!(
+            text.contains("connection timed out"),
+            "原始细节丢了：{text}"
+        );
     }
 
     #[test]
