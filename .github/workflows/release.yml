@@ -374,13 +374,55 @@ jobs:
         with:
           path: C:\Program Files (x86)\NSIS
           key: nsis-3.13.0-${{ runner.os }}
-      - name: 安装 NSIS（缓存未命中才 choco；3 次重试 + 退避）
+      - name: 安装 NSIS（缓存未命中：SourceForge 便携包优先，choco 仅兜底）
         shell: pwsh
         run: |
           if ("${{ steps.nsis-cache.outputs.cache-hit }}" -eq "true") {
-            Write-Host "NSIS 命中缓存（key=nsis-3.13.0-${{ runner.os }}），跳过 choco"
+            Write-Host "NSIS 命中缓存（key=nsis-3.13.0-${{ runner.os }}），跳过安装"
             exit 0
           }
+          $dest = "${env:ProgramFiles(x86)}\NSIS"
+          # 线路 1（首选）：SourceForge 便携 zip，钉 SHA-256。理由：2026-11-26 发 v0.1.3 时
+          # chocolatey.org 先 503 后 504，x64/x86 两条腿同时红，且红点都在整条编译之后。
+          # SourceForge 与 chocolatey.org 不在同一条依赖链上，且这份 zip 就是 NSIS 官方
+          # 发布渠道（同版本同字节，本机实测用它能编译本项目 .nsi）。
+          # 布局注意：zip 里真正的 makensis 在 `Bin\` 下。**不要**把它挪到安装根——实测挪
+          # 到根会以 0xC0000135（STATUS_DLL_NOT_FOUND）退出；根的 2.5 KB `makensis.exe`
+          # 是官方转发器，`/VERSION` 也正常回 v3.13。
+          $url  = "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13.zip"
+          $want = "BA63DFFC4410EE89193E1CB5A41989991BD77C61068DA17E3156D136B7B0B3D8"
+          $zip  = Join-Path $env:RUNNER_TEMP "nsis-3.13.zip"
+          $ok = $false
+          for ($i = 0; $i -lt 2; $i++) {
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            curl.exe -L --retry 3 --retry-connrefused --max-time 180 -sS -o $zip $url
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "便携包下载失败（curl exit $LASTEXITCODE），第 $($i + 1)/2 次"
+              Start-Sleep -Seconds 5
+              continue
+            }
+            $got = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash
+            if ($got -ne $want) {
+              Write-Warning "便携包 SHA-256 不匹配：期望 $want，实际 $got（第 $($i + 1)/2 次）"
+              Start-Sleep -Seconds 5
+              continue
+            }
+            $ok = $true
+            break
+          }
+          if ($ok) {
+            $tmp = Join-Path $env:RUNNER_TEMP "nsis-x"
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+            Expand-Archive -Path $zip -DestinationPath $tmp -Force
+            New-Item -ItemType Directory -Force $dest | Out-Null
+            Copy-Item (Join-Path $tmp "nsis-3.13\*") $dest -Recurse -Force
+            if (Test-Path (Join-Path $dest "Bin\makensis.exe")) {
+              Write-Host "NSIS 就绪（SourceForge 便携包，SHA-256 已核对；makensis 在 Bin\ 下）"
+              exit 0
+            }
+            Write-Warning "便携包解包后没有 Bin\makensis.exe，转 choco 兜底"
+          }
+          # 线路 2（兜底）：choco 钉版本 + 3 次重试。
           # 退避阶梯按任务书钉成 10s / 30s / 60s。**只有「还有下一次」才退避**：
           # 3 次尝试只消耗前两档，第 3 次失败会立刻 fail-closed——若按 `$i -lt $waits.Count`
           # 判断，第 3 次失败后还要白等 60s 才退出（本地模拟实测到这一点，已修）。
@@ -399,13 +441,15 @@ jobs:
               Start-Sleep -Seconds $waits[$i]
             }
           }
-          Write-Error "choco 安装 NSIS 3.13.0 三次全失败：没有 makensis 就出不了安装包，本步 fail-closed"
+          Write-Error "两条线路全失败：SourceForge 便携包不可用，choco 3 次也失败。没有 makensis 就出不了安装包，本步 fail-closed"
           exit 1
       - name: 解析 NSIS 并断言版本（3.13.x）
         shell: pwsh
         run: |
           $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\Bin\makensis.exe",
             "$env:ProgramFiles\NSIS\makensis.exe"
           )
           $nsis = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -413,17 +457,19 @@ jobs:
             $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
             if ($cmd) { $nsis = $cmd.Source }
           }
-          if (-not $nsis) { Write-Error "makensis 未找到（缓存未命中且 choco 三次失败？）"; exit 1 }
-          # 不用 `makensis /VERSION` 探版本：该开关不在 Chapter 3 §3.1.1 的选项清单里
-          # （清单有 /HDRINFO、/V、/LICENSE 等），若不存在这一步会在整条构建之后才红。
-          # 读文件版本信息只要求文件存在，零风险；顺手当版本漂移断言用。
+          if (-not $nsis) { Write-Error "makensis 未找到（便携包与 choco 两条线路都失败？）"; exit 1 }
+          # 版本断言以 `/VERSION` 的运行时输出为准：便携包的 `Bin\makensis.exe` **没有**
+          # 版本资源（实测 FileVersion 为空），只读文件版本会在这里假红。FileVersion 仅兜底。
+          $probe = (& $nsis /VERSION 2>&1 | Out-String).Trim()
           $vi = (Get-Item $nsis).VersionInfo
-          if (-not $vi.FileVersion -or -not $vi.FileVersion.StartsWith("3.13")) {
-            Write-Error "makensis 版本漂移：期望 3.13.x，实际 '$($vi.FileVersion)'（路径 $nsis）"
+          $probeOk = ($probe -match '3\.13')
+          $fileOk = ($vi.FileVersion -and $vi.FileVersion.StartsWith("3.13"))
+          if (-not ($probeOk -or $fileOk)) {
+            Write-Error "makensis 版本漂移：期望 3.13.x，/VERSION='$probe'，FileVersion='$($vi.FileVersion)'（路径 $nsis）"
             exit 1
           }
           "MAKENSIS=$nsis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "MAKENSIS=$nsis（FileVersion $($vi.FileVersion) / ProductVersion $($vi.ProductVersion)）"
+          Write-Host "MAKENSIS=$nsis（/VERSION='$probe' / FileVersion='$($vi.FileVersion)' / ProductVersion='$($vi.ProductVersion)'）"
       - name: 编译安装包（makensis，${{ matrix.arch }} per-user）
         shell: pwsh
         env:
