@@ -281,7 +281,12 @@ jobs:
           $a = (Get-FileHash -Algorithm SHA256 -Path $official[0].FullName).Hash
           $b = (Get-FileHash -Algorithm SHA256 -Path $repoCopying).Hash
           if ($a -ne $b) {
-            Write-Error "installer/licenses/aria2-COPYING.txt 与官方包内 COPYING 不一致（$b vs $a）：许可原文被改动或版本漂移"
+            $sb = (Get-Item $repoCopying).Length
+            $sa = (Get-Item $official[0].FullName).Length
+            Write-Host "::error::许可原文对账失败：repo=$b ($sb B) / official=$a ($sa B)"
+            if ($sa -ne $sb) {
+              Write-Host "::error::两侧字节数差 $([Math]::Abs($sa - $sb)) B。若该差值等于行数，几乎肯定是**换行符**被 checkout 改写成了 CRLF（git 的 autocrlf/text 规则），而不是有人改了许可正文——先查 .gitattributes 是否对 installer/licenses/ 声明了 `-text`。"
+            }
             exit 1
           }
           Write-Host "许可原文对账通过：COPYING SHA-256 = $b"

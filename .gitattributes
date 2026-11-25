@@ -1,0 +1,12 @@
+# 换行符策略（真 CI 实证，run 45603199376）
+#
+# `installer/licenses/**` 下的许可原文是 GPLv2 分发义务里的「随附原件」，必须**逐字节**
+# 等于上游发布包内的同名文件。git 默认会按 `core.autocrlf` / `text` 规则在 checkout
+# 时把 LF 改写成 CRLF，结果是「随附的原件」不再是原件：
+#
+#   仓库 blob : 18,092 B / 8177F975…（LF，与官方 zip 内 COPYING 一致）
+#   checkout 后: 18,431 B / 189B1AF9…（CRLF，多出 339 B = 行数）
+#   → release 的逐字节对账判红，而代码其实没问题
+#
+# `-text` 关闭该路径的换行符转换，让 checkout 得到的就是 blob 的原始字节。
+installer/licenses/** -text
