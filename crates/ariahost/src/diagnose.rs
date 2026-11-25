@@ -787,22 +787,39 @@ mod platform {
     /// 所以先用 `ntdll!RtlGetVersion`：它不读 manifest，返回真实版本；动态解析是为了
     /// 不把 `ntdll` 变成链接期依赖（它本来也不在 import 表里）。解析失败才退回
     /// `GetVersionExW`，并**在 `source` 里老实标注**，让读包的人知道这个数字可能不准。
+    /// **踩过的坑（task-67）**：`GetModuleHandleW` 要的是 UTF-16（`PCWSTR`）。曾把窄 C 串
+    /// `c"ntdll.dll"` 的指针 `cast::<u16>()` 交给它——Windows 会把 `6E 74 64 6C …` 当成
+    /// 一个 UTF-16 模块名去查，必然查不到 → 返回 NULL → 静默落回 `GetVersionExW`，于是
+    /// MSVC 产物把 Win11 26200 报成「6.2 / build 9200」。所以这里显式给 UTF-16 字面量，
+    /// **不要再 cast 窄串**。
     #[cfg(windows)]
     pub fn os_version() -> Option<OsVersion> {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
         use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 
+        /// `"ntdll.dll"` 的 UTF-16 形式（含结尾 NUL）。
+        const NTDLL_W: [u16; 10] = [
+            0x006E, 0x0074, 0x0064, 0x006C, 0x006C, 0x002E, 0x0064, 0x006C, 0x006C, 0x0000,
+        ];
+
         /// `NTSTATUS RtlGetVersion(PRTL_OSVERSIONINFOW) -> NTSTATUS`（0 = 成功）。
         type RtlGetVersionFn = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+
+        // 只在生成诊断包时跑一次（`os_version` 的唯一调用方是 `env_json`），把四个判据
+        // 原样打进 stderr：有它在，MSVC 产物上「为什么走回退」不需要再靠猜。
+        let mut probe = String::from("[osver-probe]");
 
         // SAFETY: `ntdll.dll` 在 Windows 上恒已加载（只取模块句柄，不增引用计数）；
         // `RtlGetVersion` 的签名按 WinDDK 声明，调用方给出的结构体已填好大小字段。
         unsafe {
-            let module = GetModuleHandleW(c"ntdll.dll".as_ptr().cast::<u16>());
+            let module = GetModuleHandleW(NTDLL_W.as_ptr());
+            let module_err = std::io::Error::last_os_error().raw_os_error();
+            probe.push_str(&format!(" handle={module:?} handle_err={module_err:?}"));
             if !module.is_null() {
-                if let Some(address) =
-                    GetProcAddress(module, c"RtlGetVersion".as_ptr().cast::<u8>())
-                {
+                let address = GetProcAddress(module, c"RtlGetVersion".as_ptr().cast::<u8>());
+                let proc_err = std::io::Error::last_os_error().raw_os_error();
+                probe.push_str(&format!(" proc={address:?} proc_err={proc_err:?}"));
+                if let Some(address) = address {
                     // SAFETY: 地址来自 `GetProcAddress("RtlGetVersion")`，签名与别名一致。
                     let rtl: RtlGetVersionFn = std::mem::transmute(address);
                     let mut info = OSVERSIONINFOW {
@@ -810,7 +827,10 @@ mod platform {
                             .unwrap_or(0),
                         ..OSVERSIONINFOW::default()
                     };
-                    if rtl(&mut info) == 0 {
+                    let status = rtl(&mut info);
+                    probe.push_str(&format!(" rtl_status={status}"));
+                    if status == 0 {
+                        eprintln!("{probe} branch=ntdll");
                         return Some(OsVersion {
                             major: info.dwMajorVersion,
                             minor: info.dwMinorVersion,
@@ -821,6 +841,7 @@ mod platform {
                 }
             }
         }
+        eprintln!("{probe} branch=fallback-getversionex");
         get_version_ex()
     }
 
