@@ -160,6 +160,39 @@ pub fn wait_quit_consumed(timeout: Duration) -> bool {
     }
 }
 
+/// 「帧路径已经发出关窗」的回执位（task-59 第二张网）。
+///
+/// 第一版只覆盖「2s 内没人消费」。真机矩阵抓到了更靠后的一种卡法：
+/// 帧路径**接住了** quit、也把 aria2 停干净了，然后 UI 不再出帧
+/// （窗口被遮挡 / 系统吞掉 `ViewportCommand::Close`），进程于是永远停在「已停止」。
+/// 所以 ctl 线程还要确认「关窗真的发出去了」，否则照样自己收尾。
+static QUIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 帧路径发出关窗后的宽限：这段时间里进程该自己退掉了（关窗到进程消失是毫秒级）。
+pub const FRAME_EXIT_WAIT: Duration = Duration::from_secs(2);
+/// 等「帧路径已发出关窗」的上限。要够长到覆盖最慢的停止链（实测 4.1–5.0s），
+/// 又要短到让客户端 10s 预算里还剩余量——[`FRAME_EXIT_WAIT`] 之后再退也在预算内。
+pub const FRAME_CLOSE_GRACE: Duration = Duration::from_secs(6);
+
+/// 帧路径发出关窗后调用（`app.rs::pump_quit` 里紧跟在 `send_viewport_cmd(Close)` 之后）。
+pub fn mark_quit_done() {
+    QUIT_DONE.store(true, Ordering::SeqCst);
+}
+
+/// 等「帧路径已发出关窗」，最多 `timeout`。`true` = 帧路径走到了关窗那一步。
+pub fn wait_quit_done(timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if QUIT_DONE.load(Ordering::SeqCst) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// 兜底收尾（task-59）：ctl 线程自己把会话存好、把 aria2 停掉，然后退出。
 ///
 /// **不做**「直接 exit 不保存」：那会把未完成会话丢掉。若根本没有托管的运行时
@@ -445,18 +478,43 @@ mod platform {
                         FALLBACK_TARGET,
                         format!("ctl.fallback: 未启用（帧路径已在 {CONSUME_WAIT:?} 内接手）"),
                     );
-                } else {
-                    if !simulated {
+                    // 第二张网（task-59 真机矩阵补的）：接手 ≠ 会退出。
+                    // 实测下载态里帧路径把 aria2 停干净后就再没出过帧（窗口被遮挡 /
+                    // Close 被系统吞掉），进程永远停在「已停止」，客户端拿到 `timeout`。
+                    if wait_quit_done(FRAME_CLOSE_GRACE) {
+                        log.push_level(
+                            logfile::Level::Info,
+                            FALLBACK_TARGET,
+                            format!(
+                                "ctl.fallback: 帧路径已发出关窗，宽限 {FRAME_EXIT_WAIT:?} 等进程自己退"
+                            ),
+                        );
+                        std::thread::sleep(FRAME_EXIT_WAIT);
+                        // 走到这里说明关窗没生效（正常关窗时进程早没了，下面的代码根本不会执行）。
                         log.push_level(
                             logfile::Level::Warn,
                             FALLBACK_TARGET,
                             format!(
-                                "ctl.fallback: {CONSUME_WAIT:?} 内没有出帧回执，改由 ctl 线程收尾"
+                                "ctl.fallback: 关窗后 {FRAME_EXIT_WAIT:?} 进程仍未退出 → 直接 exit 0"
                             ),
                         );
+                        std::process::exit(0);
                     }
-                    fallback_quit(&log);
+                    log.push_level(
+                        logfile::Level::Warn,
+                        FALLBACK_TARGET,
+                        format!(
+                            "ctl.fallback: 帧路径接住了但 {FRAME_CLOSE_GRACE:?} 内没发出关窗 → 由 ctl 线程收尾"
+                        ),
+                    );
+                } else if !simulated {
+                    log.push_level(
+                        logfile::Level::Warn,
+                        FALLBACK_TARGET,
+                        format!("ctl.fallback: {CONSUME_WAIT:?} 内没有出帧回执，改由 ctl 线程收尾"),
+                    );
                 }
+                fallback_quit(&log);
             }
         }
     }
@@ -465,6 +523,16 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mark_quit_done_is_observable_by_wait() {
+        // 轮询回执位：ctl 第二张网靠它判断「帧路径有没有真的发出关窗」。
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(30));
+            mark_quit_done();
+        });
+        assert!(wait_quit_done(Duration::from_secs(2)));
+    }
 
     #[test]
     fn quit_is_the_only_recognised_command() {

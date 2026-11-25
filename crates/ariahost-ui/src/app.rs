@@ -51,6 +51,8 @@ const IDLE_REPAINT: Duration = Duration::from_millis(500);
 const HIDDEN_WAKE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 退出流程的总兜底时间（停止链自身有 15s+10s 两段超时，再加余量）。
+/// 发出关窗后等它生效的上限（task-59 第二张网）。正常关窗是毫秒级，2s 只为兜住「关窗被吞」。
+const EXIT_CLOSE_WATCH: Duration = Duration::from_secs(2);
 const QUIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 忙态的重绘周期（启动/停止/行操作期间）。
@@ -282,6 +284,8 @@ pub struct PanelApp {
     quit: Option<QuitFlow>,
     /// 已提交关窗（自己发的那次 Close 要放行，否则会陷入 CancelClose 循环）。
     exit_committed: bool,
+    /// 「已发出关窗，等它生效」的截止时间（task-59 第二张网）。
+    exit_deadline: Option<Instant>,
     /// 「ask」档的面板内关闭对话框。
     close_prompt: Option<ClosePrompt>,
     /// 启动时检测到的未完成任务数（信息条用；`None` = 不显示）。
@@ -485,6 +489,7 @@ impl PanelApp {
             window_hidden: false,
             quit: None,
             exit_committed: false,
+            exit_deadline: None,
             close_prompt: None,
             session_pending: None,
             open_web,
@@ -680,6 +685,11 @@ impl PanelApp {
             self.quit_save_pending = true;
             // 标记「已提交关窗」：下一次 close_requested 是我们自己发的，pump_close 必须放行。
             self.exit_committed = true;
+            // task-59 第二张网：关窗指令也可能被系统吞掉（真机矩阵在「下载中」抓到过：
+            // aria2 已停、进程却永远停在「已停止」）。所以发完关窗后自己记一个截止时间，
+            // 到点还没退就直接退——退出不再依赖「Close 一定生效」。
+            self.exit_deadline = Some(Instant::now() + EXIT_CLOSE_WATCH);
+            crate::ctl::mark_quit_done();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
@@ -3274,6 +3284,16 @@ impl PanelApp {
     /// （`--panel-selftest --drive`）**共用这一条绘制路径**，避免驱动测到的不是产品代码。
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         self.frames = self.frames.saturating_add(1);
+        // task-59 第二张网：已经发出关窗、但宽限内进程还没退（Close 被系统吞掉）→ 自己退。
+        // 只在「已发出关窗」之后生效，正常关窗时这一帧根本跑不到这里（进程已经没了）。
+        if let Some(deadline) = self.exit_deadline {
+            if Instant::now() >= deadline {
+                self.log
+                    .push("退出：关窗 2 秒未生效（系统吞掉了 Close）→ 直接 exit 0".to_owned());
+                std::process::exit(0);
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         // 控制管道（M3-f）：`ariahost --quit` 由 ctl 线程置位，这里消费并走退出档。
         // 必须放在最前面：晚一帧消费就可能让客户端多等一轮握手。
         if self.quit.is_none() && crate::ctl::take_quit_request() {
