@@ -788,15 +788,16 @@ mod platform {
         // SAFETY: `ntdll.dll` 在 Windows 上恒已加载（只取模块句柄，不增引用计数）；
         // `RtlGetVersion` 的签名按 WinDDK 声明，调用方给出的结构体已填好大小字段。
         unsafe {
-            let module_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-            let module = GetModuleHandleW(module_name.as_ptr());
+            let module = GetModuleHandleW(c"ntdll.dll".as_ptr().cast::<u16>());
             if !module.is_null() {
-                if let Some(address) = GetProcAddress(module, b"RtlGetVersion\0".as_ptr()) {
+                if let Some(address) = GetProcAddress(module, c"RtlGetVersion".as_ptr().cast::<u8>()) {
                     // SAFETY: 地址来自 `GetProcAddress("RtlGetVersion")`，签名与别名一致。
                     let rtl: RtlGetVersionFn = std::mem::transmute(address);
-                    let mut info = OSVERSIONINFOW::default();
-                    info.dwOSVersionInfoSize =
-                        u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0);
+                    let mut info = OSVERSIONINFOW {
+                        dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>())
+                            .unwrap_or(0),
+                        ..OSVERSIONINFOW::default()
+                    };
                     if rtl(&mut info) == 0 {
                         return Some(OsVersion {
                             major: info.dwMajorVersion,
@@ -816,12 +817,13 @@ mod platform {
     fn get_version_ex() -> Option<OsVersion> {
         use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
 
-        let mut info = OSVERSIONINFOW::default();
-        info.dwOSVersionInfoSize =
-            u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0);
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>()).unwrap_or(0),
+            ..OSVERSIONINFOW::default()
+        };
         // SAFETY: 按 SDK 定义填好 `dwOSVersionInfoSize` 后只读查询，不持有任何句柄。
         let ok = unsafe { GetVersionExW(&mut info) };
-        (ok != 0).then(|| OsVersion {
+        (ok != 0).then_some(OsVersion {
             major: info.dwMajorVersion,
             minor: info.dwMinorVersion,
             build: info.dwBuildNumber,

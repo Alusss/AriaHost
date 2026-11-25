@@ -128,7 +128,25 @@ $p.ExitCode            # ← 真退出码
 
 **所有自检脚本统一这个写法**；`cmd /c` 也不可靠（同样不回填）。
 
-### 6.4 自检入口不得提供可变后门
+### 6.4 Windows 目标的 lint 必须单独跑一遍（Linux 目标看不见 `#[cfg(windows)]`）
+
+已被咬过两次：`tray.rs` 的 `manual_range_contains`、`diagnose.rs` 的四条（`manual_c_str_literals` / `field_reassign_with_default` ×2 / `unnecessary_lazy_evaluations`）。两次都是 **CI 才红**，本地全绿——因为那些代码在 `#[cfg(windows)]` 里，Linux 目标根本不编译。
+
+本地闸门（WSL 内，需要 `x86_64-pc-windows-gnu` 交叉工具链）：
+
+```bash
+ARIAHOST_SKIP_ICON=1 \
+cargo clippy --workspace --all-targets --locked \
+  --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+`ARIAHOST_SKIP_ICON=1` 的来历：`build.rs` 用 `winresource` 嵌图标，而交叉到 windows 目标时它会把路径里的 `/` 转成 `\`，`windres` 因此打不开 ICO、整个 gate 被一个**与被测代码无关**的资源步骤挡住。该变量只跳过资源嵌入，**不影响任何 Rust 代码的编译与 lint**；正式构建不设它。
+
+> 这条闸门不替代 CI：`-gnu` 与 `-msvc` 仍有差异（`cfg(target_env)` 分支）。它的价值是**把"只有 Windows 才编的代码"提前拉到本地**，把一轮 10 分钟 + 2× 计费的 CI 往返变成 40 秒本地循环。
+
+---
+
+### 6.5 自检入口不得提供可变后门
 
 隐藏自检（`--panel-selftest`、`--log-selftest`、`--panel-selftest --drive …`）**只能读状态、只能注入输入事件**。
 
@@ -137,7 +155,7 @@ $p.ExitCode            # ← 真退出码
 
 理由：测试若能用后门改状态，它就**证明不了 UI 接线**——而 UI 接线正是这类测试存在的唯一目的。
 
-### 6.5 安全与"错误值"类缺陷只认受控实验
+### 6.6 安全与"错误值"类缺陷只认受控实验
 
 **"跑一遍看起来正常"证明不了脱敏、权限、路径解析、版本上报这几类是对的。** 必须人为构造最坏输入，再对**产物**做机械扫描。
 

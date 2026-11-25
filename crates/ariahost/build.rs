@@ -20,6 +20,21 @@ fn main() {
         return;
     }
 
+    // 逃生开关：仅用于「在没有 Windows SDK 的宿主上做 windows 目标的 check/clippy」。
+    //
+    // 为什么需要它：`#[cfg(windows)]` 的代码在 Linux 目标下根本不编译，本地 clippy 看不见
+    // 那些 lint（已被咬过两次：tray.rs 的 manual_range_contains、diagnose.rs 的四条）。
+    // 想本地提前抓，就要 `cargo clippy --target x86_64-pc-windows-gnu`；而这条路上
+    // `winresource` 会把路径里的 `/` 转成 `\`，windres 因此打不开 ICO 直接失败，
+    // 于是整个 gate 被一个**与被测代码无关**的资源步骤挡住。
+    //
+    // 设 `ARIAHOST_SKIP_ICON=1` 只跳过资源嵌入，**不影响任何 Rust 代码的编译与 lint**；
+    // 正式构建（CI/发布）不设该变量，资源照常嵌入。
+    if std::env::var_os("ARIAHOST_SKIP_ICON").is_some() {
+        println!("cargo:warning=ARIAHOST_SKIP_ICON 已设置：跳过图标/版本资源嵌入（仅用于跨目标 lint）");
+        return;
+    }
+
     let icon = icon_path();
 
     let mut res = winresource::WindowsResource::new();
