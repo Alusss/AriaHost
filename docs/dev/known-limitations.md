@@ -204,24 +204,37 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 
 ---
 
-## L11 卸载器的注册表清除**未取证**（不是缺陷）
+## L11 卸载器的注册表清除在真实用户机上**仍未取证**（已排除「是我们的缺陷」）
 
-**现象**：`installer/ariahost.nsi` 的卸载段有 `DeleteRegKey`（清 `HKCU\Software\AriaHost` 与卸载信息键），但**从未在真机上验证过它真的清干净了**。
+**曾经的现象**：`task-66` 的安装包端到端核验里，卸载后 `HKCU\Software\AriaHost` **仍然存在**。
 
-**为什么记「未取证」而不是「缺陷」**：本沙箱里的 NSIS 根本写不进注册表——用**独立最小探针**（只 `WriteRegStr HKCU` 一次、再 `WriteRegStr HKLM` 一次）验证，**两者都返回 ERR**。环境不允许复现，就既不能判定代码有问题，也不能宣称它通过。
+**已查清：那对残留键不是卸载器留下的，是取证脚本自己写的** ——
+1. 卸载段 [`installer/ariahost.nsi:939-940`](../../installer/ariahost.nsi) **无条件**删两个键（`${REG_APP_KEY}` 与 `REG_UNINST_KEY`），代码层面与「有没有探测到在跑的实例」无关；
+2. `task-66` 的 harness（`t66-e2e.ps1`）在**安装前**就写了 `HKCU\Software\AriaHost\InstallDir`（为了让 `.onInit` 认沙箱目录），step 8 只还原了值、**没删键**；
+3. 独立最小探针（只 `WriteRegStr HKCU` 一次）在本环境**返回 ERR** —— 说明 NSIS 子进程写 HKCU 在本会话被拦，卸载器既没写进去过，也就无法证明「删掉了」。
 
-**什么条件下补验**：首次在真机（非沙箱）装一次 per-user 包 → 卸载 → `reg query HKCU\Software\AriaHost` 与卸载信息键都查不到；同时确认 `%LOCALAPPDATA%\Programs\AriaHost` 已删、`<dl.dir>` 数据文件**未被触碰**。补验通过后删本条并记入对应修订记录。
+**所以现在的准确表述是**：`HKCU\Software\AriaHost` 残留 = 取证环境产物，**不是产品缺陷**；「真实用户机上卸载后键是否消失」**仍未验证**（本会话 NSIS 写 HKCU 被拦，无法构造）。
 
-**证据**：task-66 的最小探针（`WriteRegStr HKCU` ERR、`WriteRegStr HKLM` ERR）；方法论见 [test.md](test.md) §6.13「构造等价条件」。
+**什么条件下补验**：在**非沙箱**机器上装一次 per-user 包 → 卸载 → `reg query HKCU\Software\AriaHost` 与 `HKCU\...\Uninstall\AriaHost` 都查不到；同时确认 `%LOCALAPPDATA%\Programs\AriaHost` 已删、`<dl.dir>` 里的用户数据**未被触碰**。补验通过后删本条并记入修订记录。
+
+**教训（值得单独记住）**：验收脚本自己的写入会伪装成「产品残留」。造 harness 时**凡写进被测系统的状态，必须在收尾时能证明已撤销**，否则结论只能写「未取证」，不能写「缺陷」——方法论见 [test.md](test.md) §6.13。
 
 ---
 
-## L12 诊断包的操作系统版本可能是假的（**已知错误，未修**，task-67）
+## L12 诊断包 `os_version` 在 MSVC 产物上曾报假值（**已修 `e4c6c9c`，待 MSVC 产物复验**）
 
-**现象**：同一份代码，MSVC 产物报 `{6,2,9200, source:"fallback-getversionex…"}`（Win8 / 6.2），GNU 产物报 `26200`（正确 build 号）。诊断包 `env.json` 的 `os_version` 因此可能是错的。
+**现象**：同一份源码，MSVC 产物报 `{6,2,9200, source:"fallback-getversionex…"}`（Win8 / 6.2），GNU 交叉产物报真实 `26200`。诊断包 `env.json` 里的 `os_version` 因此在 MSVC 产物上是假的。
 
-**根因**：`GetVersionEx` 在 Win10+ 上**没有 `supportedOS` manifest 声明**时会谎报 Windows 8（6.2.9200）——这是系统的兼容性垫片，不是我们的业务逻辑；产物是否带上该 manifest 取决于链接与资源注入路径，所以 MSVC / GNU 表现不同。
+**真因（与最初的猜测不同，值得记下来）**：**不是 manifest**，也不是 `RtlGetVersion` 不可用，而是我们自己**把窄串当宽串传**：
 
-**状态与纪律**：**已知错误，未修**（task-67）。在此之前——**报障时不要把 `os_version` 当作事实**：判断用户系统用 `winver` 截图、`Get-ComputerInfo` 或直接询问用户，不要引 `env.json` 的该字段。
+```rust
+GetModuleHandleW(c"ntdll.dll".as_ptr().cast::<u16>())   // ← c"" 是 [u8]，cast 后按 UTF-16 读模块名
+```
 
-**该修的条件**：在资源 manifest 里声明 `supportedOS`（Win10/11 GUID）或改用 `RtlGetVersion`；修完必须**两种产物都验**（MSVC / GNU）都报出真实 build 号。
+`GetModuleHandleW` 于是恒返回空 → `GetProcAddress("RtlGetVersion")` 恒失败 → 落到 `GetVersionExW`（它没有 `supportedOS` 声明时按 Win8 谎报，属第二层错误）。**历史反差也由此解释**：`task-49` 时代用的是 `Vec<u16>` 宽串写法，所以 GNU 报得对；后来重构成 `c""` 才引入，于是连 GNU 也错。
+
+**修法与证据**：改成显式 `[u16; N]` 宽串（`e4c6c9c`）。同机同源码 A/B，`--diagnose` 的 `env.json`：修复前 `{6,2,9200, fallback-getversionex}` → 修复后 `{10,0,26200, ntdll-rtlgetversion}`。
+
+**仍未验证的部分（所以本条不删）**：A/B 是在 **GNU 交叉产物**上做的；**修后的 MSVC 产物尚未实测**（要等一次 CI 构建后跑 `--diagnose` 读 `env.json` 才能闭环）。另：Win10 / Windows Server 未验。
+
+**在此之前的行为约束**：报障时若拿到的是 `e4c6c9c` 之前的产物，**不要**把 `os_version` 当事实——用 `winver` 截图或直接问用户。
