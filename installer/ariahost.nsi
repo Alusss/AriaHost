@@ -145,8 +145,10 @@ SetCompressorDictSize 32
 
 Name "${APP_NAME} ${VERSION}"
 OutFile "${OUTFILE}"
+; 默认目录只给编译期默认值；**不要**再加回 `InstallDirRegKey`。
+; 原因：NSIS 会在 .onInit 之前就把注册表值塞进 $INSTDIR，等于零校验地把它当成默认目录；
+; 而那个键完全可能是调试期或失败安装留下的残留（v0.1.2 真机踩过，见 .onInit 的 D1 段）。
 InstallDir "${INSTALL_ROOT}\${APP_NAME}"
-InstallDirRegKey ${REG_ROOT} "${REG_APP_KEY}" "InstallDir"
 ShowInstDetails show
 ShowUninstDetails show
 BrandingText "${APP_NAME} ${VERSION} (${ARCH})"
@@ -663,15 +665,35 @@ Function .onInit
   ; 并因为 ${SEC_SERVICE} 只能在该 Section 之后引用而把隐藏逻辑放到 Section 之后。
   ; 该函数已随本批删除，勿再恢复（per-user 注册服务已是产品能力）。
 
-  ; D：覆盖/升级前先让旧实例退出（真实等待进程消失，不是 Sleep 后假设已退出）
+  ; D1（发版阻塞项，2026-11-26 真机踩过）：默认目录的判据是「那个目录是不是一份真安装」。
+  ;
+  ; 旧逻辑只要 `$0\ariahost.exe` 存在就采纳注册表里的 InstallDir，于是调试期写进这个键的
+  ; 临时路径会变成用户新装的默认目录（v0.1.2 实测：被带进工作区里的测试安装路径，随后
+  ; ariahost 因运行在受限路径连 aria2.conf 都写不出来）。文件头也已去掉
+  ; `InstallDirRegKey`——那条会让 NSIS 在**任何校验之前**就把该值塞进 $INSTDIR。
+  ;
+  ; 真安装的判据必须**同时**存在 ariahost.exe 与 uninst.exe：`WriteUninstaller` 紧跟在主程序
+  ; 落盘之后，所以「装到一半就失败」的目录不会两样都齐。缺一即判不可信：清掉记录、回落到
+  ; 编译期默认目录。用户用 `/D` 显式指定了别的目录时不动它（只在 $INSTDIR 仍等于坏值时回落）。
   ReadRegStr $0 ${REG_ROOT} "${REG_APP_KEY}" "InstallDir"
-  ${If} $0 == ""
-    StrCpy $0 "$INSTDIR"
+  ${If} $0 != ""
+    ${If} ${FileExists} "$0\${APP_EXE}"
+    ${AndIf} ${FileExists} "$0\uninst.exe"
+      DetailPrint "检测到已安装的 ${APP_NAME}（$0），将按升级方式处理。"
+      StrCpy $INSTDIR "$0"
+    ${Else}
+      DetailPrint "忽略不可信的安装目录记录（$0）：那里没有完整的 ${APP_EXE} + uninst.exe，改用默认目录。"
+      !insertmacro TraceWrite "[init] 丢弃不可信 InstallDir=$0"
+      ClearErrors
+      DeleteRegValue ${REG_ROOT} "${REG_APP_KEY}" "InstallDir"
+      ${If} $INSTDIR == $0
+        StrCpy $INSTDIR "${INSTALL_ROOT}\${APP_NAME}"
+      ${EndIf}
+    ${EndIf}
   ${EndIf}
-  ; 目标目录优先用已记录的安装位置（用户这次可能在目录页换了新目录，旧实例仍在旧目录）
-  ${If} ${FileExists} "$0\${APP_EXE}"
-    DetailPrint "检测到已安装的 ${APP_NAME}（$0），将按升级方式处理。"
-    StrCpy $INSTDIR "$0"
+  ; 兜底：$INSTDIR 为空（注册表键存在但值为空串等边角情况）时也不要往空路径装。
+  ${If} $INSTDIR == ""
+    StrCpy $INSTDIR "${INSTALL_ROOT}\${APP_NAME}"
   ${EndIf}
   Call StopAppForInstall
 FunctionEnd
