@@ -22,7 +22,7 @@ AriaHost — aria2 Windows 服务管理器
   ariahost --service               以 Windows 服务方式运行（ServiceHost）
   ariahost --install-service       注册 Windows 服务（需管理员）
   ariahost --uninstall-service     注销 Windows 服务（需管理员）
-  ariahost --write-aumid <lnk>     给 .lnk 快捷方式写入 AUMID
+  ariahost --write-aumid <lnk>     （M3 安装器调用；命令行暂不实现，会明确报 AH-E1001）
   ariahost --aria2-fetch [版本]    下载并安装 aria2 核心（省略版本 = 最新，如 1.37.0）
   ariahost --quit                  请求运行中的面板实例退出
   ariahost --version | -V          显示版本
@@ -469,7 +469,7 @@ fn web_open_hook() -> ariahost_ui::OpenWebFn {
         let mut config = ariahost_common::config::load().map_err(|error| error.to_string())?;
         let secret = ariahost_common::config::resolve_secret(
             &mut config,
-            &arihost_common::paths::default_secret_path()
+            &ariahost_common::config::default_secret_path()
                 .ok_or_else(|| "取不到 secret.bin 路径".to_owned())?,
         )
         .map_err(|error| error.to_string())?;
