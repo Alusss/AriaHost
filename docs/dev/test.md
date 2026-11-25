@@ -207,3 +207,29 @@ Get-ChildItem $tmp -Recurse -File | ForEach-Object {
 - 生产上意味着**多用户（RDP / 快速用户切换）**场景下会串——`%LOCALAPPDATA%\AriaHost\panel.lock` 是每用户的，两个用户可各跑一个面板，但管道只有一个。这是待修缺陷（已立单），不是「测试环境噪音」。
 
 **并发验收协议（临时）**：动手前在 `.scratch/m3/panel-lock/` 建 `<你的名字>.lock`（内容写用途与起始时间），用完删除；需要独占面板/管道的用例，先确认目录里没有别人的锁。**这不能修产品缺陷，只能避免互相污染证据。**
+
+### 6.9 内存必须按进程句柄取数（禁用按名字的计数器）
+
+**事故（2026-11-25）**：一份验收脚本用
+
+```powershell
+Get-Counter '\Process(ariahost)\Working Set - Private'
+```
+
+取私用工作集。该计数器**按实例名**返回，不带 PID；机器上有残留实例时 `[0]` 可能是**别的进程**的数。据此报出「服务页 110.6MB 超 100MB 闸门」，重测（按句柄）后真实值是 **99.1MB** —— 一次假失败，代价是整轮排查方向。
+
+**规则**：
+
+1. 一律用 `K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX.PrivateWorkingSetSize`，且句柄来自**你启动的那个进程**（`Start-Process -PassThru` 的 `.Handle`），不是按名字找。
+2. 采样期必须记录**同时存在的同名实例数**；`>1` 就 INCONCLUSIVE。
+3. 口径写死在输出里：`PWS max = XXX KB（句柄 PID=NNNN）/ 余量 = XXX KB`。
+4. **「没采到数据」永远不是「通过」**：采样数 < N、进程中途退出、变量为空 → 判 `INCONCLUSIVE`，**不得**判 PASS（已发现 4 个脚本犯过 `$null -lt 闸门值 → True` 这类空判）。
+
+### 6.10 自检/演示模式的数字不能当产品基线
+
+`--seed-rows N`（自检模式）跳过 config/RPC/web/log/tray 等整套常驻设施，内存显著偏低（实测 73.8MB vs 正常 idle 96.6MB）。因此：
+
+- **闸门判定只认「正常启动的 idle 面板」**；
+- 自检模式的数字只能在**同模式内**横向比较（例如同一模式加 200 行 vs 0 行，验证虚拟化是否吃内存）。
+
+---
