@@ -67,7 +67,17 @@ version（解析版本 + 元数据自检，ubuntu）
 | `build` | `cargo build --release --locked --target x86_64-pc-windows-msvc` → 暂存 `dist/x64` → 签名占位①（签 exe，无 secret 即跳过）→ `choco install nsis` → `makensis -INPUTCHARSET UTF8` → 签名占位②（签 setup）→ `SHA256SUMS.txt` + `manifest.json`（`variant = per-user`）→ `upload-artifact`（7 天）。`timeout-minutes: 30` | 编译、打包或校验和失败 |
 | `publish` | 仅 tag：下载 artifact（**不** merge）→ 只捞 `*-x64-setup.exe` 与 `*manifest.json` → 硬校验 x64 包存在 → 重算校验和 → `gh release create --verify-tag` | 缺 `contents: write` 或 tag 不存在 |
 
-**x86 在 M4 之前不启用**：`release.yml` 里整段注释掉了 `build-x86`（**不留 `continue-on-error`**——失败 job 一样烧 2× 分钟，且失败被静默吞掉更坏）。恢复时要同时改四处：解开 job、`publish.needs` 加它、`rust-toolchain.toml` 的 `targets` 加 `i686-pc-windows-msvc`、`.cargo/config.toml` 取消 i686 段注释。全机变体（`/DPER_MACHINE`、产物名带 `-machine-`）同样排在 M4。
+**x86 自 M4-1 起转正为流水线的一部分**（Q15 拍板：双架构都要出包）。落地方式：
+
+| 位置 | 32 位是怎么进来的 |
+|---|---|
+| `rust-toolchain.toml` | `targets` 里同时列 `x86_64-pc-windows-msvc` 与 `i686-pc-windows-msvc`（全仓唯一事实源） |
+| `.cargo/config.toml` | `[target.i686-pc-windows-msvc] rustflags` 解开，与 x64 同为静态 CRT |
+| `ci.yml` | 目标断言改成两个 target 都必须在；在 x64 clippy/test 之外加一条 `cargo check --workspace --all-targets --target i686-pc-windows-msvc`（**只 check**，不 codegen、不测试：同一份类型检查已能抓 32 位不成立的写法，省 Windows runner 分钟）；makensis 门禁加第 5 条 `/DARCH=x86` 变体编译 |
+| `release.yml` | `build` job 改成 `matrix.include`（x64/x86 两条腿，`fail-fast: false`）；包名、SHA256SUMS、manifest、artifact 全按 `matrix.arch` 区分；publish 硬门禁要求**两个包都在** |
+
+全机变体（`/DPER_MACHINE`、产物名带 `-machine-`）仍排在 M4 后续批次。
+**不给任何腿 `continue-on-error`**：失败 job 一样烧 2× 分钟，而且失败被静默吞掉后没人会注意到某一腿其实一直没出包（这比不跑更坏）。
 
 ## 4. 缓存
 

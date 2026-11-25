@@ -19,6 +19,9 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
-# M4 恢复 x86 时取消注释（Q3/Q15；同时同步 rust-toolchain.toml 的 targets 与 release.yml）：
-# [target.i686-pc-windows-msvc]
-# rustflags = ["-C", "target-feature=+crt-static"]
+# M4-1（2026-11-26）起启用：32 位包与 64 位包同一口径——静态 CRT，用户机器无需 VC++ 运行库。
+# 本机核对：dumpbin /dependents target\i686-pc-windows-msvc\release\ariahost.exe
+# 不得出现 VCRUNTIME140*.dll / MSVCP140*.dll（**待真产物**:CI 的 32 位腿只做 cargo check，
+# 静态 CRT 的 dumpbin 断言目前只覆盖 x64；32 位产物的该断言排在后续批次，别当成已有门禁）。
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

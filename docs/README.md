@@ -59,6 +59,6 @@
   - **`.cargo/config.toml`**：已建，x64 走静态 CRT（`+crt-static`，D13-A）；验收 #15a 仍需 `dumpbin /dependents` 实测确认。
   - **CI 配额口径**：仓库 private，Windows runner 2× 分钟计费 → 只跑 x64、Windows 侧单 job、路径判定 + `concurrency` + 7 天 artifact，见 [dev/ci](dev/ci.md) §1。
 - **仍未决 / 待落地**（不阻塞文档，阻塞「能跑」）：
-  1. **x86 与全机变体（`/DPER_MACHINE`）未进流水线**：首版只发 x64 per-user 单包，M4 加；恢复步骤写在 `release.yml` 的注释块与 [dev/ci](dev/ci.md) §3。
+  1. **全机变体（`/DPER_MACHINE`）未进流水线**：M4-1 起已出 x64 与 x86 两份 per-user 包；全机变体排在后续批次，恢复步骤见 [dev/ci](dev/ci.md) §3。
   2. **`--quit` 退出码契约**（0/1/2）是安装器脚本的假设，M1 实现 CLI 时确认。
 - 端口与路径约定（两文一致，执行层直接引用）：RPC `localhost:6800`、网页页 `http://127.0.0.1:6875`、安装目录 `%LOCALAPPDATA%\Programs\AriaHost`、配置 `%APPDATA%\AriaHost\config.toml`、服务名 `AriaHost`。

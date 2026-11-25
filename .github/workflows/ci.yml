@@ -255,7 +255,7 @@ jobs:
       # 这一步把 VS 的 x64 开发环境导入本 job 的后续步骤作为兜底。
       - name: 导入 MSVC 开发环境（rc.exe，供 build.rs 的 winresource 使用）
         uses: ilammy/msvc-dev-cmd@v1
-      - name: 校验工具链 pin 与 target（rustc 1.95.x / x86_64-pc-windows-msvc）
+      - name: 校验工具链 pin 与 target（rustc 1.95.x / x64 + x86）
         shell: bash
         run: |
           set -euo pipefail
@@ -267,9 +267,12 @@ jobs:
           esac
           # 只打印不断言会给人「target 已验证」的错觉；这里改成硬断言。
           rustup target list --installed | tr -d '\r'
-          rustup target list --installed | tr -d '\r' | grep -qx 'x86_64-pc-windows-msvc' \
-            || { echo "::error::未安装 x86_64-pc-windows-msvc target（应由 rust-toolchain.toml 的 targets 提供）。"; exit 1; }
-          echo "OK：x86_64-pc-windows-msvc 已安装"
+          # M4-1 起双架构：缺任一 target 都硬失败（32 位是发版产物，不是可选实验）
+          for t in x86_64-pc-windows-msvc i686-pc-windows-msvc; do
+            rustup target list --installed | tr -d '\r' | grep -qx "$t" \
+              || { echo "::error::未安装 $t target（应由 rust-toolchain.toml 的 targets 提供）。"; exit 1; }
+          done
+          echo "OK：x86_64-pc-windows-msvc 与 i686-pc-windows-msvc 均已安装"
       - name: 缓存 registry 与 target
         uses: actions/cache@v4
         with:
@@ -289,6 +292,13 @@ jobs:
         run: cargo test --workspace --locked
       - name: Release 构建（x64）
         run: cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
+      # M4-1：32 位腿的**编译验证**。只做 check（不 codegen、不测试、不打包），
+      # 因为同一份 LLVM 类型检查已能暴露「在 32 位下不成立」的写法（usize 宽度、
+      # 指针转换、`as` 截断、按 cfg 分支的 Win32 类型）；真正的 release 产包在
+      # release.yml 的 matrix 里跑，避免 CI 双份 codegen 烧 Windows runner 分钟。
+      # 产物落在 target/i686-pc-windows-msvc/（已被上面的缓存覆盖）→ 第二次起增量。
+      - name: 32 位编译检查（i686-pc-windows-msvc）
+        run: cargo check --workspace --all-targets --locked --target i686-pc-windows-msvc
       - name: 校验主程序产物（+ 静态 CRT 快检）
         shell: pwsh
         run: |
@@ -429,6 +439,16 @@ jobs:
           }
           if (Test-Path $outNo) { Write-Error "负向断言失败：缺核心时仍生成了 $outNo"; exit 1 }
           Write-Host "OK：缺核心时按预期编译失败（默认 fail-closed 生效）"
+
+          # ---- 5) 32 位变体（M4-1）：/DARCH=x86 + 同一份带核心载荷 → 必须编译成功。
+          # 32 位包在 .nsi 里走的是「跳过 RunningX64 检查」的那条分支，这段只在
+          # ARCH=x86 时被解析；不在这里点着，CI 全绿也证明不了 32 位包装得了。
+          $outX86 = Join-Path $PWD "dist\AriaHost-0.0.0-ci-x86-setup.exe"
+          & $mk /V2 /INPUTCHARSET UTF8 /DVERSION=0.0.0-ci /DVI_VERSION=0.0.0.0 /DARCH=x86 "/DSRCDIR=$srcCore" "/DOUTFILE=$outX86" "installer\ariahost.nsi"
+          if ($LASTEXITCODE -ne 0) { Write-Error "makensis（x86 变体）失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
+          $itemX86 = Get-Item $outX86
+          if ($itemX86.Length -lt 100000) { Write-Error "32 位安装包异常小（$($itemX86.Length) B），载荷疑似未打入"; exit 1 }
+          Write-Host "OK：32 位变体编译通过（$($itemX86.Name) / $($itemX86.Length) 字节）"
 
           # ---- 收尾：把「预期失败」留下的退出码清掉。
           # GitHub Actions 的 powershell 包装器在用户脚本末尾会执行 `exit $LASTEXITCODE`；

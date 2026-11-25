@@ -30,7 +30,8 @@ version（解析版本 + 元数据自检，ubuntu）
 | `build` | `cargo build --release --locked --target x86_64-pc-windows-msvc` → 暂存 `dist/x64/ariahost.exe`（**给 makensis 的路径必须绝对 + 全反斜杠**）→ 签名占位①（签 exe）→ `choco install nsis` → `makensis` 出安装包 → 签名占位②（签 setup）→ `SHA256SUMS.txt` + `manifest.json` → `upload-artifact`（7 天）。`timeout-minutes: 30`（首版压过，挂住时最坏计费 60 分钟而非 120） |
 | `publish` | 下载 artifact（**不** merge，避免同名 `SHA256SUMS.txt` 互相覆盖）→ 只捞 `*-x64-setup.exe` 与 `*manifest.json` 到 `out/` → **校验 x64 安装包必须存在**（缺则失败、不发 Release）→ 重算校验和 → 生成 notes → `gh release create` |
 
-**为什么只有一个构建 job**：仓库是 private，Windows runner 按 2× 分钟计费（2000 分钟/月 ≈ 1000 分钟实际构建）。x86 在 M4 之前整段注释掉、**不留 `continue-on-error`**——失败 job 一样烧分钟，且失败被静默吞掉比不跑更坏。恢复步骤写在 `release.yml` 的注释块里（四处要一起改）。
+**双架构构建（M4-1 起）**：`build` job 是一张 `matrix.include` 表，两条腿（x64 / x86）并行、`fail-fast: false`，产物分别为 `AriaHost-<ver>-x64-setup.exe` 与 `AriaHost-<ver>-x86-setup.exe`，各自带 `SHA256SUMS.txt` 与 `-manifest.json`；`publish` 硬门禁要求**两个包都在**才发 Release。
+仓库是 private，Windows runner 按 2× 分钟计费（2000 分钟/月 ≈ 1000 分钟实际构建），所以：一条腿失败**不**用 `continue-on-error` 遮掩（失败 job 一样烧分钟，静默吞掉更坏），且 32 位在 CI 里只做 `cargo check`（真正的 release codegen 只在 release.yml 的 matrix 里跑一次，避免双份编译）。分钟基线待首次 tag 跑完后按日志回填。
 
 `publish` 因此可以回到默认门禁（`needs` 全部成功），不再需要 `!cancelled()` 兜底。
 

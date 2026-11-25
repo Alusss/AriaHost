@@ -149,11 +149,35 @@ jobs:
           echo "元数据自检通过。"
 
   build:
-    name: 构建 x64 per-user
+    name: 构建 ${{ matrix.arch }} per-user
     needs: version
     runs-on: windows-latest
-    # 首版压到 30 分钟（挂住时最坏计费 60 分钟，而不是 120）；首次跑若不够再按日志基线调大。
-    timeout-minutes: 30
+    # fail-fast: false —— 一条腿失败不许取消另一条腿：两个包都要有，且失败原因必须两条都能看到。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 两条腿唯一允许的差异就是这张表；所有步骤都只读 matrix.*，不再有硬编码的 arch/target。
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            bits: 64
+            abi: msvc
+            min_windows: "10.0.17763"
+            aria2_zip: aria2-1.37.0-win-64bit-build1.zip
+            # 与 crates/ariahost-core/src/fetch.rs 的 KNOWN_SHA256 同源；改一处必须改两处。
+            aria2_sha256: 67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288
+            # 挂住时最坏计费 2×；首次跑若不够再按日志基线调大。
+            timeout: 30
+          - arch: x86
+            target: i686-pc-windows-msvc
+            bits: 32
+            abi: msvc
+            min_windows: "10.0.17763"
+            aria2_zip: aria2-1.37.0-win-32bit-build1.zip
+            aria2_sha256: 35f6514cc5dd7e98a87b3c4c2d25a0754b9b063dbe59bc0f22d483464f61e5b6
+            # x86 是交叉编译（host x64、target i686 的 rc.exe 要走 Hostx64\x86），首次跑留足余量。
+            timeout: 40
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
       - uses: actions/checkout@v4
       - name: 确认 workspace 存在
@@ -171,6 +195,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
+          # 显式给 targets：交叉目标的 std 由本 action 装入。不传时只有宿主的默认 target，
+          # `cargo build --target i686-pc-windows-msvc` 会报 "can't find crate for `std`"。
+          # 值来自 matrix，与 rust-toolchain.toml 的 targets 列表必须一致（meta job 会查）。
+          targets: ${{ matrix.target }}
       # 同 ci.yml：build.rs 里的 winresource 需要 Windows SDK 的 rc.exe（它按 RC_PATH →
       # WindowsSdkVerBinPath → 注册表 KitsRoot10 查找，不依赖 PATH），这一步导入 VS x64 开发环境兜底。
       - name: 导入 MSVC 开发环境（rc.exe，供 build.rs 的 winresource 使用）
@@ -192,17 +220,17 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-release-x64-${{ hashFiles('**/Cargo.lock') }}-${{ steps.toolchain.outputs.cachekey }}
+          key: ${{ runner.os }}-release-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}-${{ steps.toolchain.outputs.cachekey }}
           restore-keys: |
-            ${{ runner.os }}-release-x64-
-      - name: 构建（release, x64）
-        run: cargo build --workspace --release --locked --target x86_64-pc-windows-msvc
-      - name: 暂存产物到 dist/x64
+            ${{ runner.os }}-release-${{ matrix.arch }}-
+      - name: 构建（release, ${{ matrix.arch }}）
+        run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - name: 暂存产物到 dist/${{ matrix.arch }}
         shell: pwsh
         run: |
-          $dist = "dist/x64"
+          $dist = "dist/${{ matrix.arch }}"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          $exe = "target/x86_64-pc-windows-msvc/release/ariahost.exe"
+          $exe = "target/${{ matrix.target }}/release/ariahost.exe"
           if (-not (Test-Path $exe)) {
             Write-Error "缺少 $exe：请确认某个 crate 声明了 [[bin]] name = `"ariahost`"。"
             exit 1
@@ -228,11 +256,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $ver    = '1.37.0'
-          $zipName = "aria2-$ver-win-64bit-build1.zip"
+          # 32/64 位的 zip 名与哈希都来自 matrix（唯一差异表），本脚本不再硬编码任何一位。
+          $zipName = '${{ matrix.aria2_zip }}'
           $url    = "https://github.com/aria2/aria2/releases/download/release-$ver/$zipName"
           # 唯一认可的哈希（zip 整体）。改动此值必须先解释来源，见 docs/dev/release.md §7。
-          $sha256 = '67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288'
-          $dist   = 'dist/x64'
+          # 与 crates/ariahost-core/src/fetch.rs 的 KNOWN_SHA256 同源，改一处必须改两处。
+          $sha256 = '${{ matrix.aria2_sha256 }}'
+          $dist   = 'dist/${{ matrix.arch }}'
           $work   = Join-Path $env:RUNNER_TEMP 'aria2-bundle'
           Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -299,7 +329,7 @@ jobs:
         env:
           SIGN_PASS: ${{ secrets.SIGN_CERT_PASSWORD }}
         run: |
-          Write-Host "SIGN_CERT 已配置：此处应执行 signtool sign /f cert.pfx /p <pass> dist/x64/ariahost.exe"
+          Write-Host "SIGN_CERT 已配置：此处应执行 signtool sign /f cert.pfx /p <pass> dist/${{ matrix.arch }}/ariahost.exe"
           Write-Host "::warning::exe 签名是占位实现，产物未签名（TODO: 接入 signtool）。"
       - name: 安装 NSIS
         shell: pwsh
@@ -321,7 +351,7 @@ jobs:
           # 读文件版本信息只要求文件存在，零风险。
           $vi = (Get-Item $nsis).VersionInfo
           Write-Host "makensis = $nsis（FileVersion $($vi.FileVersion) / ProductVersion $($vi.ProductVersion)）"
-      - name: 编译安装包（makensis，x64 per-user）
+      - name: 编译安装包（makensis，${{ matrix.arch }} per-user）
         shell: pwsh
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -329,8 +359,8 @@ jobs:
         run: |
           # 输出与源目录都显式给绝对路径（/DOUTFILE、/DSRCDIR 覆盖 .nsi 默认值），
           # 不依赖 makensis 的「相对脚本目录」工作目录假设。
-          $out = Join-Path $PWD "installer/AriaHost-$env:VERSION-x64-setup.exe"
-          $src = Join-Path $PWD "dist/x64"
+          $out = Join-Path $PWD "installer/AriaHost-$env:VERSION-${{ matrix.arch }}-setup.exe"
+          $src = Join-Path $PWD "dist/${{ matrix.arch }}"
           Remove-Item $out -ErrorAction SilentlyContinue
           # /INPUTCHARSET UTF8：installer/ariahost.nsi 是 UTF-8（无 BOM），含大量中文字面量
           # （MUI 文案 / VersionKey）。不显式声明输入字符集时，en-US runner 的 ANSI 代码页会
@@ -339,10 +369,10 @@ jobs:
           # ariahost.nsi 里缺 ${SRCDIR}\aria2c.exe 直接 !error 编译失败）。所以这里
           # 不需要额外的 /DBUNDLED_ARIA2_REQUIRED——少一个"发布时要记得传的 define"，
           # 也就少一种「忘了传 → 悄悄出无核心包」的事故形态。
-          & $env:MAKENSIS /V2 /INPUTCHARSET UTF8 "/DVERSION=$env:VERSION" "/DVI_VERSION=$env:VI_VERSION" "/DARCH=x64" "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi"
+          & $env:MAKENSIS /V2 /INPUTCHARSET UTF8 "/DVERSION=$env:VERSION" "/DVI_VERSION=$env:VI_VERSION" "/DARCH=${{ matrix.arch }}" "/DSRCDIR=$src" "/DOUTFILE=$out" "installer\ariahost.nsi"
           if ($LASTEXITCODE -ne 0) { Write-Error "makensis 失败（exit $LASTEXITCODE）"; exit $LASTEXITCODE }
           if (-not (Test-Path $out)) { Write-Error "未生成 $out"; exit 1 }
-          Copy-Item $out "dist/x64/" -Force
+          Copy-Item $out "dist/${{ matrix.arch }}/" -Force
           Get-Item $out | Select-Object Name, Length
       - name: 代码签名 setup（占位：Q8 首版不签，无 secret 时跳过）
         # 位置要求：在 makensis 之后、生成 SHA256SUMS 之前（校验和必须算在最终产物上，见下一 step 注释）。
@@ -356,10 +386,11 @@ jobs:
           # 并把两处签名占位（本步骤 + 打包前的 exe 那一步）换成真实的 signtool 调用。
           Write-Host "SIGN_CERT 已配置，但签名步骤仍是占位实现（TODO: 接入 signtool）。"
           Write-Host "::warning::签名占位步骤未执行实际签名，产物未签名。"
-      # SHA256SUMS 只覆盖 x64 per-user 包 + exe，且文件名里带 -x64- 段。
-      # M4 加变体时注意：per-user 是 AriaHost-<ver>-x64-setup.exe，全机变体是
-      # AriaHost-<ver>-x64-machine-setup.exe。若把下面的 glob 改成 -setup.exe 通配，
-      # 同一发布会一次捞出两个包 → 校验和与 Release 附件重名/互相覆盖。
+      # SHA256SUMS 只覆盖**本腿那一份** per-user 包 + exe，文件名里带 -<arch>- 段。
+      # M4-1 起两条腿并行，各自算各自的校验和（两个 artifact 互不覆盖：name 与 path 都按 matrix 区分）。
+      # 注意：per-user 是 AriaHost-<ver>-<arch>-setup.exe，全机变体是
+      # AriaHost-<ver>-<arch>-machine-setup.exe。若把下面的 glob 改成 -setup.exe 通配，
+      # 会一次捞出两个包 → 校验和与 Release 附件重名/互相覆盖（本步已显式断言不含 machine）。
       #
       # 顺序约束（不可调换）：**任何签名步骤都必须在本步骤之前**。签名会改字节，
       # 先算校验和再签名 → 用户按 SHA-256 核对必然失败（docs/dev/release.md §5）。
@@ -368,8 +399,9 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          $dir = "dist/x64"
-          $setup = Get-Item -Path "$dir/AriaHost-$env:VERSION-x64-setup.exe" -ErrorAction Stop
+          $arch = '${{ matrix.arch }}'
+          $dir = "dist/$arch"
+          $setup = Get-Item -Path "$dir/AriaHost-$env:VERSION-$arch-setup.exe" -ErrorAction Stop
           if ($setup.Name -match 'machine') { Write-Error "glob 命中了全机变体包，首版不应出现：$($setup.Name)"; exit 1 }
           $files = @($setup, (Get-Item "$dir/ariahost.exe"))
           $lines = foreach ($f in $files) {
@@ -379,67 +411,26 @@ jobs:
           $manifest = [ordered]@{
             product   = "AriaHost"
             version   = $env:VERSION
-            arch      = "x64"
-            target    = "x86_64-pc-windows-msvc"
+            arch      = $arch
+            target    = '${{ matrix.target }}'
+            bits      = ${{ matrix.bits }}
+            abi       = '${{ matrix.abi }}'
+            min_windows = '${{ matrix.min_windows }}'
             variant   = "per-user"
             commit    = "${{ github.sha }}"
             built_at  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             files     = $lines
             notes     = "未经本地代码签名（Q8 首版口径）"
           }
-          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 "$dir/AriaHost-$env:VERSION-x64-manifest.json"
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 "$dir/AriaHost-$env:VERSION-$arch-manifest.json"
           Get-Content "$dir/SHA256SUMS.txt"
       - name: 上传 artifact（7 天）
         uses: actions/upload-artifact@v4
         with:
-          name: AriaHost-${{ needs.version.outputs.version }}-x64
-          path: dist/x64/
+          name: AriaHost-${{ needs.version.outputs.version }}-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 7
-
-  # ───────────────────────────────────────────────────────────────────────────
-  # 【M4 恢复】x86（i686-pc-windows-msvc）构建 —— 首版不启用，整段注释掉
-  #
-  # 为什么不留 continue-on-error：私有仓 Windows runner 按 2× 分钟计费，
-  # 失败 job 一样烧分钟；而且失败被静默吞掉后，没人会注意到 x86 其实一直没出包，
-  # 这比「不跑」更坏（Q3/Q15 已定：x86 在 M4 转正为必成）。
-  #
-  # M4 恢复步骤（四处一起改，漏一处就 pin 失效/缓存错乱）：
-  #   1. 解开下面整段 job，并把 publish 的 needs 改成 [version, build, build-x86]；
-  #   2. rust-toolchain.toml 的 targets 加上 "i686-pc-windows-msvc"；
-  #   3. .cargo/config.toml 取消 [target.i686-pc-windows-msvc] 段注释；
-  #   4. publish 的产物 glob 说明同步补 -x86 / -machine- 变体（见 build job 里的注释）。
-  #
-  # build-x86:
-  #   name: 构建 x86（M4 启用）
-  #   needs: version
-  #   runs-on: windows-latest
-  #   timeout-minutes: 60
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: 安装 Rust（显式传 toolchain 输入，版本与 rust-toolchain.toml 一致）
-  #       id: toolchain
-  #       uses: dtolnay/rust-toolchain@stable
-  #       with:
-  #         toolchain: "1.95"
-  #     - name: 缓存 registry 与 target
-  #       uses: actions/cache@v4
-  #       with:
-  #         path: |
-  #           ~/.cargo/registry/index
-  #           ~/.cargo/registry/cache
-  #           ~/.cargo/git/db
-  #           target
-  #         key: ${{ runner.os }}-release-x86-${{ hashFiles('**/Cargo.lock') }}-${{ steps.toolchain.outputs.cachekey }}
-  #     - name: 构建（release, x86）
-  #       run: cargo build --workspace --release --locked --target i686-pc-windows-msvc
-  #     - name: 打包（makensis，x86）
-  #       shell: pwsh
-  #       run: |
-  #         # 与 x64 job 同构，只把 /DARCH 与目录换成 x86
-  #         # 注意：i686 目前仅在 .cargo/config.toml 里注释保留 crt-static，恢复时必须一并解开
-  #         Write-Error "M4 恢复时补全本步骤（参考 build job 的 makensis 调用）"
-  # ───────────────────────────────────────────────────────────────────────────
 
   publish:
     name: 发布 GitHub Release
@@ -464,17 +455,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          # 只捞 x64 per-user 包：文件名形如 AriaHost-<ver>-x64-setup.exe。
-          # 全机变体是 AriaHost-<ver>-x64-machine-setup.exe，不会被 '*-x64-setup.exe' 命中；
-          # 若改成 '*-setup.exe'，M4 之后会一次捞到多个包并互相覆盖。
-          find release-assets -type f -name '*-x64-setup.exe' -exec cp {} out/ \;
+          # M4-1 起两条腿各出一份 per-user 包：AriaHost-<ver>-x64-setup.exe / -x86-setup.exe。
+          # 全机变体是 AriaHost-<ver>-<arch>-machine-setup.exe，不会被 '*-<arch>-setup.exe' 命中；
+          # 若改成 '*-setup.exe'，将来加变体会一次捞到多个包并互相覆盖。
+          for arch in x64 x86; do
+            find release-assets -type f -name "*-${arch}-setup.exe" -exec cp {} out/ \;
+          done
           find release-assets -type f -name '*-manifest.json' -exec cp {} out/ \;
           ls -l out
-          # 硬门禁：x64 per-user 是首版唯一产物，缺了就不发 Release
-          if [ ! -f "out/AriaHost-${VERSION}-x64-setup.exe" ]; then
-            echo "::error::缺少 x64 安装包 AriaHost-${VERSION}-x64-setup.exe，构建未产出，本次不发布。"
-            exit 1
-          fi
+          # 硬门禁：双架构都是发版产物，缺任一腿就不发 Release（M4-1 起 x86 转正为必成）
+          for arch in x64 x86; do
+            if [ ! -f "out/AriaHost-${VERSION}-${arch}-setup.exe" ]; then
+              echo "::error::缺少 ${arch} 安装包 AriaHost-${VERSION}-${arch}-setup.exe，构建未产出，本次不发布。"
+              exit 1
+            fi
+          done
           cd out
           sha256sum ./*.exe | sed 's| \./| |' > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -487,11 +482,12 @@ jobs:
           {
             echo "AriaHost ${VERSION}"
             echo
-            echo "本次产物（首版只发 x64 per-user 单包）："
+            echo "本次产物（per-user 单包，双架构）："
             echo
-            echo "- x64 安装包：\`AriaHost-${VERSION}-x64-setup.exe\`"
+            echo "- 64 位安装包：\`AriaHost-${VERSION}-x64-setup.exe\`"
+            echo "- 32 位安装包：\`AriaHost-${VERSION}-x86-setup.exe\`"
             echo "- 校验和：\`SHA256SUMS.txt\`（下载后务必核对）"
-            echo "- 版本清单：\`AriaHost-${VERSION}-x64-manifest.json\`"
+            echo "- 版本清单：\`AriaHost-${VERSION}-x64-manifest.json\`、\`AriaHost-${VERSION}-x86-manifest.json\`"
             echo
             echo "安装包未做代码签名（首版口径），SmartScreen 可能提示「未知发布者」，"
             echo "请以 SHA-256 校验值为准。"

@@ -9,7 +9,6 @@
 [toolchain]
 channel = "1.95"
 components = ["rustfmt", "clippy"]
-targets = ["x86_64-pc-windows-msvc"]
-# M4 恢复 x86 时，把上一行 targets 换成下面这行（Q3/Q15；同时同步 .cargo/config.toml 的 i686 段
-# 与 release.yml 里被注释掉的 build-x86 job）：
-# targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
+# M4-1（2026-11-26）起双架构：x64 与 x86 是同一份源码的两条腿，targets 必须都在。
+# 只加 target 不加 crate 特性不能出 32 位包；.cargo/config.toml 的 i686 crt-static 段也必须同步解开。
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
