@@ -1867,6 +1867,26 @@ impl PanelApp {
             self.log.push(line);
         }
         if out.refresh_runtime {
+            // 卡片在成功时会收起来 —— 收起来就**等于没有确认**。
+            // 所以把结论同时写进顶部信息条：用户看到「装好了」而不是「卡片莫名消失」。
+            let headline = match &self.guide.notice {
+                Some(GuideNotice::Online {
+                    version,
+                    line_note,
+                    hash_note,
+                    ..
+                }) => Some(format!(
+                    "下载核心已就绪：aria2 {version}（{line_note}；{hash_note}）"
+                )),
+                Some(GuideNotice::External { version, path }) => Some(format!(
+                    "已改用你指定的 aria2 {version}：{}",
+                    path.display()
+                )),
+                _ => None,
+            };
+            if let Some(headline) = headline {
+                self.set_banner(Banner::new(Tone::Good, headline));
+            }
             self.refresh_runtime_after_core_setup();
         }
         if self.guide.busy() {
