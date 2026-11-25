@@ -158,6 +158,9 @@ pub enum QuitOutcome {
 /// 没完成，面板可能压根没收到 quit），也可能是「请求送达了、面板在退但没退完」
 /// （在存会话 / 停 aria2c）。前者该查管道、权限与版本；后者该再等或转人工。
 /// 压成一个码，排障时只能猜；而 stdout 又不能加字段（安装器按全等比对）。
+///
+/// 三个变体归两类事实：`Handshake` 与 `Watchdog` 都属「没送达」（管道连不上/读完无应答，
+/// 或应答一直不返回），`ExitWait` 才是「送达但没退完」。用户可见文案按这两类写。
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutPhase {
@@ -165,7 +168,8 @@ pub enum TimeoutPhase {
     Handshake,
     /// 已收到 `ok pid=`，等该进程消失超时。
     ExitWait,
-    /// 外层看门狗到期 / 起不了工作线程（理论上不该出现）。
+    /// 外层看门狗到期（真机最常见的成因：服务端接了管道却不回应答，读应答永久阻塞），
+    /// 或起不了工作线程——两种都属于「没送达」。
     Watchdog,
 }
 
@@ -656,12 +660,16 @@ fn quit_stderr_lines(outcome: &QuitOutcome) -> Vec<String> {
              强杀会丢会话并留下 aria2c 孤儿"
                 .to_owned(),
         ],
+        // Watchdog 与 Handshake **同属「没送达」**（实测：服务端接了管道却不回应答时，
+        // 读应答会一直阻塞，只能由看门狗收尾）。区别只在检测路径，处置口径必须一致——
+        // 若在这里说「面板卡在保存会话」就是把没送达误报成退得慢，用户会照着错的方向处置。
         QuitOutcome::Timeout(TimeoutPhase::Watchdog) => vec![
             format!(
-                "与控制管道交互超时（{}s，外层看门狗到期）",
+                "与控制管道握手超时（{}s 内没收到面板应答；读应答一直没返回）",
                 QUIT_BUDGET.as_secs()
             ),
-            "  → 面板可能卡在保存会话：不动它会让下次启动自动降级；急的话在任务管理器结束它"
+            "  → 与「握手超时」同类：退出请求可能根本没送达。先确认面板还在跑（任务管理器里有 \
+             ariahost.exe）；仍不行就结束它，下次启动会自动降级未保存的会话"
                 .to_owned(),
         ],
     }
@@ -1749,6 +1757,22 @@ mod tests {
             exit_wait.contains("已收到面板应答"),
             "退不完要说明应答已收到：{exit_wait}"
         );
+        // Watchdog 与 Handshake 同属「没送达」（真机实测：服务端接管道不回应答 → 读阻塞 →
+        // 看门狗收尾）。它绝不能说成「卡在保存会话」，那是把没送达误报成退得慢。
+        let watchdog = quit_stderr_lines(&QuitOutcome::Timeout(TimeoutPhase::Watchdog)).join("\n");
+        assert_eq!(
+            quit_stdout_line(&QuitOutcome::Timeout(TimeoutPhase::Watchdog)),
+            "quit: timeout"
+        );
+        assert!(
+            watchdog.contains("没收到面板应答"),
+            "看门狗到期也要说明没收到应答：{watchdog}"
+        );
+        assert!(
+            !watchdog.contains("保存会话"),
+            "看门狗到期不属于「送达未退完」，不得沿用延后处置文案：{watchdog}"
+        );
+        assert_ne!(watchdog, handshake, "两条发现路径的文案仍应可区分");
         // 四态的键值本身也是契约（安装器按它判断）。
         assert_eq!(
             quit_stdout_line(&QuitOutcome::NoInstance),
