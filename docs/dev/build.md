@@ -191,7 +191,20 @@ PWS max = NNN,NNN KB（PID=NNNN，余量=NNN,NNN KB）→ PASS|FAIL|INCONCLUSIVE
   —— 诊断包里据此可直接判定「真的用了哪个后端」，不必再跑 selftest。
 - **边界**：`--panel-selftest` **不**初始化文件日志（短命自检不污染用户日志），要验写入器本身用 `--log-selftest`。
 
-**已实测（Linux 真面板、隔离 `APPDATA`、10 s）**：`ariahost.log` 22 行 / 2855 B，`main`×1 + `panel`×20 + `panel.probe`×1，`LEAK`/`SK-SHOULD-NOT-APPEAR` 命中 0。
+**已实测（Linux 真面板、隔离 `APPDATA`、45 s）**：`ariahost.log` 25 行 / 3530 B，`main`×1 + `panel`×23 + `panel.probe`×1，`LEAK`/`SK-SHOULD-NOT-APPEAR` 命中 0。
+
+**这 25 行怎么来的（可复述的账）**：
+
+| 类别 | 行数 | 说明 |
+|---|---|---|
+| `main` 启动 | 1 | `main.rs` 在 `logfile::init` 之后写的第一行 |
+| 启动期一次性 `panel` | 18 | 后端选择 / 窗口状态 / 单实例锁 / 渲染配置 / 配置读取 / secret / 核心未就绪 / 界面行为 / 渲染器 / 图标 / 控制管道 / 系统字体 / 中文字体 / 图集上限 / 渲染设备 / 前置条件 / 后台刷新启动 … 每条只写一次 |
+| `panel.probe` | 1 | 后端探测轨迹（只有 `auto` 才有这行） |
+| 事件驱动 `panel` | 5 | 4 次 `aria2 刷新失败 AH-E2003`（退避 4 s→8 s→16 s）+ 1 次 `服务状态查询失败 AH-E5001`（非 Windows 的一次性事件） |
+
+**定频写盘 = 0 行**：worker 的 2 s 刷新**成功时不写日志**（只在失败时写），`RawInput.max_texture_side` 每帧改的是内存字段、不进日志。所以「零交互面板长时间挂着」的写盘量只由**退避重试**决定：45 s 内退避只到 16 s 档，30 s 窗口里正好只多 2 行（8 s、16 s 两次重试）。若真在渲染循环里写，30 s ≈ 60 fps × 30 = **1800 行量级**——与实测差三个数量级。
+
+**判据演化（写明，避免被当成无声放宽）**：task-58 的判据 2 原文是「用 `--panel-selftest` 跑一次，再检查落盘文件」。实现上 `--panel-selftest` **有意不落盘**（`cli::inits_file_log` 只对 `Panel | Service` 返回真）：这是**安全不变量**——并发 CI 自检会互踩同一个文件，短命自检会污染用户日志。因此该判据拆成两条替代证据：**A** 用 `--log-selftest --dir <隔离目录>` 验写入器与脱敏（exit 0、500 行、`leak=false`、落盘可见 `token:***` 与 `--rpc-secret=***`）；**B** 用真面板（隔离 `APPDATA`、45 s）验探针轨迹上盘 + 写盘有界（即上表）。拆法的覆盖面**大于**原判据：原判据只要求「轨迹进了文件」，B 还证明了「日志不会把磁盘写爆」，并顺带否掉「每帧写盘」这个真实风险。
 
 ## 5. 本地绿的边界（必读）
 
