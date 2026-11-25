@@ -2148,14 +2148,20 @@ impl PanelApp {
         let running = self.core.is_running();
         let ready = self.core_probe.ready();
 
+        // 状态卡（审计 M-1 / M-2）：**先画右对齐按钮组**，文本再占剩下的宽度并强制折行。
+        // 旧写法把按钮放在 `right_to_left` 的末尾，长句（如「找不到 aria2c：…」）只被窗口
+        // 裁掉，右侧按钮被挤出可视区（`13-core-guide.png` 的铁证）。次级文字用
+        // `Small`(12pt) + `text2`，不再用 `.weak().small()`（3.72:1 且 9pt）。
         ui.horizontal(|ui| {
-            badge(ui, &view);
-            ui.label(RichText::new(&view.headline).strong());
-            if busy {
-                ui.add(egui::Spinner::new());
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.main_buttons(ui, running, busy, ready);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    badge(ui, &view);
+                    ui.add(egui::Label::new(RichText::new(&view.headline)).wrap());
+                    if busy {
+                        ui.add(egui::Spinner::new());
+                    }
+                });
             });
         });
 
@@ -2167,20 +2173,24 @@ impl PanelApp {
             );
         }
         for line in &view.details {
-            ui.label(RichText::new(line).weak().small());
+            ui.label(
+                RichText::new(line)
+                    .text_style(egui::TextStyle::Small)
+                    .color(crate::theme::text2(ui)),
+            );
         }
         if let Some(next) = &view.next_step {
             ui.label(
                 RichText::new(format!("下一步：{next}"))
-                    .color(tone_color(view.tone))
-                    .small(),
+                    .text_style(egui::TextStyle::Body)
+                    .color(crate::theme::text2(ui)),
             );
         }
         if let (Some(since), true) = (self.busy_since, busy) {
             ui.label(
                 RichText::new(format!("已等待 {:.1} 秒", since.elapsed().as_secs_f32()))
-                    .weak()
-                    .small(),
+                    .text_style(egui::TextStyle::Small)
+                    .color(crate::theme::text2(ui)),
             );
         }
         if self.host.as_ref().is_some_and(|host| !host.is_alive()) {
@@ -2942,11 +2952,17 @@ impl PanelApp {
             .column(Column::initial(104.0).at_least(72.0))
             .column(Column::initial(64.0).at_least(48.0))
             .column(Column::initial(120.0).at_least(96.0))
-            .header(20.0, |mut header| {
+            .header(24.0, |mut header| {
                 for title in ["名称", "大小", "进度", "速度", "剩余", "状态", "操作"]
                 {
                     header.col(|ui| {
-                        ui.label(RichText::new(title).strong().small());
+                        // 表头 12pt（审计 M-5 / §5.4）：旧写法 `.strong().small()` 是 9pt，
+                        // 而 `strong()` 在 egui 里只换颜色不改字重，等于又小又平。
+                        ui.label(
+                            RichText::new(title)
+                                .text_style(egui::TextStyle::Small)
+                                .color(crate::theme::text2(ui)),
+                        );
                     });
                 }
             })
@@ -2964,10 +2980,17 @@ impl PanelApp {
                     };
 
                     table_row.col(|ui| {
-                        ui.label(RichText::new(&*row.name).small());
+                        ui.label(RichText::new(&*row.name).text_style(egui::TextStyle::Small));
                     });
+                    // 数值列右对齐（§5.4）：等宽数字靠右，纵向才能比对位。
                     table_row.col(|ui| {
-                        ui.label(RichText::new(&*row.size).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(&*row.size)
+                                    .text_style(egui::TextStyle::Small)
+                                    .monospace(),
+                            );
+                        });
                     });
                     table_row.col(|ui| {
                         ui.add(
@@ -2977,28 +3000,50 @@ impl PanelApp {
                         );
                     });
                     table_row.col(|ui| {
-                        ui.label(RichText::new(&*row.speed).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(&*row.speed)
+                                    .text_style(egui::TextStyle::Small)
+                                    .monospace(),
+                            );
+                        });
                     });
                     table_row.col(|ui| {
-                        ui.label(RichText::new(&*row.eta).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(&*row.eta)
+                                    .text_style(egui::TextStyle::Small)
+                                    .monospace(),
+                            );
+                        });
                     });
                     table_row.col(|ui| {
                         ui.label(
                             RichText::new(&*row.status)
-                                .small()
+                                .text_style(egui::TextStyle::Small)
                                 .color(status_color(row.kind)),
                         );
                     });
                     table_row.col(|ui| {
+                        // 操作列三槽位固定宽（审计 M-7）：不可用的动作**也画出禁用按钮**占位，
+                        // 这样「同一动作在每一行都落在同一 x」——旧写法只有存在的按钮才画，
+                        // 「只有移除」的行会把移除挪到暂停位，误点即暂停/移除。
+                        let slot = |ui: &mut egui::Ui, text: &str, enabled: bool| -> bool {
+                            ui.add_enabled_ui(enabled, |ui| {
+                                ui.add_sized([40.0, 24.0], egui::Button::new(text))
+                                    .clicked()
+                            })
+                            .inner
+                        };
                         ui.horizontal(|ui| {
-                            if row.kind.can_pause() && ui.small_button("暂停").clicked() {
+                            if slot(ui, "暂停", row.kind.can_pause()) {
                                 action = Some((TaskAction::Pause, Arc::clone(&row.gid), row.kind));
                             }
-                            if row.kind.can_resume() && ui.small_button("继续").clicked() {
+                            if slot(ui, "继续", row.kind.can_resume()) {
                                 action =
                                     Some((TaskAction::Unpause, Arc::clone(&row.gid), row.kind));
                             }
-                            if row.kind.can_remove() && ui.small_button("移除").clicked() {
+                            if slot(ui, "移除", row.kind.can_remove()) {
                                 action = Some((TaskAction::Remove, Arc::clone(&row.gid), row.kind));
                             }
                         });
