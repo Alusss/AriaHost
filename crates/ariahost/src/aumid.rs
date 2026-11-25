@@ -177,10 +177,17 @@ mod platform {
     /// `VT_LPWSTR`（`wtypes.h`）。本文件只用这一种 PROPVARIANT 形态。
     pub(super) const VT_LPWSTR: u16 = 31;
 
-    /// `PROPVARIANT` 的最小可用形态：8 字节头（vt + 3×reserved）+ 8 字节联合（x64 上是指针）。
+    /// `PROPVARIANT` 的**只读入参视图**：8 字节头（vt + 3×reserved）+ 偏移 8 处的一个指针。
     ///
-    /// 只填 `VT_LPWSTR` 一种，所以不需要完整联合定义；布局有测试钉住（工程上够用又少一份
-    /// 手抄风险）。若将来需要别的类型，别扩这个结构体，改用 `PROPVARIANT` 官方定义。
+    /// **这不是完整的 `PROPVARIANT`，只是一个「读得对」的视图。** 官方定义 = 8 字节头 +
+    /// 16 字节联合（联合里含 `DECIMAL`，见 `windows-sys` 的
+    /// `Win32::System::Variant::PROPVARIANT`）→ **两种架构都是 24 字节**；
+    /// 本结构体只有 16（x64）/ 12（x86）字节。
+    ///
+    /// 之所以安全：只用于 `IPropertyStore::SetValue` 的 `*const` 入参，Windows 只按 `vt`
+    /// 读 `vt@0` 与 `data@8`，**不会写回来**。反之——
+    /// **绝不能**把它交给会写入的实现（`GetValue` / `PropVariantCopy` / 任何 `*mut` 出参），
+    /// 32 位下 12 字节被写就会越界。要支持那些接口，别扩这个结构体，改用官方定义。
     #[repr(C)]
     pub(super) struct PropVariant {
         pub vt: u16,
@@ -421,13 +428,23 @@ mod tests {
         );
     }
 
-    /// `PROPVARIANT` 的最小布局：8 字节头 + 指针联合（x64 = 16 字节）。
+    /// `PROPVARIANT` 入参视图的布局钉死：`vt@0`、`data@8`、总长 = 8 + 指针宽度。
+    ///
+    /// 32 位首轮真跑就红在这里：原断言写死 `size_of == 16`，而 x86 上是 **12**（8 + 4）。
+    /// 这不是产品缺陷——入参路径只被读，不被写；但断言必须按指针宽度表达，
+    /// 否则等于用 x64 的数字去约束 x86。
     #[cfg(windows)]
     #[test]
     fn propvariant_layout_is_pinned() {
         use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<platform::PropVariant>(), 16);
+        let expected = 8 + size_of::<*mut u16>();
+        assert_eq!(size_of::<platform::PropVariant>(), expected);
+        assert!(
+            expected == 16 || expected == 12,
+            "未知的目标指针宽度：{expected}"
+        );
         assert_eq!(offset_of!(platform::PropVariant, vt), 0);
+        // 偏移 8 = 官方联合区起点，两架构一致（头部固定 8 字节）。
         assert_eq!(offset_of!(platform::PropVariant, data), 8);
     }
 }
