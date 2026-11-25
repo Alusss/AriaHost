@@ -363,10 +363,47 @@ jobs:
         run: |
           Write-Host "SIGN_CERT 已配置：此处应执行 signtool sign /f cert.pfx /p <pass> dist/${{ matrix.arch }}/ariahost.exe"
           Write-Host "::warning::exe 签名是占位实现，产物未签名（TODO: 接入 signtool）。"
-      - name: 安装 NSIS
+      # NSIS 获取策略（task-79）：**缓存优先 → choco 钉版本重试 → 版本漂移断言**。
+      # 为什么不再「进来就 choco 装一次」：2026-11-26 发 v0.1.3 时
+      # community.chocolatey.org 抖 503，x64/x86 两条腿同时红，且红点都在整条
+      # Windows 编译之后——私有仓分钟数按 2 倍计费，上游抖一次就烧两轮全量编译。
+      # 缓存命中时零网络；两条腿共用一个键（冷缓存时并行会各装一次，第二次起都命中）。
+      - name: 缓存 NSIS（版本钉 3.13.0）
+        id: nsis-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files (x86)\NSIS
+          key: nsis-3.13.0-${{ runner.os }}
+      - name: 安装 NSIS（缓存未命中才 choco；3 次重试 + 退避）
         shell: pwsh
         run: |
-          choco install nsis --no-progress -y
+          if ("${{ steps.nsis-cache.outputs.cache-hit }}" -eq "true") {
+            Write-Host "NSIS 命中缓存（key=nsis-3.13.0-${{ runner.os }}），跳过 choco"
+            exit 0
+          }
+          # 退避阶梯按任务书钉成 10s / 30s / 60s。**只有「还有下一次」才退避**：
+          # 3 次尝试只消耗前两档，第 3 次失败会立刻 fail-closed——若按 `$i -lt $waits.Count`
+          # 判断，第 3 次失败后还要白等 60s 才退出（本地模拟实测到这一点，已修）。
+          # 写成 $attempts-1 的好处：将来提到 4 次尝试，60s 档自动生效，不必改两处。
+          $waits = @(10, 30, 60)
+          $attempts = 3
+          for ($i = 0; $i -lt $attempts; $i++) {
+            Write-Host "::group::choco install nsis --version=3.13.0（第 $($i + 1)/$attempts 次）"
+            choco install nsis --version=3.13.0 --no-progress -y
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -eq 0) { Write-Host "choco 安装成功（第 $($i + 1) 次）"; exit 0 }
+            Write-Warning "第 $($i + 1) 次失败（exit $code）"
+            if ($i -lt ($attempts - 1)) {
+              Write-Host "等待 $($waits[$i]) s 后重试（503 多为上游瞬时抖动，退避一次往往就好）"
+              Start-Sleep -Seconds $waits[$i]
+            }
+          }
+          Write-Error "choco 安装 NSIS 3.13.0 三次全失败：没有 makensis 就出不了安装包，本步 fail-closed"
+          exit 1
+      - name: 解析 NSIS 并断言版本（3.13.x）
+        shell: pwsh
+        run: |
           $candidates = @(
             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
             "$env:ProgramFiles\NSIS\makensis.exe"
@@ -376,13 +413,17 @@ jobs:
             $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
             if ($cmd) { $nsis = $cmd.Source }
           }
-          if (-not $nsis) { Write-Error "makensis 未找到（choco 安装失败？）"; exit 1 }
-          "MAKENSIS=$nsis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (-not $nsis) { Write-Error "makensis 未找到（缓存未命中且 choco 三次失败？）"; exit 1 }
           # 不用 `makensis /VERSION` 探版本：该开关不在 Chapter 3 §3.1.1 的选项清单里
           # （清单有 /HDRINFO、/V、/LICENSE 等），若不存在这一步会在整条构建之后才红。
-          # 读文件版本信息只要求文件存在，零风险。
+          # 读文件版本信息只要求文件存在，零风险；顺手当版本漂移断言用。
           $vi = (Get-Item $nsis).VersionInfo
-          Write-Host "makensis = $nsis（FileVersion $($vi.FileVersion) / ProductVersion $($vi.ProductVersion)）"
+          if (-not $vi.FileVersion -or -not $vi.FileVersion.StartsWith("3.13")) {
+            Write-Error "makensis 版本漂移：期望 3.13.x，实际 '$($vi.FileVersion)'（路径 $nsis）"
+            exit 1
+          }
+          "MAKENSIS=$nsis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "MAKENSIS=$nsis（FileVersion $($vi.FileVersion) / ProductVersion $($vi.ProductVersion)）"
       - name: 编译安装包（makensis，${{ matrix.arch }} per-user）
         shell: pwsh
         env:

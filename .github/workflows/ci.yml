@@ -375,6 +375,44 @@ jobs:
       # 正斜杠会被当作字面字符 → 在 Linux 上绿不能推出在 Windows 上绿。
       # 所以：① 平台必须是 Windows；② 载荷必须是 cargo 真实产出的 ariahost.exe；
       # ③ 与 release.yml 传同一套 /D 参数（含反斜杠绝对路径）。
+      # NSIS 获取策略（task-79）：**缓存优先 → choco 钉版本重试 → 版本漂移断言**。
+      # 为什么不再「镜像预装就用、没有就 choco 装一次」：2026-11-26 发 v0.1.3 时
+      # community.chocolatey.org 抖 503，CI 与 release 两条线同时红，且红点都落在
+      # 整条 Windows 编译**之后**——私有仓分钟数按 2 倍计费，一次上游抖动就烧掉两轮
+      # 全量编译。缓存命中时这一步是纯本地解包，零网络。
+      - name: 缓存 NSIS（版本钉 3.13.0）
+        id: nsis-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files (x86)\NSIS
+          key: nsis-3.13.0-${{ runner.os }}
+      - name: 安装 NSIS（缓存未命中才 choco；3 次重试 + 退避）
+        shell: pwsh
+        run: |
+          if ("${{ steps.nsis-cache.outputs.cache-hit }}" -eq "true") {
+            Write-Host "NSIS 命中缓存（key=nsis-3.13.0-${{ runner.os }}），跳过 choco"
+            exit 0
+          }
+          # 退避阶梯按任务书钉成 10s / 30s / 60s。**只有「还有下一次」才退避**：
+          # 3 次尝试只消耗前两档，第 3 次失败会立刻 fail-closed——若按 `$i -lt $waits.Count`
+          # 判断，第 3 次失败后还要白等 60s 才退出（本地模拟实测到这一点，已修）。
+          # 写成 $attempts-1 的好处：将来提到 4 次尝试，60s 档自动生效，不必改两处。
+          $waits = @(10, 30, 60)
+          $attempts = 3
+          for ($i = 0; $i -lt $attempts; $i++) {
+            Write-Host "::group::choco install nsis --version=3.13.0（第 $($i + 1)/$attempts 次）"
+            choco install nsis --version=3.13.0 --no-progress -y
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -eq 0) { Write-Host "choco 安装成功（第 $($i + 1) 次）"; exit 0 }
+            Write-Warning "第 $($i + 1) 次失败（exit $code）"
+            if ($i -lt ($attempts - 1)) {
+              Write-Host "等待 $($waits[$i]) s 后重试（503 多为上游瞬时抖动，退避一次往往就好）"
+              Start-Sleep -Seconds $waits[$i]
+            }
+          }
+          Write-Error "choco 安装 NSIS 3.13.0 三次全失败：没有 makensis 就出不了安装包，本步 fail-closed"
+          exit 1
       - name: 安装脚本编译门禁（makensis，真实载荷）
         shell: pwsh
         run: |
@@ -384,12 +422,18 @@ jobs:
           }
           $mk = Find-Makensis
           if (-not $mk) {
-            Write-Host "镜像未预装 NSIS，改用 choco 安装"
-            choco install nsis --no-progress -y
-            $mk = Find-Makensis
+            $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $mk = $cmd.Source }
           }
-          if (-not $mk) { Write-Error "makensis 未找到（镜像未预装且 choco 安装失败）"; exit 1 }
-          Write-Host "makensis = $mk"
+          if (-not $mk) { Write-Error "makensis 未找到（缓存未命中且 choco 三次失败？）"; exit 1 }
+          # 版本漂移断言：缓存键写的是 3.13.0，但缓存也可能被同名键的旧内容污染；
+          # 任何偏离都在这里立刻红，别等到出包比版本才发现差异。
+          $ver = (Get-Item $mk).VersionInfo.FileVersion
+          if (-not $ver -or -not $ver.StartsWith("3.13")) {
+            Write-Error "makensis 版本漂移：期望 3.13.x，实际 '$ver'（路径 $mk）"
+            exit 1
+          }
+          Write-Host "MAKENSIS=$mk（FileVersion $ver）"
           $src = Join-Path $PWD "dist\x64"
           $out = Join-Path $PWD "dist\AriaHost-0.0.0-ci-x64-setup.exe"
           New-Item -ItemType Directory -Force $src | Out-Null
