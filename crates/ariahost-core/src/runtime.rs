@@ -644,9 +644,24 @@ pub struct Timeouts {
     pub stop_grace: Duration,
     /// `forceShutdown` 之后的退出等待（默认 10s）。
     pub force_grace: Duration,
-    /// 首次轮询间隔（默认 200ms，之后按 1.5 倍递增）。
+    /// 就绪探测的**首次**间隔（默认 100ms，之后按 1.5 倍递增到 [`Self::ready_poll_max`]）。
+    ///
+    /// 为什么不复用 [`Self::poll`]：`poll` 同时被 `stop()` 的三段 `wait_exit` 当轮询间隔用，
+    /// 改它会连带改停止路径的节奏——而停止路径的时序是冻结的（M4-c 任务书硬边界）。
+    pub ready_poll: Duration,
+    /// 就绪探测的间隔**上限**（默认 400ms）。
+    ///
+    /// 同理不复用 [`Self::poll_max`]：后者在 `stop()` 里是「强杀后等退出的兜底超时」。
+    /// 两个值语义不同、owner 不同（就绪 = 启动体验；poll_max = 停止收尾），共用一个字段
+    /// 会让「调启动」这件事偷偷改掉「停止」的时序。
+    pub ready_poll_max: Duration,
+    /// 等子进程退出时的轮询间隔（`stop()` 的三段 `wait_exit` 用；默认 200ms）。
+    ///
+    /// 就绪探测**不**用它（见 [`Self::ready_poll`]）。
     pub poll: Duration,
-    /// 轮询间隔上限（默认 1s）。
+    /// 强杀后等退出的兜底超时（`stop()` 用；默认 1s）。
+    ///
+    /// 名字沿用历史（当年就绪循环复用过同一个值），**它从来不是「轮询上限」**。
     pub poll_max: Duration,
 }
 
@@ -656,6 +671,8 @@ impl Default for Timeouts {
             ready: Duration::from_secs(15),
             stop_grace: Duration::from_secs(15),
             force_grace: Duration::from_secs(10),
+            ready_poll: Duration::from_millis(100),
+            ready_poll_max: Duration::from_millis(400),
             poll: Duration::from_millis(200),
             poll_max: Duration::from_secs(1),
         }
@@ -821,7 +838,9 @@ impl CoreRuntime {
         self.status.pid = Some(pid);
 
         let started = Instant::now();
-        let mut interval = self.timeouts.poll;
+        // 就绪循环用自己的节奏（`ready_poll` / `ready_poll_max`）：这两个值只影响
+        // 「spawn → Running」的探测频率，**不参与**任何停止时序。
+        let mut interval = self.timeouts.ready_poll;
         loop {
             match child.try_wait() {
                 Ok(Some(code)) => {
@@ -875,7 +894,7 @@ impl CoreRuntime {
                         return Err(error);
                     }
                     std::thread::sleep(interval);
-                    interval = next_interval(interval, self.timeouts.poll_max);
+                    interval = next_interval(interval, self.timeouts.ready_poll_max);
                 }
             }
         }
@@ -1350,9 +1369,31 @@ mod tests {
             ready: Duration::from_millis(80),
             stop_grace: Duration::from_millis(60),
             force_grace: Duration::from_millis(60),
+            ready_poll: Duration::from_millis(5),
+            ready_poll_max: Duration::from_millis(10),
             poll: Duration::from_millis(5),
             poll_max: Duration::from_millis(10),
         }
+    }
+
+    /// M4-c 的护栏：只许改**就绪**节奏，不许顺手改掉停止的预算。
+    ///
+    /// 就绪探测改用 `ready_poll` / `ready_poll_max` 正是为了与停止侧解耦：`poll` / `poll_max`
+    /// 同时被 `stop()` 的三段 `wait_exit` 使用（强杀后的兜底超时也在里面）。这条测试把停止侧
+    /// 四个数钉死——任何人为了让启动更快而改到这里，先红的是 CI，不是用户的卸载。
+    #[test]
+    fn timeouts_keep_ready_and_stop_budgets_separate() {
+        let timeouts = Timeouts::default();
+        // 就绪：首轮 100ms、退避上限 400ms（M4-c 新值）
+        assert_eq!(timeouts.ready_poll, Duration::from_millis(100));
+        assert_eq!(timeouts.ready_poll_max, Duration::from_millis(400));
+        // 就绪总预算不变（L13 的 S1+S2 仍受 15s 保护）
+        assert_eq!(timeouts.ready, Duration::from_secs(15));
+        // 停止侧原样冻结：15s + 10s = 25s，与 CLI `--quit` 的 25s 预算对齐
+        assert_eq!(timeouts.stop_grace, Duration::from_secs(15));
+        assert_eq!(timeouts.force_grace, Duration::from_secs(10));
+        assert_eq!(timeouts.poll, Duration::from_millis(200));
+        assert_eq!(timeouts.poll_max, Duration::from_secs(1));
     }
 
     fn spec() -> LaunchSpec {
