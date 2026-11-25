@@ -145,7 +145,16 @@ mod tests {
     #[test]
     fn redacts_magnet_infohash() {
         let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=x";
-        assert_eq!(redact(magnet), "magnet:?xt=urn:btih:***&dn=x");
+        assert_eq!(
+            redact(magnet),
+            "magnet:?xt=urn:btih:***&dn=x",
+            "infohash 是「谁在下什么」的证据，必须抹"
+        );
+        // base32 形式（32 字符）同样抹掉——只认 hex 会漏掉一半磁力链接。
+        assert_eq!(
+            redact("urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"),
+            "urn:btih:***"
+        );
     }
 
     #[test]
@@ -153,6 +162,11 @@ mod tests {
         assert_eq!(
             redact("https://alice:hunter2@example.com/a/b"),
             "https://alice:***@example.com/a/b"
+        );
+        // 带端口（FTP/自建 HTTP）也要认，且端口保留。
+        assert_eq!(
+            redact("ftp://bob:pw@host:2121/x"),
+            "ftp://bob:***@host:2121/x"
         );
         // 没有 @ 的普通 URL 原样
         assert_eq!(
@@ -179,6 +193,22 @@ mod tests {
         ] {
             assert_eq!(redact(text), text, "{text}");
         }
+        // 敏感词作为普通单词出现（后面没有分隔符/值）不该误伤。
+        assert_eq!(redact("token 注入完成"), "token 注入完成");
+    }
+
+    /// 脱敏会被叠加调用（历史落盘前兜底再脱一次、日志里贴了已脱敏的串），
+    /// 二次调用必须是幂等的——否则 `***` 会被再吃一遍，变成吞掉后文。
+    #[test]
+    fn applying_redaction_twice_is_stable() {
+        let line = "args=[--rpc-secret=aaa, token:bbb] url=http://u:p@h/?token=ccc";
+        let once = redact(line);
+        assert_eq!(
+            once,
+            "args=[--rpc-secret=***, token:***] url=http://u:***@h/?token=***"
+        );
+        assert_eq!(redact(&once), once, "二次脱敏不得改变结果");
+        assert_eq!(redact(&redact(&once)), once);
     }
 
     #[test]

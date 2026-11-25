@@ -25,11 +25,14 @@
 //! | `total_bytes` / `completed_bytes` | u64 | 大小 |
 //! | `status` | `complete` / `error` / `removed` | 终态 |
 //! | `error_code` | string? | `AH-E####` 或 aria2 的 errorCode；成功时不写 |
-//! | `finished_at` | string | UTC RFC3339；**固定格式，可按字符串排序** |
+//! | `finished_at` | string | UTC；**必须用 [`ariahost_common::time::utc_stamp`] 生成**（定宽 24 字节） |
 //! | `source` | `user` / `service` | 哪个平面写的 |
 //!
-//! `finished_at` 由调用方给（本模块不再加第三份时间格式化实现；排序只依赖
-//! 「RFC3339 UTC 定长字符串」这个性质）。
+//! `finished_at` 由调用方给，但**格式不是自由的**：`recent()`/`find()` 只靠字符串比较排序，
+//! 所以必须是 `ariahost_common::time::utc_stamp` 那种定宽 UTC 串（`YYYY-MM-DDTHH:MM:SS.mmmZ`）。
+//! 混用两种长度会把顺序排错——`"…:20.500Z"` 与 `"…:20Z"` 逐字节比时 `'.'`(0x2E) < `'Z'`(0x5A)，
+//! 不带毫秒的那条会被排到后面。本模块不做二次解析，也就救不回来。
+//! （时间戳实现只有 common 一份，本模块不再自己格式化。）
 //!
 //! ## 幂等
 //!
@@ -57,8 +60,10 @@
 //!
 //! ## 脱敏归属
 //!
-//! 规则落在 [`ariah​ost_common::redact`]（`common`），服务日志与任务历史共用**同一份**实现。
+//! 规则落在 [`ariahost_common::redact`]（`common`），服务日志与任务历史共用**同一份**实现。
 //! 本模块在落盘前**再脱一次**（调用方忘了脱也兜住）。
+//!
+//! 时间戳同理：只有 [`ariahost_common::time::utc_stamp`] 一份实现，本模块不自己格式化。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -630,6 +635,9 @@ impl History {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use ariahost_common::time::utc_stamp;
 
     use super::*;
 
@@ -684,6 +692,50 @@ mod tests {
             finished_at,
         )
         .with_bytes(1000, 1000)
+    }
+
+    /// `base` 秒 + `offset_ms` 毫秒的 UTC 定宽串（用 common 的唯一实现，不自己拼字符串）。
+    fn stamp(base: u64, offset_ms: u64) -> String {
+        utc_stamp(UNIX_EPOCH + Duration::from_secs(base) + Duration::from_millis(offset_ms))
+    }
+
+    // ---- finished_at 的格式契约 ----
+
+    /// `finished_at` 必须用 `ariahost_common::time::utc_stamp` 生成（定宽 24 字节）。
+    ///
+    /// 这条把契约钉在**排序**上而不是钉在字符串字面量上：`recent()` 只做字符串比较，
+    /// 同一秒内的两条记录只有带毫秒才分得出先后（不带毫秒就退化成「同秒顺序不定」）。
+    #[test]
+    fn common_time_stamps_keep_same_second_entries_in_order() {
+        let temp = TempDir::new("stamp-order");
+        let history = temp.history();
+
+        let base = 1_700_000_000u64;
+        let early_stamp = stamp(base, 100);
+        let late_stamp = stamp(base, 900);
+        assert_eq!(early_stamp.len(), ariahost_common::time::STAMP_LEN);
+        assert!(early_stamp < late_stamp);
+
+        // 故意先写「较晚」的再写「较早」的：顺序必须按 finished_at，而不是按写入顺序。
+        history
+            .record(&entry("late", HistoryStatus::Complete, &late_stamp))
+            .expect("写 late");
+        history
+            .record(&entry("early", HistoryStatus::Complete, &early_stamp))
+            .expect("写 early");
+
+        let gids: Vec<String> = history
+            .recent(10)
+            .expect("读")
+            .into_iter()
+            .map(|item| item.gid)
+            .collect();
+        assert_eq!(gids, ["late", "early"], "同秒内必须靠毫秒定序");
+
+        // 落盘串就是那个定宽串本身（没有第二次格式化，也没有被转义改写）。
+        let raw = fs::read_to_string(temp.file()).expect("读文件");
+        assert!(raw.contains(&late_stamp), "{raw}");
+        assert!(raw.contains(&early_stamp), "{raw}");
     }
 
     // ---- 正常往返 ----

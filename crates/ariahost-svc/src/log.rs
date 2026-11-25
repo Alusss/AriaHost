@@ -19,11 +19,14 @@
 //! **服务进程自身**的事件，不去改 aria2 的 `log=` 指向（避免两边互相覆盖）。
 
 use std::cell::RefCell;
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
+
+// 时间戳与脱敏**只有一份实现**，都在 `ariahost-common`（见下面「实现归属」一节）。
+use ariahost_common::redact::redact;
+use ariahost_common::time::utc_stamp;
 
 /// 日志级别。只留三档：服务日志是给排障看的，不需要 TRACE/DEBUG 的花活。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,7 +241,7 @@ impl ServiceLog {
         };
         let line = format!(
             "{} {} {}\n",
-            format_utc(instant),
+            utc_stamp(instant),
             level.as_str(),
             redact(message)
         );
@@ -376,145 +379,28 @@ impl LogSink for ServiceLog {
 }
 
 // ---------------------------------------------------------------------------
-// 时间戳
+// 实现归属：时间戳与脱敏都在 `ariahost-common`，本文件只调用、不复制
 // ---------------------------------------------------------------------------
-
-/// `SystemTime` → `YYYY-MM-DDTHH:MM:SS.mmmZ`（UTC，定宽，可直接按字节切）。
-pub fn format_utc(instant: SystemTime) -> String {
-    let since_epoch = instant.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-    let seconds = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
-    let millis = since_epoch.subsec_millis();
-    let days = seconds.div_euclid(86_400);
-    let of_day = seconds.rem_euclid(86_400);
-    let (year, month, day) = civil_from_days(days);
-    let mut out = String::with_capacity(24);
-    // `write!` 到 String 不会失败，显式忽略结果以满足 clippy。
-    let _ = write!(
-        out,
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        of_day / 3_600,
-        (of_day % 3_600) / 60,
-        of_day % 60
-    );
-    out
-}
-
-/// 1970-01-01 起的天数 → (年, 月, 日)。Howard Hinnant 的 `civil_from_days`。
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1); // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (
-        if month <= 2 { year + 1 } else { year },
-        u32::try_from(month).unwrap_or(1),
-        day,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// 脱敏
-// ---------------------------------------------------------------------------
-
-/// 被抹掉的占位符。
-const REDACTED: &str = "***";
-
-/// 值的终止字符（出现在这些字符之前的部分才算「秘密值」）。
-const VALUE_END: &[char] = &[
-    ' ', '\t', '\r', '\n', '"', '\'', '&', ',', ';', ')', ']', '}', '>', '<', '`', '|',
-];
-
-/// 脱敏：`token:` / `token=` / `--rpc-secret=` / 磁力 infohash / URL 密码 **全部** 抹成 `***`。
-///
-/// 为什么必须做：服务日志会被用户贴进 issue，而 aria2 的 RPC secret 一旦泄露，
-/// 局域网里任何人都能远程加任务/删文件（架构 §4.6.1 威胁模型）。
-pub fn redact(message: &str) -> String {
-    let text = with_values_redacted(message, "token:", |ch| !VALUE_END.contains(&ch));
-    let text = with_values_redacted(&text, "token=", |ch| !VALUE_END.contains(&ch));
-    let text = with_values_redacted(&text, "rpc-secret=", |ch| !VALUE_END.contains(&ch));
-    let text = with_values_redacted(&text, "urn:btih:", |ch| ch.is_ascii_alphanumeric());
-    redact_url_password(&text)
-}
-
-/// 把 `needle` 之后的「连续值字符」替换成 `***`（大小写不敏感，保留 `needle` 原文）。
-fn with_values_redacted<F>(message: &str, needle: &str, is_value: F) -> String
-where
-    F: Fn(char) -> bool,
-{
-    let lower = message.to_ascii_lowercase();
-    let mut out = String::with_capacity(message.len());
-    let mut copied = 0usize;
-    let mut search = 0usize;
-    while let Some(offset) = lower[search..].find(needle) {
-        let start = search + offset;
-        let value_start = start + needle.len();
-        let mut value_end = value_start;
-        for (index, ch) in message[value_start..].char_indices() {
-            if !is_value(ch) {
-                break;
-            }
-            value_end = value_start + index + ch.len_utf8();
-        }
-        out.push_str(&message[copied..value_start]);
-        if value_end > value_start {
-            out.push_str(REDACTED);
-        }
-        copied = value_end;
-        // 空值也要前进，否则死循环。
-        search = value_end.max(value_start);
-    }
-    out.push_str(&message[copied..]);
-    out
-}
-
-/// `scheme://user:password@host/...` 里的密码 → `***`（用户名保留，便于排障）。
-fn redact_url_password(message: &str) -> String {
-    let lower = message.to_ascii_lowercase();
-    let mut out = String::with_capacity(message.len());
-    let mut copied = 0usize;
-    let mut search = 0usize;
-    while let Some(offset) = lower[search..].find("://") {
-        let authority_start = search + offset + 3;
-        // 权限段到下一个 `/`、`?`、`#`、空白或引号为止。
-        let mut authority_end = message.len();
-        for (index, ch) in message[authority_start..].char_indices() {
-            if matches!(ch, '/' | '?' | '#' | ' ') || VALUE_END.contains(&ch) {
-                authority_end = authority_start + index;
-                break;
-            }
-        }
-        let authority = &message[authority_start..authority_end];
-        if let Some(at) = authority.rfind('@') {
-            if let Some(colon) = authority[..at].find(':') {
-                let password_start = authority_start + colon + 1;
-                let password_end = authority_start + at;
-                out.push_str(&message[copied..password_start]);
-                if password_end > password_start {
-                    out.push_str(REDACTED);
-                }
-                copied = password_end;
-            }
-        }
-        search = authority_end.max(authority_start);
-        if search >= message.len() {
-            break;
-        }
-        // 跳过已经处理过的权限段，继续找下一个 `://`。
-        search += 1;
-    }
-    out.push_str(&message[copied..]);
-    out
-}
+//
+// 这里原本各有一份 `format_utc` 与 `redact`，与 common 那份逐字一致。两份实现必然
+// 漂移，而这两处漂移的代价最高：
+//
+// - 脱敏漂移 → 日志里漏出明文 `rpc-secret`（用户会把日志贴进 issue，见架构 §4.6.1）；
+// - 时间戳漂移 → 同一份日志里两种长度的时间前缀，定宽被破坏后字符串排序直接错。
+//
+// 现在：时间戳 → `ariahost_common::time::utc_stamp`（定宽 24 字节，输出与原来逐字节一致，
+// 已落盘的 `service.log` 不受影响）；脱敏 → `ariahost_common::redact::redact`
+// （与任务历史落盘共用同一份）。
+//
+// 唯一性由 `grep -rn "fn utc_stamp\|fn redact" crates/` 守护：定义只应在 common。
+// 下面测试里保留的那几条脱敏断言是**接线回归**（证明服务日志确实走 common 的规则），
+// 不是第二份算法。
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::UNIX_EPOCH;
 
     static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -536,30 +422,26 @@ mod tests {
     }
 
     // --- 时间戳 ---
+    //
+    // 格式本身的断言（定值、定宽、列序、纪元前钳制）在 `ariahost_common::time` 的测试里。
+    // 原来这里的两条 `format_utc_*` 测试已迁到 common：
+    // `matches_known_instants` 与 `stamps_sort_lexicographically_like_time`。
+    // 这里只断言**服务日志确实用了那份实现**（接线回归）。
 
     #[test]
-    fn format_utc_matches_known_instants() {
-        assert_eq!(format_utc(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
-        // 外部核对：`date -u -d @1700000000` = 2023-11-14T22:13:20Z
-        assert_eq!(format_utc(at(1_700_000_000)), "2023-11-14T22:13:20.000Z");
-        // 外部核对：`date -u -d @1793000000` = 2026-10-26T07:33:20Z
-        assert_eq!(format_utc(at(1_793_000_000)), "2026-10-26T07:33:20.000Z");
-        // 毫秒与闰年 2 月 29 日（2024-02-29T12:00:00Z）。
+    fn written_line_timestamp_equals_common_utc_stamp() {
+        let dir = temp_dir("stamp-wiring");
+        let log = ServiceLog::open(&dir, Limits::default());
+        let instant = at(1_700_000_000) + Duration::from_millis(123);
+        assert!(log.write_at(instant, Level::Info, "接线检查"));
+        let text = read(log.path());
+        let stamp = utc_stamp(instant);
+        assert_eq!(stamp.len(), ariahost_common::time::STAMP_LEN);
         assert_eq!(
-            format_utc(at(1_709_208_000) + Duration::from_millis(7)),
-            "2024-02-29T12:00:00.007Z"
+            text,
+            format!("{stamp} INFO 接线检查\n"),
+            "日志行的时间前缀必须逐字节等于 common 的 utc_stamp"
         );
-    }
-
-    #[test]
-    fn format_utc_is_lexicographically_ordered() {
-        let early = format_utc(at(1_700_000_000));
-        let late = format_utc(at(1_700_000_001));
-        assert!(
-            early < late,
-            "定宽 UTC 必须能按字符串排序：{early} / {late}"
-        );
-        assert_eq!(early.len(), late.len());
     }
 
     // --- 脱敏 ---
