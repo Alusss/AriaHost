@@ -8,7 +8,7 @@
 //! M2 起「无参数」真的起窗（`crates/ariahost-ui`）；`--service` 与三个短命助手仍是桩。
 //! `--panel-selftest` 是隐藏自测入口（不出现在 `--help` 里），供无人值守量测内存用。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ariahost_common::{ErrorCode, BINARY_NAME, EXIT_ERR, EXIT_OK, EXIT_TIMEOUT, VERSION};
 
@@ -22,7 +22,8 @@ AriaHost — aria2 Windows 服务管理器
   ariahost --service               以 Windows 服务方式运行（ServiceHost）
   ariahost --install-service       注册 Windows 服务（需管理员）
   ariahost --uninstall-service     注销 Windows 服务（需管理员）
-  ariahost --write-aumid <lnk>     （M3 安装器调用；命令行暂不实现，会明确报 AH-E1001）
+  ariahost --write-aumid <lnk>     给快捷方式写 AUMID（安装器调用；Toast 的前提）
+  ariahost --service-status        打印服务状态（单行 JSON，机器可读；未安装也退出 0）
   ariahost --aria2-fetch [版本]    下载并安装 aria2 核心（省略版本 = 最新，如 1.37.0）
   ariahost --quit                  请求运行中的面板实例退出
   ariahost --version | -V          显示版本
@@ -62,6 +63,8 @@ pub enum Command {
     InstallService,
     /// `--uninstall-service`：注销 Windows 服务（短命助手）。
     UninstallService,
+    /// `--service-status`：只读查询服务状态（短命助手，单行 JSON；面板/安装器/脚本共用）。
+    ServiceStatus,
     /// `--write-aumid <lnk>`：给快捷方式写 AUMID（短命助手）。
     WriteAumid {
         /// 目标 `.lnk` 路径。
@@ -201,6 +204,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "--web-selftest" => Command::WebSelftest,
         "--install-service" => Command::InstallService,
         "--uninstall-service" => Command::UninstallService,
+        "--service-status" => Command::ServiceStatus,
         "--quit" => Command::Quit,
         "--version" | "-V" => Command::Version,
         "--help" | "-h" => Command::Help,
@@ -426,17 +430,8 @@ fn execute(command: &Command) -> i32 {
         Command::WebSelftest => run_web_selftest(),
         Command::InstallService => run_install_service(),
         Command::UninstallService => run_uninstall_service(),
-        Command::WriteAumid { lnk } => {
-            // 留桩是**有意**的：AUMID 只在 MSI/安装器建快捷方式时才有意义（M3），
-            // 面板/CLI 现在写它没有消费方。别让用户以为这里能用。
-            println!(
-                "{} write-aumid 尚未接入：{}",
-                ErrorCode::Usage.code(),
-                lnk.display()
-            );
-            println!("它由 M3 安装器（installer/ariahost.nsi）在创建开始菜单快捷方式时调用，命令行不单独提供该功能。");
-            EXIT_ERR
-        }
+        Command::ServiceStatus => run_service_status(),
+        Command::WriteAumid { lnk } => run_write_aumid(lnk),
         Command::Aria2Fetch { version } => run_aria2_fetch(version.as_deref()),
         Command::RuntimeSelftest { seconds } => run_runtime_selftest(*seconds),
         Command::Quit => {
@@ -529,6 +524,11 @@ fn run_install_service() -> i32 {
                 ariahost_svc::InstallOutcome::AlreadyExisted => "服务本来就在（已注册，无需重装）",
             };
             println!("{text}：{}", exe.display());
+            // 启动类型也是安装器与排障要看的事实：首版**固定手动（按需）启动**，不随系统自启
+            // （需求第 5 条：不偷偷开机启服务）。要改得走 SCM 工具，CLI 不提供 `--auto`。
+            println!(
+                "启动方式：手动（按需）启动，不随系统自启；服务名 AriaHost，账户 LocalSystem。"
+            );
             println!(
                 "下一步：`ariahost --service` 由系统拉起；面板里点「启动 aria2」不需要管理员。"
             );
@@ -557,6 +557,62 @@ fn run_uninstall_service() -> i32 {
             EXIT_ERR
         }
     }
+}
+
+/// `--write-aumid <lnk>`：给快捷方式写 `System.AppUserModel.ID`（安装器每条 `.lnk` 调一次）。
+///
+/// 失败**只影响通知**（Toast 降级为托盘气泡），所以这里不打 usage、不返回用法错误码，
+/// 而是给既有错误码 + 一句人话 + 建议；安装器把非 0 退出码当「警告」记日志后继续。
+fn run_write_aumid(lnk: &Path) -> i32 {
+    match crate::aumid::write_aumid(lnk) {
+        Ok(()) => {
+            println!("AUMID 已写入：{}（{}）", lnk.display(), crate::aumid::AUMID);
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("{} {}", error.code().code(), error.message());
+            eprintln!("{}", error.suggestion());
+            EXIT_ERR
+        }
+    }
+}
+
+/// `--service-status`：只读查询，输出**单行 JSON**（字段名与取值都是稳定英文/数字）。
+///
+/// 为什么不打印中文：面板要轮询它，解析中文文案等于把 UI 文案变成协议；
+/// 未安装也退出 0（那是常态，不是错误）。
+fn run_service_status() -> i32 {
+    match ariahost_svc::status_report() {
+        Ok(report) => {
+            println!("{}", service_status_json(&report));
+            EXIT_OK
+        }
+        Err(error) => {
+            eprintln!("{} 查询服务状态失败：{}", error.code.code(), error.detail);
+            EXIT_ERR
+        }
+    }
+}
+
+/// 把状态报告编成单行 JSON（**稳定契约**：字段顺序固定、缺值一律 `null`）。
+///
+/// 形状：`{"installed":bool,"state":str,"start_type":str|null,"pid":number|null}`
+fn service_status_json(report: &ariahost_svc::ServiceStatusReport) -> String {
+    let start_type = match report.start_type {
+        Some(mode) => format!("\"{}\"", mode.as_str()),
+        None => "null".to_owned(),
+    };
+    let pid = match report.pid {
+        Some(pid) => pid.to_string(),
+        None => "null".to_owned(),
+    };
+    format!(
+        "{{\"installed\":{},\"state\":\"{}\",\"start_type\":{},\"pid\":{}}}",
+        report.installed,
+        report.state.as_str(),
+        start_type,
+        pid
+    )
 }
 
 /// 服务操作失败的统一上屏口径：`AH-E` 码 + 一句人话 + 可执行建议。
@@ -1115,8 +1171,49 @@ mod tests {
                 lnk: PathBuf::from(path)
             })
         );
-        // 留桩但必须**明确失败**：不能让用户以为 AUMID 已经写进快捷方式了。
+        // 路径不存在 → 必须**明确失败**（AH-E1001），不能假装写过。
         assert_eq!(run_args(&["--write-aumid", path]), EXIT_ERR);
+    }
+
+    /// JSON 形状是面板/安装器/脚本的契约：字段顺序、取值、缺值写法都不能变。
+    #[test]
+    fn service_status_json_shape_is_stable() {
+        let not_installed = ariahost_svc::ServiceStatusReport {
+            installed: false,
+            state: ariahost_svc::ServiceState::NotInstalled,
+            start_type: None,
+            pid: None,
+        };
+        assert_eq!(
+            service_status_json(&not_installed),
+            r#"{"installed":false,"state":"not-installed","start_type":null,"pid":null}"#
+        );
+
+        let running = ariahost_svc::ServiceStatusReport {
+            installed: true,
+            state: ariahost_svc::ServiceState::Running,
+            start_type: Some(ariahost_svc::ServiceStartMode::Demand),
+            pid: Some(4242),
+        };
+        assert_eq!(
+            service_status_json(&running),
+            r#"{"installed":true,"state":"running","start_type":"demand","pid":4242}"#
+        );
+    }
+
+    #[test]
+    fn service_status_is_parsed_and_never_prints_chinese_state() {
+        assert_eq!(
+            parse_args(&["--service-status"]),
+            Ok(Command::ServiceStatus)
+        );
+        // 平台相关：非 Windows 上必然失败（AH-E5001），Windows 上未装也是成功（installed:false）。
+        let code = run_args(&["--service-status"]);
+        if cfg!(windows) {
+            assert_eq!(code, EXIT_OK, "Windows 上未装服务也必须退出 0");
+        } else {
+            assert_eq!(code, EXIT_ERR, "非 Windows 上没有 SCM，必须明确失败");
+        }
     }
 
     #[test]
@@ -1158,6 +1255,7 @@ mod tests {
             "--service",
             "--install-service",
             "--uninstall-service",
+            "--service-status",
             "--write-aumid",
             "--quit",
             "--version",

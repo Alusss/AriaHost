@@ -6,6 +6,7 @@
 //! 分派顺序硬约束：先解析 argv，再决定是否进入单实例锁；短命助手不参与单实例。
 //! 面板的单实例锁在 `ariahost_ui::run_panel` 内部获取（`%LOCALAPPDATA%\AriaHost\panel.lock`）。
 
+mod aumid;
 mod cli;
 
 fn main() {

@@ -122,6 +122,50 @@ impl UninstallOutcome {
     }
 }
 
+/// SCM 启动类型（只留本产品会遇到的 5 种；[`Self::as_str`] 是稳定机器可读文本）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStartMode {
+    /// 随系统自动启动。
+    Auto,
+    /// 手动/按需启动（`DemandStart`，本产品的默认，需求第 5 条）。
+    Demand,
+    /// 已禁用。
+    Disabled,
+    /// 驱动：系统启动时加载（服务不该出现，保留以便如实上报而不是猜）。
+    System,
+    /// 驱动：引导时加载（同上）。
+    Boot,
+}
+
+impl ServiceStartMode {
+    /// 稳定文本：面板/脚本按它判断，**不要**解析中文。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Demand => "demand",
+            Self::Disabled => "disabled",
+            Self::System => "system",
+            Self::Boot => "boot",
+        }
+    }
+}
+
+/// 只读服务状态报告（`--service-status` 与面板轮询共用同一份数据）。
+///
+/// 「未安装」不是错误：`installed == false` 时 `state` 恒为 [`ServiceState::NotInstalled`]、
+/// `start_type`/`pid` 都是 `None`。这样调用方既不用把「没装」当异常，也不用解析中文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceStatusReport {
+    /// 是否有服务注册。
+    pub installed: bool,
+    /// 当前状态。
+    pub state: ServiceState,
+    /// 启动类型（未安装时 `None`）。
+    pub start_type: Option<ServiceStartMode>,
+    /// 服务进程 pid（只有运行中且 SCM 给出时才是 `Some`）。
+    pub pid: Option<u32>,
+}
+
 /// 服务状态查询失败（[`ServiceState::NotInstalled`] 不是错误，不走这个类型）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceQueryError {
@@ -251,10 +295,11 @@ mod state {
 
     use ariahost_common::ErrorCode;
     use windows_service::service::ServiceAccess;
+    use windows_service::service::ServiceStartType;
     use windows_service::service::ServiceState as WinServiceState;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    use super::{ServiceQueryError, ServiceState};
+    use super::{ServiceQueryError, ServiceStartMode, ServiceState, ServiceStatusReport};
     use crate::install::{ERROR_ACCESS_DENIED, ERROR_SERVICE_DOES_NOT_EXIST};
 
     /// 查询指定服务名的状态。
@@ -280,6 +325,62 @@ mod state {
             .query_status()
             .map_err(|error| map_error(&error, "查询服务状态"))?;
         Ok(map_state(status.current_state))
+    }
+
+    /// 只读状态报告：`QUERY_STATUS | QUERY_CONFIG` 一次拿全状态、pid 与启动类型。
+    ///
+    /// 为什么合在一次调用里：面板要轮询它，分三次打开服务句柄会让「状态/pid/启动类型」
+    /// 来自三个不同瞬间，出现「已停止但 pid 还在」这类自相矛盾的报告。
+    pub fn status_report_of(name: &str) -> Result<ServiceStatusReport, ServiceQueryError> {
+        let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+            .map_err(|error| map_error(&error, "打开本机 SCM"))?;
+
+        let service = match manager.open_service(
+            name,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+        ) {
+            Ok(service) => service,
+            // 「没装」是常态，不是错误：给一份自洽的报告而不是 Err。
+            Err(error) if is_not_installed(&error) => {
+                return Ok(ServiceStatusReport {
+                    installed: false,
+                    state: ServiceState::NotInstalled,
+                    start_type: None,
+                    pid: None,
+                });
+            }
+            Err(error) => return Err(map_error(&error, "打开服务")),
+        };
+
+        let status = service
+            .query_status()
+            .map_err(|error| map_error(&error, "查询服务状态"))?;
+        let state = map_state(status.current_state);
+        let config = service
+            .query_config()
+            .map_err(|error| map_error(&error, "查询服务配置"))?;
+        Ok(ServiceStatusReport {
+            installed: true,
+            state,
+            start_type: Some(map_start_type(config.start_type)),
+            // 只有运行时 pid 才有意义：停止态 SCM 仍会给出上次的 pid，照抄会误导面板。
+            pid: if state.is_running() {
+                status.process_id
+            } else {
+                None
+            },
+        })
+    }
+
+    /// `windows_service::ServiceStartType` → 本 crate 的稳定枚举。
+    fn map_start_type(start_type: ServiceStartType) -> ServiceStartMode {
+        match start_type {
+            ServiceStartType::AutoStart => ServiceStartMode::Auto,
+            ServiceStartType::OnDemand => ServiceStartMode::Demand,
+            ServiceStartType::Disabled => ServiceStartMode::Disabled,
+            ServiceStartType::SystemStart => ServiceStartMode::System,
+            ServiceStartType::BootStart => ServiceStartMode::Boot,
+        }
     }
 
     /// 取 Win32 错误码。`windows_service::Error` 只有 `Winapi` 变体带 `io::Error`。
@@ -341,13 +442,21 @@ mod state {
 
     use ariahost_common::ErrorCode;
 
-    use super::{ServiceQueryError, ServiceState};
+    use super::{ServiceQueryError, ServiceState, ServiceStatusReport};
 
     /// 非 Windows 平台没有 SCM，直接报「服务不可用」。
     pub fn query_state_of(_name: &str) -> Result<ServiceState, ServiceQueryError> {
         Err(ServiceQueryError::new(
             ErrorCode::ServiceUnavailable,
             "非 Windows 平台不支持 SCM 查询".to_owned(),
+        ))
+    }
+
+    /// 非 Windows 平台没有 SCM，状态报告同样如实报错（不能伪造一台机器的服务状态）。
+    pub fn status_report_of(_name: &str) -> Result<ServiceStatusReport, ServiceQueryError> {
+        Err(ServiceQueryError::new(
+            ErrorCode::ServiceUnavailable,
+            "非 Windows 平台没有 SCM，无法查询服务状态".to_owned(),
         ))
     }
 }
@@ -366,6 +475,19 @@ pub fn query_state() -> Result<ServiceState, ServiceQueryError> {
 /// 保证不存在的名字，所以把名字作为参数暴露出来。
 pub fn query_state_of(name: &str) -> Result<ServiceState, ServiceQueryError> {
     state::query_state_of(name)
+}
+
+/// 查询本产品服务的只读状态报告（`--service-status` 的实现，面板轮询也用它）。
+///
+/// 与 [`query_state`] 的区别：这里额外给出 `start_type` 与运行中的 `pid`，
+/// 且**未安装不是错误**（`installed: false`）。
+pub fn status_report() -> Result<ServiceStatusReport, ServiceQueryError> {
+    status_report_of(SERVICE_NAME)
+}
+
+/// 查询任意服务名的只读状态报告（[`status_report`] 的实现入口）。
+pub fn status_report_of(name: &str) -> Result<ServiceStatusReport, ServiceQueryError> {
+    state::status_report_of(name)
 }
 
 pub use scm::{install, run, start, stop, uninstall};
@@ -418,6 +540,41 @@ mod tests {
     fn service_names_are_pinned() {
         assert_eq!(SERVICE_NAME, "AriaHost");
         assert_eq!(SERVICE_DISPLAY_NAME, "AriaHost");
+    }
+
+    /// 启动类型的文本是面板/脚本的判断依据，改了就是破坏契约。
+    #[test]
+    fn start_modes_have_stable_texts() {
+        assert_eq!(ServiceStartMode::Auto.as_str(), "auto");
+        assert_eq!(ServiceStartMode::Demand.as_str(), "demand");
+        assert_eq!(ServiceStartMode::Disabled.as_str(), "disabled");
+        assert_eq!(ServiceStartMode::System.as_str(), "system");
+        assert_eq!(ServiceStartMode::Boot.as_str(), "boot");
+    }
+
+    /// 「未安装」的报告必须自洽：installed=false 时不带 start_type/pid，状态就是 not-installed。
+    #[test]
+    fn not_installed_report_is_self_consistent() {
+        let report = ServiceStatusReport {
+            installed: false,
+            state: ServiceState::NotInstalled,
+            start_type: None,
+            pid: None,
+        };
+        assert!(!report.installed);
+        assert_eq!(report.state.as_str(), "not-installed");
+        assert!(!report.state.is_installed());
+        assert!(report.start_type.is_none());
+        assert!(report.pid.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn status_report_returns_unsupported_on_non_windows() {
+        let error = status_report().expect_err("非 Windows 上不该伪造服务状态");
+        assert_eq!(error.code, ErrorCode::ServiceUnavailable);
+        assert_eq!(error.code.code(), "AH-E5001");
+        assert!(error.detail.contains("SCM"));
     }
 
     #[cfg(windows)]

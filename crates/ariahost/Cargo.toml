@@ -23,3 +23,12 @@ ariahost-svc = { path = "../ariahost-svc" }
 ariahost-web = { path = "../ariahost-web" }
 # 面板入口：M2 起「无参数启动」真的开窗（含 --panel-selftest 隐藏自测入口）。
 ariahost-ui = { path = "../ariahost-ui" }
+
+# `--write-aumid` 的 COM 调用（`SHGetPropertyStoreFromParsingName` + 手写 IPropertyStore
+# vtable）：只有 Windows 目标需要。特性按需单独开，不摊到其它 crate 上。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
