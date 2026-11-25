@@ -433,8 +433,38 @@ UninstallIcon "${SRCDIR}\ariahost.ico"
     ${If} $R7 == "1"
       !insertmacro TraceWrite "[${MODE}] 等待结束：仍在运行（轮次=$R9，实测=$R1 ms）"
       !if "${MODE}" == "install"
-        MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 20 秒），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从托盘菜单「退出」${APP_NAME}，或在任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
-        Abort
+        ; 守卫（task-64）：`--quit` 的最坏路径是「客户端自等 10s + ctl 兜底 2s + 保存会话/停 aria2c」，
+        ; 真机 20 连跑里仍偶发超过 20s 墙钟；此时安装器原本直接 Abort，用户看到的是
+        ; 「面板已经退了、安装器却报仍在运行」——差一两秒的假失败。
+        ; 所以最后一道不是继续等，而是**强制收掉本安装目录的实例**（它的退出流程已经没响应了，
+        ; 再等只会把差异放大）。只在 $INSTDIR\ariahost.exe 存在时才 kill：上方已把
+        ; 「同名进程但不装在本目录」分流成提示 + Abort，所以这里不会误杀别人的同名程序。
+        ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
+          !insertmacro TraceWrite "[guard] 20s 内未退出 → taskkill /F /IM ${APP_EXE}"
+          nsExec::ExecToStack 'taskkill /F /IM ${APP_EXE}'
+          Pop $R6
+          Pop $R5
+          !insertmacro TraceWrite "[guard] taskkill 返回码=$R6"
+          StrCpy $R9 0
+          ${Do}
+            !insertmacro ProcessIsRunning ${APP_EXE} 12
+            ${If} $R7 == "0"
+              !insertmacro TraceWrite "[guard] 复查第 $R9 轮：已退出"
+              ${ExitDo}
+            ${EndIf}
+            Sleep 250
+            IntOp $R9 $R9 + 1
+            ${If} $R9 >= 20
+              ${ExitDo}
+            ${EndIf}
+          ${Loop}
+          !insertmacro TraceWrite "[guard] 复查结束：$R7（轮次=$R9）"
+        ${EndIf}
+        ${If} $R7 == "1"
+          MessageBox MB_OK|MB_ICONSTOP "${APP_NAME} 仍在运行（已等待约 20 秒并尝试强制结束仍未成功），安装无法覆盖被占用的文件，已中止。$\r$\n$\r$\n请从任务管理器结束 ${APP_EXE} 后重新运行安装程序。$\r$\n（--quit 返回：$R8）" /SD IDOK
+          Abort
+        ${EndIf}
+        DetailPrint "${APP_NAME} 未在预算内自行退出，已强制结束（守卫），继续安装。"
       !else
         DetailPrint "警告：${APP_NAME} 仍在运行，后续删除可能因文件占用失败；请退出后手工删除残留目录。"
       !endif

@@ -49,3 +49,7 @@ node_modules/
 # TRACE 的规矩是「编译期开关 + 仓库外的绝对路径」（见 docs/dev/release.md），
 # 这条只是最后一道兜底：真出错时不要让脏文件进提交。
 /git_project*
+
+# 编译期 /DTRACE 传成 POSIX 形态时 makensis 会把反斜杠吃掉，落点变成仓库根下的
+# mntfgit_projectwasm... 这类错位文件（task-54/64 实测）。兜底忽略，别让垃圾进提交。
+/mntfgit_project*
