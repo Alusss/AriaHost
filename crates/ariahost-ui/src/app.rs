@@ -26,6 +26,7 @@ use crate::core_setup::{CoreGuide, GuideNotice};
 use crate::instance::InstanceLock;
 use crate::logbuf::LogBuffer;
 use crate::metrics;
+use crate::service::{self, ServiceCard};
 use crate::tasks::{self, TaskAction, TaskRow, TaskStatus};
 use crate::view::{tone_color, StatusView, Tone};
 use crate::window::{self, Geometry};
@@ -298,6 +299,14 @@ pub struct PanelApp {
     pub(crate) drive_targets: crate::drive::Targets,
     /// 设置页里「打开配置文件所在目录」等动作的提示（复用 notice 会串味，单独一条）。
     settings_flash: Option<(String, Instant)>,
+    /// 服务管理页是否打开（M3-b：与设置页互斥，同时只画一页）。
+    service_open: bool,
+    /// 服务页状态机：等待态、结果提示、何时算完成（纯逻辑，见 crate::service）。
+    service_card: ServiceCard,
+    /// 正在飞的提权调用（后台线程 → mpsc）。Some = 有一条授权流程没结束。
+    svc_rx: Option<std::sync::mpsc::Receiver<crate::elevate::ElevateOutcome>>,
+    /// 本进程是否已是管理员（启动时算一次；只用于文案，不改变「统一走提权」的策略）。
+    elevated: bool,
 }
 
 impl PanelApp {
@@ -483,6 +492,10 @@ impl PanelApp {
             settings_open: false,
             settings: crate::settings::Settings::new(),
             settings_flash: None,
+            service_open: false,
+            service_card: ServiceCard::new(),
+            svc_rx: None,
+            elevated: crate::elevate::is_elevated(),
             drive_targets: crate::drive::Targets::default(),
         }
     }
@@ -785,6 +798,399 @@ impl PanelApp {
             Tone::Good,
             "设置已保存到 config.toml（原子写）；重启后生效的项见列表标注",
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // M3-b 服务管理页
+    // -------------------------------------------------------------------
+
+    /// 打开/关闭服务管理页。与设置页互斥：同时只画一页。
+    fn toggle_service(&mut self) {
+        if self.service_open {
+            self.service_open = false;
+            if let Some(worker) = &self.worker {
+                worker.set_service_page(false);
+            }
+            return;
+        }
+        // 进服务页 = 离开设置页（不静默丢掉草稿：设施页只是暂时不画，改动仍在内存里）。
+        self.settings_open = false;
+        self.settings.leaving = false;
+        self.service_open = true;
+        if let Some(worker) = &self.worker {
+            // 切页时把服务轮询调到 2s，并立刻拉一次；**不是每帧**。
+            worker.set_service_page(true);
+        }
+        self.log
+            .push("打开服务管理页：六态卡片 + 装/卸/启停（都要一次 Windows 授权）".to_owned());
+    }
+
+    /// 点一个服务操作：统一走「提权助手」，一条路径一种文案。
+    ///
+    /// 四个动作都改 SCM，非管理员必然 `AH-E5002`（实测），所以**不做「先试库调用再提权」**：
+    /// 那样会出现「有时弹框有时不弹」的两套体验。提权一律在后台线程里发，
+    /// 因为 `ShellExecuteExW(runas)` 在本会话实测会阻塞约 122 秒才返回取消。
+    fn start_service_op(&mut self, op: service::Op, ctx: &egui::Context) {
+        if self.svc_rx.is_some() {
+            self.log
+                .push("上一条授权流程还没结束：先等它返回（重复点不会加速）".to_owned());
+            return;
+        }
+        let Some(target) = elevate_target(op) else {
+            self.service_card.settle(
+                service::NoticeTone::Bad,
+                "找不到可执行文件路径（current_exe / SystemRoot 不可用），无法发起授权。",
+            );
+            return;
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let timeout = op.budget();
+        let spawned = std::thread::Builder::new()
+            .name("ariahost-svc-elevate".to_owned())
+            .spawn(move || {
+                let outcome = crate::elevate::run_elevated(&target.file, &target.args, timeout);
+                let _ = tx.send(outcome);
+            });
+        if let Err(error) = spawned {
+            self.service_card.settle(
+                service::NoticeTone::Bad,
+                format!("提权线程起不来：{error}（服务未变更）"),
+            );
+            return;
+        }
+
+        self.svc_rx = Some(rx);
+        self.service_card.begin(op);
+        self.log.push(format!(
+            "{}：请求 Windows 授权（会弹一次 UAC；点取消不会改动任何东西）",
+            op.button()
+        ));
+        ctx.request_repaint();
+    }
+
+    /// 提权子进程给出结论后的处理（取消 / 失败 / 成功提交）。
+    fn on_elevate_outcome(&mut self, outcome: crate::elevate::ElevateOutcome, ctx: &egui::Context) {
+        use crate::elevate::ElevateOutcome as E;
+        let Some(op) = self.service_card.pending() else {
+            self.log
+                .push(format!("提权流程返回，但界面已无等待中的操作：{outcome:?}"));
+            return;
+        };
+        match outcome {
+            E::Completed {
+                exit_code: 0,
+                waited,
+            } => {
+                self.log.push(format!(
+                    "{}：授权通过，助手进程成功返回（{:.1}s）；等 SCM 反映状态",
+                    op.button(),
+                    waited.as_secs_f32()
+                ));
+                // 立刻连拉三次（1s 一次），让等待态几秒内看到真实跳变。
+                if let Some(worker) = &self.worker {
+                    worker.burst_service();
+                }
+            }
+            E::Completed { exit_code, waited } => {
+                let (headline, next) = service::hint_for(ErrorCode::ServiceUnavailable);
+                self.log.push(format!(
+                    "{}：助手进程退出码 {exit_code}（{:.1}s）——{headline}",
+                    op.button(),
+                    waited.as_secs_f32()
+                ));
+                self.service_card.settle(
+                    service::NoticeTone::Bad,
+                    format!("{headline}（退出码 {exit_code}）"),
+                );
+                self.set_banner(
+                    Banner::new(Tone::Bad, format!("{headline}（退出码 {exit_code}）"))
+                        .and_next(next),
+                );
+            }
+            E::Cancelled { waited } => {
+                // 取消不是错误：只写信息条，**不弹红条**（task-46 硬要求）。
+                self.log.push(format!(
+                    "{}：授权被取消/未确认（{:.1}s），服务未变更",
+                    op.button(),
+                    waited.as_secs_f32()
+                ));
+                self.service_card.settle(
+                    service::NoticeTone::Info,
+                    service::elevation_cancelled_message(waited),
+                );
+            }
+            E::LaunchFailed { error, detail } => {
+                self.log
+                    .push(format!("{}：授权框发不出来：{detail}", op.button()));
+                let headline = "无法弹出 Windows 授权框：服务未变更";
+                self.service_card.settle(service::NoticeTone::Bad, headline);
+                self.set_banner(
+                    Banner::new(Tone::Bad, format!("{headline}（Win32={error}）"))
+                        .and_next("右键面板 →「以管理员身份运行」，再从服务页点一次"),
+                );
+            }
+            E::WaitTimedOut { waited } => {
+                self.log.push(format!(
+                    "{}：助手进程未在预算内结束（{:.1}s）",
+                    op.button(),
+                    waited.as_secs_f32()
+                ));
+                self.service_card
+                    .finish(op, service::NoticeOutcome::TimedOut);
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// 每帧一次的非阻塞收尾：提权结果 + SCM 快照 + 等待预算。
+    fn pump_service(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.svc_rx {
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    self.svc_rx = None;
+                    self.on_elevate_outcome(outcome, ctx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // 授权框开着的时候也要出帧：等待态里的「已等 X 秒」得走字。
+                    ctx.request_repaint_after(Duration::from_millis(120));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.svc_rx = None;
+                    self.service_card.settle(
+                        service::NoticeTone::Bad,
+                        "授权流程意外中断（后台线程没了），服务未变更。",
+                    );
+                }
+            }
+        }
+
+        // SCM 是唯一事实来源：达到目标状态就收尾（用户也可能在别处点了启动）。
+        let state = self.service.and_then(|snapshot| snapshot.state());
+        if let Some((op, _outcome)) = self.service_card.observe(state) {
+            self.log
+                .push(format!("{}：SCM 已到达目标状态", op.button()));
+            if let Some(worker) = &self.worker {
+                worker.burst_service();
+            }
+        }
+        if let Some((op, _outcome)) = self.service_card.timeout_if_due(Instant::now()) {
+            self.log.push(format!(
+                "{}：超出等待预算，界面不再等（SCM 可能稍后完成，可点「刷新状态」）",
+                op.button()
+            ));
+        }
+    }
+
+    /// 服务页：顶部说明 + 中间状态卡片 + 底部操作条。
+    fn show_service_page(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("ariahost_service_head")
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Windows 服务");
+                    ui.label(
+                        RichText::new("把 aria2 装成系统服务：开机自启，面板关掉也能继续下载")
+                            .weak(),
+                    );
+                });
+                ui.add_space(2.0);
+            });
+
+        egui::Panel::bottom("ariahost_service_actions")
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                self.show_service_buttons(ui);
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.show_service_card(ui);
+            });
+        });
+    }
+
+    /// 六态状态卡片：状态 / 启动方式 / PID / 等待态 / 结果提示。
+    fn show_service_card(&mut self, ui: &mut egui::Ui) {
+        let snapshot = self.service;
+        let state = snapshot.and_then(|snapshot| snapshot.state());
+
+        let (label, color) = match (state, snapshot) {
+            (Some(state), _) => (service::state_label(state), service_state_color(state)),
+            (None, Some(ServiceSnapshot::Failed { .. })) => {
+                ("查询失败", Color32::from_rgb(230, 140, 140))
+            }
+            (None, _) => ("读取中…", Color32::GRAY),
+        };
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("状态").weak());
+            let badge = ui.label(RichText::new(label).strong().size(20.0).color(color));
+            self.drive_targets.note("服务状态", badge.rect);
+            ui.label(
+                RichText::new(format!("服务名 {}", ariahost_svc::SERVICE_NAME))
+                    .weak()
+                    .small(),
+            );
+        });
+
+        if let Some(state) = state {
+            ui.label(RichText::new(service::state_hint(state)).weak());
+        }
+
+        ui.add_space(6.0);
+        egui::Grid::new("ariahost_service_facts")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("启动方式").weak());
+                let start_mode = match snapshot {
+                    Some(ServiceSnapshot::State(report)) => report.start_type,
+                    _ => None,
+                };
+                ui.label(service::start_mode_label(start_mode));
+                ui.end_row();
+
+                ui.label(RichText::new("PID").weak());
+                let pid = match snapshot {
+                    Some(ServiceSnapshot::State(report)) => report.pid,
+                    _ => None,
+                };
+                ui.label(pid.map_or_else(
+                    || "—（未运行或 SCM 未给）".to_owned(),
+                    |pid| pid.to_string(),
+                ));
+                ui.end_row();
+
+                ui.label(RichText::new("查询失败原因").weak());
+                match snapshot {
+                    Some(ServiceSnapshot::Failed { code, .. }) => {
+                        ui.label(
+                            RichText::new(format!("{}（详见日志）", code.code()))
+                                .color(Color32::from_rgb(230, 160, 140)),
+                        );
+                    }
+                    _ => {
+                        ui.label(RichText::new("—").weak());
+                    }
+                }
+                ui.end_row();
+            });
+
+        // 等待态：进度 + 说明 + 计时（停止是两段式，见 `service::waiting_text`）。
+        if let Some((progress, hint, counter)) =
+            service::waiting_text(self.service_card.stage(), Instant::now())
+        {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                let line = ui.label(RichText::new(progress).strong());
+                self.drive_targets.note("服务等待态", line.rect);
+            });
+            ui.label(RichText::new(hint).weak());
+            if let Some(counter) = counter {
+                ui.label(RichText::new(counter).weak().small());
+            }
+        }
+
+        // 结果提示：成功绿 / 信息灰（取消授权走这里，**不是红条**）/ 失败红。
+        if let Some((tone, message)) = self.service_card.notice().cloned() {
+            ui.add_space(8.0);
+            let color = match tone {
+                service::NoticeTone::Ok => Color32::from_rgb(140, 200, 160),
+                service::NoticeTone::Info => Color32::from_rgb(150, 190, 240),
+                service::NoticeTone::Bad => Color32::from_rgb(230, 140, 140),
+            };
+            let response = ui.label(RichText::new(message).color(color));
+            self.drive_targets.note("服务结果提示", response.rect);
+        }
+
+        if !self.elevated {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "当前以普通权限运行：每次装/卸/启停都会弹一次 Windows 授权框。\
+                     想免掉它，可右键面板 →「以管理员身份运行」。",
+                )
+                .weak()
+                .small(),
+            );
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("查看服务日志").clicked() {
+                self.open_service_log();
+            }
+            if ui.button("刷新状态").clicked() {
+                if let Some(worker) = &self.worker {
+                    worker.burst_service();
+                }
+                self.log.push("手动刷新服务状态".to_owned());
+            }
+            ui.label(
+                RichText::new("服务日志在 %ProgramData%\\AriaHost\\logs，需管理员权限才写得进去")
+                    .weak()
+                    .small(),
+            );
+        });
+    }
+
+    /// 底部四个按钮：可用性完全由六态决定（`service::buttons`），等待中一律禁用。
+    fn show_service_buttons(&mut self, ui: &mut egui::Ui) {
+        let state = self.service.and_then(|snapshot| snapshot.state());
+        let allowed = state.map_or(service::Buttons::NONE, service::buttons);
+        let busy = self.svc_rx.is_some() || self.service_card.pending().is_some();
+
+        let mut clicked = None;
+        ui.horizontal(|ui| {
+            for (op, enabled) in [
+                (service::Op::Install, allowed.install),
+                (service::Op::Start, allowed.start),
+                (service::Op::Stop, allowed.stop),
+                (service::Op::Uninstall, allowed.uninstall),
+            ] {
+                let response = ui.add_enabled(enabled && !busy, egui::Button::new(op.button()));
+                self.drive_targets.note(op.button(), response.rect);
+                if response.clicked() {
+                    clicked = Some(op);
+                }
+            }
+            if busy {
+                ui.label(RichText::new("有一条授权流程在进行…").weak());
+            }
+        });
+        if let Some(op) = clicked {
+            let ctx = ui.ctx().clone();
+            self.start_service_op(op, &ctx);
+        }
+    }
+
+    /// 打开服务日志目录（日志文件本身要管理员才读写，先开目录比开文件稳）。
+    fn open_service_log(&mut self) {
+        let dir = ariahost_common::paths::logs_dir(ariahost_common::paths::Plane::Service);
+        match dir {
+            Some(dir) => match open_in_file_manager(&dir) {
+                Ok(()) => self
+                    .log
+                    .push(format!("已打开服务日志目录：{}", dir.display())),
+                Err(error) => {
+                    self.set_banner(
+                        Banner::new(Tone::Bad, format!("打开服务日志目录失败：{error}"))
+                            .and_next("手动打开 %ProgramData%\\AriaHost\\logs"),
+                    );
+                }
+            },
+            None => {
+                self.set_banner(
+                    Banner::new(Tone::Bad, "拿不到服务日志目录（%ProgramData% 不可用）")
+                        .and_next("手动打开 %ProgramData%\\AriaHost\\logs"),
+                );
+            }
+        }
     }
 
     /// 设置页：顶栏（配置文件路径）+ 未保存提示 + 左导航 + 右内容 + 底部操作条。
@@ -2855,6 +3261,8 @@ impl PanelApp {
         self.drain_core();
         // M3-h：核心安装事件的消费 + 看门狗（线程侧不碰 UI，这里只 try_recv 与内存判断）。
         self.pump_core_guide(ui.ctx());
+        // M3-b：提权结果 + SCM 快照 + 等待预算，全部非阻塞。
+        self.pump_service(ui.ctx());
         self.expire_optimistic();
         // M2-3：托盘 / 关闭三档 / 退出流程 / 启动检测（全部非阻塞）。
         self.pump_tray(ui.ctx());
@@ -2900,9 +3308,27 @@ impl PanelApp {
                 if entry.clicked() {
                     self.toggle_settings();
                 }
+                let service_label = if self.service_open {
+                    "返回主界面"
+                } else {
+                    "服务"
+                };
+                let service_entry = ui.button(service_label);
+                self.drive_targets.note("服务入口", service_entry.rect);
+                if service_entry.clicked() {
+                    self.toggle_service();
+                }
             });
         });
         ui.add_space(2.0);
+
+        // 服务页打开时同样替掉主体区（M3-b）。
+        if self.service_open {
+            self.show_service_page(ui);
+            self.show_close_prompt(ui.ctx());
+            self.maybe_finish_selftest(ui);
+            return;
+        }
 
         // 设置页打开时替掉主体区（顶部状态栏、任务表都不画）：既省内存，也不重排主界面。
         if self.settings_open {
@@ -3105,6 +3531,51 @@ fn facts_guard(facts: &Mutex<RuntimeFacts>) -> MutexGuard<'_, RuntimeFacts> {
 /// 面板标题里用的完整版本字符串（`AriaHost 0.1.1`），供测试与日志复用。
 pub fn title_text() -> String {
     format!("{PRODUCT_NAME} {VERSION}")
+}
+
+/// 一次提权调用的目标（可执行文件 + 参数）。
+struct ElevateTarget {
+    file: std::path::PathBuf,
+    args: Vec<String>,
+}
+
+/// 四个动作各自该拉谁：
+/// - 装/卸：面板自己的 CLI 子命令（`--install-service` / `--uninstall-service`，契约已定版）；
+/// - 启/停：**没有**对应的 CLI 子命令（cli.rs 不在本批写作用域），用系统自带的 `sc.exe`。
+///
+/// `sc start/stop` 只是「把请求交给 SCM」，真正的状态变化靠 SCM 轮询观察——
+/// 这也正好让「启动中…/停止中…」反映真实状态，而不是我们自己编的进度条。
+fn elevate_target(op: service::Op) -> Option<ElevateTarget> {
+    match op {
+        service::Op::Install => Some(ElevateTarget {
+            file: crate::elevate::helper_exe()?,
+            args: vec!["--install-service".to_owned()],
+        }),
+        service::Op::Uninstall => Some(ElevateTarget {
+            file: crate::elevate::helper_exe()?,
+            args: vec!["--uninstall-service".to_owned()],
+        }),
+        service::Op::Start => Some(ElevateTarget {
+            file: crate::elevate::sc_exe()?,
+            args: vec!["start".to_owned(), ariahost_svc::SERVICE_NAME.to_owned()],
+        }),
+        service::Op::Stop => Some(ElevateTarget {
+            file: crate::elevate::sc_exe()?,
+            args: vec!["stop".to_owned(), ariahost_svc::SERVICE_NAME.to_owned()],
+        }),
+    }
+}
+
+/// 六态 → 颜色（与状态徽章同一套语气：绿=好、黄=可操作、灰=没有、红=异常）。
+fn service_state_color(state: ariahost_svc::ServiceState) -> Color32 {
+    use ariahost_svc::ServiceState as S;
+    match state {
+        S::Running => Color32::from_rgb(140, 200, 160),
+        S::Stopped => Color32::from_rgb(230, 200, 130),
+        S::NotInstalled => Color32::from_rgb(170, 170, 170),
+        S::StartPending | S::StopPending => Color32::from_rgb(150, 190, 240),
+        S::Unknown => Color32::from_rgb(230, 160, 120),
+    }
 }
 
 #[cfg(test)]

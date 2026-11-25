@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use ariahost_aria2::{GlobalStat, RpcCallError, RpcClient, VersionInfo, DEFAULT_PORT, RPC_PATH};
 use ariahost_common::ErrorCode;
-use ariahost_svc::{query_state, ServiceQueryError, ServiceState};
+use ariahost_svc::{status_report, ServiceQueryError, ServiceState, ServiceStatusReport};
 use serde_json::Value;
 
 use crate::logbuf::LogBuffer;
@@ -54,7 +54,18 @@ pub const REFRESH_INTERVAL_MAX: Duration = Duration::from_secs(60);
 pub const BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// 服务状态刷新间隔（一次 `QueryServiceStatusEx`，轻量，不必跟着 aria2 的 2s）。
+/// 服务状态的常规刷新间隔：SCM 查询要开服务管理器，5s 一次足够跟手又不烧 CPU（M2-1 起的值）。
 pub const SERVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 服务页打开时的刷新间隔（M3-b）：面板正盯着看，2s 能接受。
+pub const SERVICE_PAGE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 服务操作后的连拉间隔：1s 一次、连拉 [`SERVICE_BURST_TIMES`] 次，
+/// 让「注册中…/启动中…/停止中…」几秒内就能看到真实状态跳变。
+pub const SERVICE_BURST_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 服务操作后连拉几次。
+pub const SERVICE_BURST_TIMES: u8 = 3;
 
 /// 连续失败几次后，把 `AH-E2005`（重连失败）一并提示出来。
 pub const RECONNECT_FAILURES: u32 = 5;
@@ -193,7 +204,9 @@ impl Aria2Failure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceSnapshot {
     /// 查询成功（含 `NotInstalled`，它**不是**错误）。
-    State(ServiceState),
+    ///
+    /// M3-b 起带上完整报告：服务页要显示启动方式与 PID，光有六态不够。
+    State(ServiceStatusReport),
     /// 查询失败。
     Failed {
         /// 既有错误码（`AH-E5001` / `AH-E5002`）。
@@ -201,6 +214,16 @@ pub enum ServiceSnapshot {
         /// 归类，决定中文文案。
         kind: ServiceFailure,
     },
+}
+
+impl ServiceSnapshot {
+    /// 六态（查询失败或还没刷新过时为 `None`）。
+    pub fn state(&self) -> Option<ServiceState> {
+        match self {
+            Self::State(report) => Some(report.state),
+            Self::Failed { .. } => None,
+        }
+    }
 }
 
 /// 服务查询失败的归类。
@@ -215,10 +238,10 @@ pub enum ServiceFailure {
 }
 
 impl ServiceSnapshot {
-    /// 由 `query_state()` 的结果构造。
-    pub fn from_result(result: Result<ServiceState, ServiceQueryError>) -> Self {
+    /// 由 `status_report()` 的结果构造。
+    pub fn from_result(result: Result<ServiceStatusReport, ServiceQueryError>) -> Self {
         match result {
-            Ok(state) => Self::State(state),
+            Ok(report) => Self::State(report),
             Err(error) => Self::Failed {
                 code: error.code,
                 kind: classify_service_failure(error.code),
@@ -317,6 +340,10 @@ impl TaskRequest {
 enum Command {
     /// 立即刷新（「立即刷新」按钮、行操作后、核心就绪后）。
     RefreshNow,
+    /// 调整服务轮询间隔（服务页开关时调用；`None` = 回到常规 5s）。
+    ServiceInterval(Option<Duration>),
+    /// 操作后连拉几次服务状态（每次 1s）。
+    ServiceBurst,
     /// 一行操作。
     Task(TaskRequest),
     /// 新建下载。
@@ -475,6 +502,22 @@ impl Worker {
         self.send(Command::RefreshNow);
     }
 
+    /// 服务页开/关时调整服务轮询间隔（M3-b；非阻塞）。
+    ///
+    /// **不每帧调用**：只在页面切换那一刻调一次——硬约束是「不得每帧开 SCM」。
+    pub fn set_service_page(&self, on_page: bool) {
+        self.send(Command::ServiceInterval(if on_page {
+            Some(SERVICE_PAGE_INTERVAL)
+        } else {
+            None
+        }));
+    }
+
+    /// 服务操作后请求连拉（非阻塞）。
+    pub fn burst_service(&self) {
+        self.send(Command::ServiceBurst);
+    }
+
     /// 请求一行操作（非阻塞；结果走 [`Update::Action`]）。
     pub fn request_task(&self, request: TaskRequest) {
         self.send(Command::Task(request));
@@ -520,6 +563,11 @@ fn run(
     let mut backoff = Backoff::new(interval);
     let mut next_aria2 = Instant::now();
     let mut next_service = Instant::now();
+    // 服务轮询的间隔**可变**（M3-b）：服务页打开时调短，操作后连拉几次，
+    // 其余时候保持 5s——硬要求是「不得每帧开 SCM」。
+    let mut service_interval = SERVICE_REFRESH_INTERVAL;
+    // 操作后立刻连拉几次（1s 一次），让等待态几秒内就能看到真实状态跳变。
+    let mut service_burst: u8 = 0;
     // 只在「文案变了」时写日志：aria2 没启动是常态，2s 一条会把 500 行缓冲刷满。
     let mut last_aria2_line: Option<String> = None;
     let mut last_service_line: Option<String> = None;
@@ -587,15 +635,19 @@ fn run(
         }
 
         if Instant::now() >= next_service {
-            let snapshot = ServiceSnapshot::from_result(query_state());
+            let snapshot = ServiceSnapshot::from_result(status_report());
             let line = match snapshot {
-                ServiceSnapshot::State(state) => {
-                    format!(
-                        "服务状态：{}（{}）",
-                        state.as_str(),
-                        ariahost_svc::SERVICE_NAME
-                    )
-                }
+                ServiceSnapshot::State(report) => format!(
+                    "服务状态：{}（{}，启动方式 {}，pid {}）",
+                    report.state.as_str(),
+                    ariahost_svc::SERVICE_NAME,
+                    report
+                        .start_type
+                        .map_or("n/a", ariahost_svc::ServiceStartMode::as_str),
+                    report
+                        .pid
+                        .map_or_else(|| "n/a".to_owned(), |pid| pid.to_string())
+                ),
                 ServiceSnapshot::Failed { code, kind } => {
                     format!("服务状态查询失败：{}（{:?}）", code.code(), kind)
                 }
@@ -607,7 +659,13 @@ fn run(
             if updates.send(Update::Service(snapshot)).is_err() {
                 return;
             }
-            next_service = Instant::now() + SERVICE_REFRESH_INTERVAL;
+            // 操作后的连拉：每次拉完递减，间隔 1s；拉完后回到常规间隔。
+            if service_burst > 0 {
+                service_burst -= 1;
+                next_service = Instant::now() + SERVICE_BURST_INTERVAL;
+            } else {
+                next_service = Instant::now() + service_interval;
+            }
         }
 
         let wait = next_aria2
@@ -617,6 +675,15 @@ fn run(
         match commands.recv_timeout(wait) {
             Ok(Command::RefreshNow) => {
                 next_aria2 = Instant::now();
+                next_service = Instant::now();
+            }
+            Ok(Command::ServiceInterval(interval)) => {
+                service_interval = interval.unwrap_or(SERVICE_REFRESH_INTERVAL);
+                // 切页时立刻拉一次：别让用户盯着一屏 5 秒前的旧状态。
+                next_service = Instant::now();
+            }
+            Ok(Command::ServiceBurst) => {
+                service_burst = SERVICE_BURST_TIMES;
                 next_service = Instant::now();
             }
             Ok(Command::Task(request)) => {
@@ -789,62 +856,83 @@ pub fn aria2_view(update: Option<&Aria2Update>) -> StatusView {
 }
 
 /// 服务状态区文案（纯函数）。
+///
+/// 这是**状态区那一行**（概览句 + 下一步）；服务管理页的六态卡片在 `crate::service`。
+/// 两处的短标签刻意共用一份（`service::state_label`），避免「概览说运行中、卡片说未知」。
 pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
     let Some(snapshot) = snapshot else {
         return StatusView::idle("等待首次刷新", "正在读取 Windows 服务状态…".to_owned());
     };
     let name = ariahost_svc::SERVICE_NAME;
     match snapshot {
-        ServiceSnapshot::State(ServiceState::Running) => StatusView {
-            badge: "运行中".to_owned(),
-            tone: Tone::Good,
-            code: None,
-            headline: format!("服务 {name} 正在运行"),
-            details: vec!["SCM 报告 SERVICE_RUNNING".to_owned()],
-            next_step: None,
-        },
-        ServiceSnapshot::State(ServiceState::Stopped) => StatusView {
-            badge: "已停止".to_owned(),
-            tone: Tone::Warn,
-            code: None,
-            headline: format!("服务 {name} 已安装，当前已停止"),
-            details: vec!["本批次不提供服务的启动/停止按钮（M2-2 面板直接托管 aria2c）".to_owned()],
-            next_step: None,
-        },
-        ServiceSnapshot::State(ServiceState::StartPending) => StatusView {
-            badge: "启动中".to_owned(),
-            tone: Tone::Warn,
-            code: None,
-            headline: format!("服务 {name} 正在启动"),
-            details: vec!["SCM 状态：SERVICE_START_PENDING".to_owned()],
-            next_step: None,
-        },
-        ServiceSnapshot::State(ServiceState::StopPending) => StatusView {
-            badge: "停止中".to_owned(),
-            tone: Tone::Warn,
-            code: None,
-            headline: format!("服务 {name} 正在停止"),
-            details: vec!["SCM 状态：SERVICE_STOP_PENDING".to_owned()],
-            next_step: None,
-        },
-        ServiceSnapshot::State(ServiceState::NotInstalled) => StatusView {
-            badge: "未安装".to_owned(),
-            tone: Tone::Warn,
-            code: None,
-            headline: format!("尚未注册 Windows 服务 {name}"),
-            details: vec![
-                "面板以普通权限运行；本批次由面板自己托管 aria2c，不依赖该服务".to_owned(),
-            ],
-            next_step: Some("一键注册服务在 M1-2B（本批次不提供安装/卸载）".to_owned()),
-        },
-        ServiceSnapshot::State(ServiceState::Unknown) => StatusView {
-            badge: "状态未知".to_owned(),
-            tone: Tone::Warn,
-            code: None,
-            headline: format!("服务 {name} 处于无法识别的状态"),
-            details: vec!["SCM 返回了暂停系列或未知状态码，面板不猜测其含义".to_owned()],
-            next_step: Some("用 `sc query AriaHost` 核对（M2-2 会接状态机）".to_owned()),
-        },
+        ServiceSnapshot::State(report) => {
+            let detail = format!(
+                "启动方式：{}；PID：{}",
+                crate::service::start_mode_label(report.start_type),
+                report
+                    .pid
+                    .map_or_else(|| "—".to_owned(), |pid| pid.to_string())
+            );
+            match report.state {
+                ServiceState::Running => StatusView {
+                    badge: crate::service::state_label(report.state).to_owned(),
+                    tone: Tone::Good,
+                    code: None,
+                    headline: format!("服务 {name} 正在运行"),
+                    details: vec![detail],
+                    next_step: None,
+                },
+                ServiceState::Stopped => StatusView {
+                    badge: crate::service::state_label(report.state).to_owned(),
+                    tone: Tone::Warn,
+                    code: None,
+                    headline: format!("服务 {name} 已安装，当前已停止"),
+                    details: vec![detail],
+                    next_step: Some(
+                        "点底部「服务」→「启动服务」，由 SCM 拉起它（面板可关）".to_owned(),
+                    ),
+                },
+                ServiceState::StartPending => StatusView {
+                    badge: crate::service::state_label(report.state).to_owned(),
+                    tone: Tone::Warn,
+                    code: None,
+                    headline: format!("服务 {name} 正在启动"),
+                    details: vec![detail],
+                    next_step: None,
+                },
+                ServiceState::StopPending => StatusView {
+                    badge: crate::service::state_label(report.state).to_owned(),
+                    tone: Tone::Warn,
+                    code: None,
+                    headline: format!("服务 {name} 正在停止"),
+                    details: vec![detail],
+                    next_step: Some("aria2 会先把会话与队列落盘再退出，请等它停稳".to_owned()),
+                },
+                ServiceState::NotInstalled => StatusView {
+                    badge: crate::service::state_label(report.state).to_owned(),
+                    tone: Tone::Warn,
+                    code: None,
+                    headline: format!("尚未注册 Windows 服务 {name}"),
+                    details: vec![
+                        "当前由面板自己托管 aria2c；装成服务后可以开机自启、面板关掉也继续下载"
+                            .to_owned(),
+                    ],
+                    next_step: Some(
+                        "点底部「服务」→「安装为服务」（会弹一次 Windows 授权框）".to_owned(),
+                    ),
+                },
+                ServiceState::Unknown => StatusView {
+                    badge: crate::service::state_label(report.state).to_owned(),
+                    tone: Tone::Warn,
+                    code: None,
+                    headline: format!("服务 {name} 处于无法识别的状态"),
+                    details: vec![detail],
+                    next_step: Some(
+                        "用 `sc query AriaHost` 核对；面板不猜这种状态该怎么办".to_owned(),
+                    ),
+                },
+            }
+        }
         ServiceSnapshot::Failed { code, kind } => {
             let (headline, next_step) = match kind {
                 ServiceFailure::UnsupportedPlatform => (
@@ -857,7 +945,8 @@ pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
                 ),
                 ServiceFailure::Other => (
                     "读取 SCM 服务状态失败".to_owned(),
-                    "本批次不自动修复；先确认 SCM 可访问（`sc query AriaHost`）".to_owned(),
+                    "先确认 SCM 可访问（`sc query AriaHost`）；服务页的「刷新状态」可重试"
+                        .to_owned(),
                 ),
             };
             StatusView {
@@ -871,7 +960,6 @@ pub fn service_view(snapshot: Option<&ServiceSnapshot>) -> StatusView {
         }
     }
 }
-
 /// 速率格式化（委托给任务列表的同一套量纲，避免两处小数位约定不一致）。
 pub fn format_speed(bytes_per_second: u64) -> String {
     tasks::format_rate(bytes_per_second)
@@ -1074,11 +1162,16 @@ mod tests {
             (ServiceState::Stopped, "已停止", Tone::Warn),
             (ServiceState::StartPending, "启动中", Tone::Warn),
             (ServiceState::StopPending, "停止中", Tone::Warn),
-            (ServiceState::Unknown, "状态未知", Tone::Warn),
+            (ServiceState::Unknown, "未知", Tone::Warn),
             (ServiceState::NotInstalled, "未安装", Tone::Warn),
         ];
         for (state, badge, tone) in cases {
-            let view = service_view(Some(&ServiceSnapshot::State(state)));
+            let view = service_view(Some(&ServiceSnapshot::State(ServiceStatusReport {
+                installed: state.is_installed(),
+                state,
+                start_type: None,
+                pid: None,
+            })));
             assert_eq!(view.badge, badge, "{state:?}");
             assert_eq!(view.tone, tone, "{state:?}");
             assert!(view.code.is_none(), "{state:?}");
@@ -1086,10 +1179,16 @@ mod tests {
     }
 
     #[test]
-    fn not_installed_points_at_m1_2b() {
-        let view = service_view(Some(&ServiceSnapshot::State(ServiceState::NotInstalled)));
+    fn not_installed_points_at_the_service_page() {
+        let view = service_view(Some(&ServiceSnapshot::State(ServiceStatusReport {
+            installed: false,
+            state: ServiceState::NotInstalled,
+            start_type: None,
+            pid: None,
+        })));
         let next = view.next_step.unwrap_or_default();
-        assert!(next.contains("M1-2B"), "{next}");
+        assert!(next.contains("服务"), "{next}");
+        assert!(next.contains("安装为服务"), "{next}");
     }
 
     #[test]

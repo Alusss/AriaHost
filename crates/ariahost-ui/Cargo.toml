@@ -49,4 +49,7 @@ windows-sys = { version = "0.59", features = [
     # 0.59 的 ReadFile/WriteFile/ConnectNamedPipe 签名里带 OVERLAPPED（Win32::System::IO），
     # 这些项按该 feature 门控：不开就「找不到符号」。
     "Win32_System_IO",
+    # M3-b 服务页提权：ShellExecuteExW + SHELLEXECUTEINFOW（该结构体的 hkeyClass 字段
+    # 被 Win32_System_Registry 门控，不开就「找不到类型」）。只加 feature，不新增 crate。
+    "Win32_System_Registry",
 ] }
