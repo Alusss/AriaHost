@@ -5,8 +5,15 @@
 //! 不在本模块（见 [`crate::runtime`] 的 `resolve_core`）。
 //!
 //! 顺序来自 `net.source_order`（见 [`lines_from`]）：用户机器默认 `cdn,github`——真实用户网络里
-//! GitHub 的 `release-assets.githubusercontent.com` 实测超时；CI 用 [`CI_SOURCE_ORDER`]，因为
-//! runner 在 GitHub 内网，2.4MB 是秒级，而 CDN 实测 ~19s。
+//! GitHub 的 `release-assets.githubusercontent.com` 实测超时（真机 v0.1.2 首次运行失败的直接原因）。
+//!
+//! [`CI_SOURCE_ORDER`]（`github,cdn`）**目前没有生产调用者**：`release.yml` 的「内置 aria2c 核心」
+//! 那一步是自带的 PowerShell 步骤，直接下载官方 zip 并对 zip 做 SHA-256 硬校验，不走本模块。
+//! 保留 `ci_lines()` 是为了 CI 侧将来跑「应用内下载」时按 `github → cdn` 排序（runner 在 GitHub
+//! 内网，直连最可信），**不要**在说明里写成「release.yml 已经在用」。
+//!
+//! 测速口径（2026-11-26，本机 rustls 直连实测，见 `.scratch/m4/`）：CDN 3266 ms / GitHub 直连
+//! 2431 ms——两者都能通，说明「GitHub 必超时」只成立于用户那侧网络，不能当普遍结论。
 //!
 //! 任何一条线路失败都必须留下痕迹：成功时进 [`DownloadOutcome::warnings`]（UI 可见信息条），
 //! 全部失败时进 [`CoreError::AllLinesFailed`]（`AH-E6007`）。

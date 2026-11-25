@@ -888,8 +888,9 @@ fn default_lines_cdn_first_then_direct() {
 
 #[test]
 fn ci_lines_keep_direct_first() {
-    // CI 的发布流程不走第三方 CDN：`release.yml` 里用 `ci_lines()`，
-    // 直连优先、CDN 兜底（runner 在 GitHub 网络内，直连更可信）。
+    // CI 侧（将来跑「应用内下载」时）的排序：直连优先、CDN 兜底（runner 在 GitHub 网络内）。
+    // 注意：`release.yml` 目前**不调用** `ci_lines()`——随包核心由自带 PowerShell 步骤直连下载
+    // 并对 zip 做 SHA-256 硬校验，本测试只钉住「排序契约」，不代表发布链路已接入。
     let lines = ci_lines();
     assert_eq!(lines[0].name, "直连 GitHub");
     assert_eq!(lines[1].name, "CDN ah.335772.xyz");
