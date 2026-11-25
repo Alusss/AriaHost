@@ -139,12 +139,10 @@ impl LineChoice {
         }
     }
 
-    /// 是否真有第二条线路可换（`app.rs` 可据此隐藏「换线路」按钮）。
+    /// 是否真有第二条线路可换（`app.rs` 据此隐藏「换线路」按钮）。
     ///
-    /// `allow(dead_code)` 的原因：目前只有单测在用它——产品侧接线（按钮显隐）要改
-    /// `app.rs`，而本批写作用域**不含** `app.rs`，已在交付报告里点出。接线落地后
-    /// 删掉这个标注（它是「待接线」的唯一痕迹，别让它悄悄变永久）。
-    #[allow(dead_code)]
+    /// 产品侧接线已在 `app.rs` 的「45 秒无进展」分支落地（`if self.guide.line.has_alternative()`
+    /// 才给按钮），所以这里**既不需要 `allow(dead_code)`，也不要再把它当「待接线」的痕迹**。
     pub const fn has_alternative(self) -> bool {
         self.fallback.is_some()
     }
