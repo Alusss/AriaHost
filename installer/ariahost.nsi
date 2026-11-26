@@ -619,7 +619,12 @@ Function RegisterServiceIfRequested
   ${If} $R1 == ""
     ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
   ${Else}
-    ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"set AH_CONFIG_PATH=$R1&& $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
+    ; `set "AH_CONFIG_PATH=..."`：**整条赋值必须包在引号里**（task-94）。不加引号时，
+  ; 安装用户的 profile 一旦含空格（`C:\Users\姓 名\AppData\...`），cmd 会把空格后的部分
+  ; 当成下一条命令，环境变量被截成 `C:\Users\姓` → 助手写进 ConfigPath 的是垃圾路径 →
+  ; 第 1 级报废 → 静默回落第 2/3 级（M5-f 那个 P0 在这些用户身上原样复现）。
+  ; `set "VAR=value"` 这种写法对含空格的路径是安全形态。
+  ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"set $\"AH_CONFIG_PATH=$R1$\"&& $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
   ${EndIf}
 
   StrCpy $R5 0     ; 轮次
@@ -912,7 +917,11 @@ Section /o "同时注册为 Windows 服务（Aria2 随系统服务运行）" SEC
   ${If} $R1 == ""
     nsExec::ExecToLog '"$INSTDIR\${APP_EXE}" --install-service'
   ${Else}
-    nsExec::ExecToLog '"$SYSDIR\cmd.exe" /v:on /S /c "set AH_CONFIG_PATH=$R1&& "$INSTDIR\${APP_EXE}" --install-service"'
+    ; 引号层级：最外层那一对是给 cmd `/c` 的，cmd 会剥掉首尾各一个引号；剥完剩下
+  ; `set "AH_CONFIG_PATH=..."&& "…\ariahost.exe" --install-service`，语义正确。
+  ; **未实测**（本轮不跑安装器；全机变体不是首发路径）：`$INSTDIR` 含空格时的实际
+  ; 命令行仍需真机取证一次（task-94 只保证能被 makensis 编译）。
+  nsExec::ExecToLog '"$SYSDIR\cmd.exe" /v:on /S /c "set "AH_CONFIG_PATH=$R1"&& "$INSTDIR\${APP_EXE}" --install-service"'
   ${EndIf}
   Pop $0
   ${If} $0 != 0

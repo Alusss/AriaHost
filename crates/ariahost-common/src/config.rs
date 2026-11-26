@@ -781,6 +781,20 @@ pub fn expand_user_path(raw: &str) -> PathBuf {
     }
 }
 
+/// 同 [`expand_user_path`]，但主目录由调用方给（单测注入「服务身份的主目录」）。
+pub fn expand_user_path_in(raw: &str, home: &Path) -> PathBuf {
+    let trimmed = raw.trim();
+    let rest = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+        .or_else(|| (trimmed == "~").then_some(""));
+    match rest {
+        Some("") => home.to_path_buf(),
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(trimmed),
+    }
+}
+
 /// 用户主目录（`USERPROFILE`，缺失时退 `HOME`）。
 pub fn user_home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
@@ -791,6 +805,19 @@ pub fn user_home() -> Option<PathBuf> {
 
 /// 下载目录的绝对路径（`aria2.conf` 的 `dir=` 必须绝对）。
 pub fn download_dir_absolute(config: &Config) -> Result<PathBuf, ConfigError> {
+    download_dir_absolute_with_home(config, None)
+}
+
+/// 同 [`download_dir_absolute`]，但 `~` 的「主目录」可注入（单测用）。
+///
+/// 为什么必须能注入：`~` 在 Linux 门禁上展开成 `$HOME`（如 `/root`），**永远不含
+/// `systemprofile`**——那样「服务身份下 `~` 落到 SYSTEM profile」这条判据在 CI 上恒真，
+/// 等于没测（`task-93` 复核指出的假绿）。注入 `C:\Windows\System32\config\systemprofile`
+/// 才能测到真实语义。
+pub fn download_dir_absolute_with_home(
+    config: &Config,
+    home: Option<&Path>,
+) -> Result<PathBuf, ConfigError> {
     let raw = config.dl.dir.trim();
     if raw.is_empty() {
         return Err(ConfigError::new(
@@ -799,11 +826,17 @@ pub fn download_dir_absolute(config: &Config) -> Result<PathBuf, ConfigError> {
             "dl.dir 为空；请在设置页填写下载目录",
         ));
     }
-    let expanded = expand_user_path(raw);
+    let expanded = match home {
+        Some(home) => expand_user_path_in(raw, home),
+        None => expand_user_path(raw),
+    };
     // `~` 开头的展开结果由主目录保证绝对；其余按**字符串**判定 —— 产品只跑 Windows，
     // 而 Linux（WSL 单测通道）上 `Path::is_absolute()` 不认 `D:\...`，不能拿它当唯一判据。
     let absolute = if raw.starts_with('~') {
-        expanded.is_absolute()
+        // `~` 的展开结果由主目录保证绝对。但 Linux 门禁上注入的 Windows 主目录
+        // （`C:\Users\alice`）在 `Path::is_absolute()` 眼里**不是**绝对路径，
+        // 所以两条判据都要认，否则 `~` 这条在跨平台单测里测不了真实语义。
+        expanded.is_absolute() || is_absolute_str(&expanded.to_string_lossy())
     } else {
         is_absolute_str(raw)
     };
@@ -1205,8 +1238,11 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
 /// 是**全平面共用**的语义（面板也要用）；这里额外回答「服务身份跑它安不安全」——
 /// 服务是 SYSTEM，落到系统保留范围会把用户的下载目录变成提权写入点，所以 **fail-closed**：
 /// 宁可让服务起不来并报错，也不能悄悄把文件塞进 `system32`。
+///
+/// 顺序固定为「**先归一化，再判**」（`task-94`）：设备前缀会改变组件序列
+/// （`\\?\C:\Windows` 的首组件是 `?`），不先剥掉的话任何组件级判据都能被绕过。
 pub fn download_dir_for_service(config: &Config) -> Result<PathBuf, ConfigError> {
-    download_dir_for_service_with(config, &service_dir_guards())
+    download_dir_for_service_with_guards(config, &service_dir_guards(), None)
 }
 
 /// 同 [`download_dir_for_service`]，但显式注入受保护目录（单测用）。
@@ -1214,20 +1250,115 @@ pub fn download_dir_for_service_with(
     config: &Config,
     guards: &ServiceDirGuards,
 ) -> Result<PathBuf, ConfigError> {
-    let dir = download_dir_absolute(config)?;
-    if let Some(reason) = forbidden_service_dir(&dir, guards) {
+    download_dir_for_service_with_guards(config, guards, None)
+}
+
+/// 再加一层注入：`~` 的主目录也可给（单测模拟「服务身份的主目录 = SYSTEM profile」）。
+///
+/// 返回的是**归一化后**的路径（设备前缀已剥掉）——aria2c 不该看到 `\\?\`。
+/// 代价：超过 260 字符的超长路径会失去 `\\?\` 的豁免；下载目录不属于该场景，已在
+/// 文档里记明。
+pub fn download_dir_for_service_with_guards(
+    config: &Config,
+    guards: &ServiceDirGuards,
+    home: Option<&Path>,
+) -> Result<PathBuf, ConfigError> {
+    let dir = download_dir_absolute_with_home(config, home)?;
+    let normalized = normalize_service_dir(&dir)?;
+    if let Some(reason) = forbidden_service_dir(&normalized, guards) {
         return Err(ConfigError::new(
             ConfigErrorKind::ForbiddenDownloadDir,
-            Some(&dir),
+            Some(&normalized),
             reason,
         ));
     }
-    Ok(dir)
+    Ok(normalized)
+}
+
+/// 归一化前置：剥设备前缀、UNC 直接拒。
+///
+/// 为什么 UNC 要拒而不是剥：服务以 SYSTEM 运行时 UNC 走**机器账户**，
+/// 等于让一个本地 SYSTEM 进程把文件写到局域网共享（凭据/横向面），
+/// 这不是「下载目录」该承担的语义。
+fn normalize_service_dir(dir: &Path) -> Result<PathBuf, ConfigError> {
+    let mut text = dir.to_string_lossy().replace('/', "\\");
+    // `\\?\UNC\server\share` 与 `\\.\UNC\...`：等价 UNC，直接拒。
+    for prefix in ["\\\\?\\unc\\", "\\\\.\\unc\\"] {
+        if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return Err(unc_forbidden(dir));
+        }
+    }
+    // 普通设备前缀：最多剥两层（`\\?\` 套 `\\.\` 是畸形输入，剥完再判即可）。
+    for _ in 0..2 {
+        let mut stripped = false;
+        for prefix in ["\\\\?\\", "\\\\.\\"] {
+            if text.len() > prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
+                text = text[prefix.len()..].to_owned();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    // 剥完之后仍是 `\\`：裸 UNC（`\\server\share`）。
+    if text.starts_with("\\\\") {
+        return Err(unc_forbidden(dir));
+    }
+    Ok(PathBuf::from(text))
+}
+
+fn unc_forbidden(dir: &Path) -> ConfigError {
+    ConfigError::new(
+        ConfigErrorKind::ForbiddenDownloadDir,
+        Some(dir),
+        format!(
+            "下载目录 {} 是 UNC（网络共享）路径：服务以 SYSTEM 运行时会用**机器账户**写远端共享，\
+             请在面板里改成本地绝对路径",
+            dir.display()
+        ),
+    )
 }
 
 /// 判定下载目录是否落在系统保留范围；命中返回可读原因。
+///
+/// 判据全部按**组件**（大小写不敏感、同时认 `\` 与 `/`），顺序从「最具体」到「最宽」，
+/// 这样报出来的原因是用户能直接照做的。
 fn forbidden_service_dir(dir: &Path, guards: &ServiceDirGuards) -> Option<String> {
-    // ① 任何层级的 `systemprofile` 组件：那是 SYSTEM 账户的「用户目录」，
+    let parts = path_segments(dir);
+
+    // ① 盘根（`C:\`）：文件会散在盘根，且盘根常被系统/用户共享。
+    if parts.len() == 1 && parts[0].len() == 2 && parts[0].ends_with(':') {
+        return Some(format!(
+            "下载目录 {} 是盘根：请给它一个子目录（例如 {}Downloads）",
+            dir.display(),
+            dir.display()
+        ));
+    }
+
+    // ② 任一组件的最后一段以 `.` 或空格结尾：Win32 会把它们归一化掉
+    //    （`C:\Windows.\Temp` 实际就是 `C:\Windows\Temp`），组件比较却看不出。
+    if let Some(bad) = parts
+        .iter()
+        .find(|segment| segment.ends_with('.') || segment.ends_with(' '))
+    {
+        return Some(format!(
+            "下载目录 {} 含以点或空格结尾的组件（{bad:?}）：Windows 会把它归一化回别的目录，\
+             组件比较因此不可靠，服务拒绝使用",
+            dir.display()
+        ));
+    }
+
+    // ③ 8.3 短名（`PROGRA~1` / `SYSTEM~1`）：展开后可能正是被禁目录。
+    if let Some(bad) = parts.iter().find(|segment| has_8dot3_alias(segment)) {
+        return Some(format!(
+            "下载目录 {} 含 8.3 短名组件（{bad:?}）：展开后可能落到被禁止的目录，改用长名",
+            dir.display()
+        ));
+    }
+
+    // ④ 任何层级的 `systemprofile` 组件：那是 SYSTEM 账户的「用户目录」，
     //    用户既看不见也基本动不了（M5-f 的那个 P0 就是这么来的）。
     if has_component_ignore_case(dir, "systemprofile") {
         return Some(format!(
@@ -1236,7 +1367,34 @@ fn forbidden_service_dir(dir: &Path, guards: &ServiceDirGuards) -> Option<String
             dir.display()
         ));
     }
-    // ② `%SystemRoot%` 整棵子树（`C:\WINDOWS\...`）。
+
+    // ⑤ 共享用户目录（`C:\Users\Public`、`Default`、`All Users`…）：
+    //    全机可写，SYSTEM 往里写等于把用户的下载暴露给所有本地用户。
+    //    **注意**：`C:\Users\<自己的用户名>\…` 是合法下载目录（安装器就写 `$PROFILE\Downloads`），
+    //    只有共享的那几个子目录被拒。
+    if let Some(bad) = parts
+        .windows(2)
+        .find(|pair| pair[0] == "users" && SHARED_USER_DIRS.contains(&pair[1].as_str()))
+        .map(|pair| pair[1].clone())
+    {
+        return Some(format!(
+            "下载目录 {} 落在共享用户目录（Users\\{bad}）里：全机可写，服务拒绝使用",
+            dir.display()
+        ));
+    }
+
+    // ⑥ `Program Files` / `Program Files (x86)` 整棵子树：程序安装区。
+    if let Some(bad) = parts
+        .iter()
+        .find(|segment| *segment == "program files" || *segment == "program files (x86)")
+    {
+        return Some(format!(
+            "下载目录 {} 落在程序安装区（{bad}）里：这是提权写入点，服务拒绝使用",
+            dir.display()
+        ));
+    }
+
+    // ⑦ `%SystemRoot%` 整棵子树（`C:\WINDOWS\...`）。
     if let Some(root) = guards.system_root.as_deref() {
         if starts_with_ignore_case(dir, root) {
             return Some(format!(
@@ -1246,7 +1404,8 @@ fn forbidden_service_dir(dir: &Path, guards: &ServiceDirGuards) -> Option<String
             ));
         }
     }
-    // ③ `%ProgramData%` **根**（子目录放行）。
+
+    // ⑧ `%ProgramData%` **根**（子目录放行）。
     if let Some(root) = guards.program_data.as_deref() {
         if eq_ignore_case(dir, root) {
             return Some(format!(
@@ -1285,6 +1444,23 @@ fn starts_with_ignore_case(path: &Path, prefix: &Path) -> bool {
 fn eq_ignore_case(path: &Path, other: &Path) -> bool {
     let parts = path_segments(path);
     !parts.is_empty() && parts == path_segments(other)
+}
+
+/// `C:\Users\` 下的**共享**子目录（这些不是「某个人的目录」，全机可写）。
+///
+/// `C:\Users\<用户名>\…` 必须放行：安装器写进配置的就是 `$PROFILE\Downloads`。
+const SHARED_USER_DIRS: &[&str] = &["public", "default", "default user", "all users"];
+
+/// 组件里是否含 8.3 短名标记（`~` 紧跟数字，如 `PROGRA~1` / `SYSTEM~1`）。
+///
+/// 为什么直接拒而不是解析：解析要 Win32 `GetLongPathNameW`（Linux 门禁上不存在），
+/// 而「下载目录里出现 8.3 短名」本身就没有正当理由——拒掉既安全又可测。
+fn has_8dot3_alias(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(index, byte)| *byte == b'~' && bytes.get(index + 1).is_some_and(u8::is_ascii_digit))
 }
 
 /// 路径里是否含某个组件（大小写不敏感）。
@@ -2504,6 +2680,128 @@ beta = "two"
         // `C:\Windows\..` 这种写法也按组件判：落在子树里照样拒。
         let dotdot = with_dl_dir("C:\\Windows\\Temp\\..\\Temp\\dl");
         assert!(download_dir_for_service_with(&dotdot, &guards()).is_err());
+    }
+
+    // ---- task-94：六类绕过（先归一化，再判）--------------------------------
+
+    /// ① 设备前缀：`\\?\` / `\\.\` 会让首组件变成 `?`/`.`，组件级判据全失效；
+    ///    UNC 形态（`\\?\UNC\…` 与裸 `\\server\share`）一律拒。
+    #[test]
+    fn service_download_dir_rejects_device_prefix_and_unc_forms() {
+        for dir in [
+            "\\\\?\\C:\\Windows\\Temp\\dl",
+            "\\\\.\\C:\\Windows\\Temp\\dl",
+            "\\\\?\\UNC\\server\\share\\dl",
+            "\\\\server\\share\\dl",
+            "//server/share/dl",
+        ] {
+            let config = with_dl_dir(dir);
+            let error = download_dir_for_service_with(&config, &guards())
+                .expect_err(&format!("{dir} 必须拒绝（设备前缀/UNC）"));
+            assert_eq!(
+                error.kind(),
+                ConfigErrorKind::ForbiddenDownloadDir,
+                "{dir} → {error}"
+            );
+        }
+        // 归一化后返回的路径不带设备前缀（aria2c 不该看到 `\\?\`）。
+        let ok = with_dl_dir("\\\\?\\D:\\Downloads\\aria2");
+        assert_eq!(
+            download_dir_for_service_with(&ok, &guards()).expect("普通盘符剥掉前缀后放行"),
+            PathBuf::from("D:\\Downloads\\aria2")
+        );
+    }
+
+    /// ② 8.3 短名：`SYSTEM~1` 就是 systemprofile，`PROGRA~1` 就是 Program Files。
+    #[test]
+    fn service_download_dir_rejects_8dot3_alias_components() {
+        for dir in [
+            "C:\\Windows\\System32\\config\\SYSTEM~1\\Downloads",
+            "C:\\PROGRA~1\\AriaHost\\dl",
+        ] {
+            let config = with_dl_dir(dir);
+            let error = download_dir_for_service_with(&config, &guards())
+                .expect_err(&format!("{dir} 必须拒绝（8.3 短名）"));
+            assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        }
+    }
+
+    /// ③ 共享用户目录：`C:\Users\Public` 全机可写；但**自己的** `C:\Users\<名>` 必须放行。
+    #[test]
+    fn service_download_dir_rejects_shared_user_dirs_but_allows_the_owner() {
+        for dir in ["C:\\Users\\Public\\Downloads", "C:\\Users\\Default\\dl"] {
+            let config = with_dl_dir(dir);
+            let error = download_dir_for_service_with(&config, &guards())
+                .expect_err(&format!("{dir} 必须拒绝（共享用户目录）"));
+            assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        }
+        let mine = with_dl_dir("C:\\Users\\alice\\Downloads");
+        assert_eq!(
+            download_dir_for_service_with(&mine, &guards()).expect("自己的用户目录放行"),
+            PathBuf::from("C:\\Users\\alice\\Downloads")
+        );
+    }
+
+    /// ④ 盘根：`C:\` 没有子目录。
+    #[test]
+    fn service_download_dir_rejects_drive_root() {
+        for dir in ["C:\\", "D:/"] {
+            let config = with_dl_dir(dir);
+            let error = download_dir_for_service_with(&config, &guards())
+                .expect_err(&format!("{dir} 必须拒绝（盘根）"));
+            assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        }
+    }
+
+    /// ⑤ 尾点/尾空格组件：Win32 归一化后就是被禁目录，组件比较看不出。
+    #[test]
+    fn service_download_dir_rejects_trailing_dot_or_space_components() {
+        for dir in [
+            "C:\\Windows.\\Temp\\dl",
+            "C:\\Windows \\Temp\\dl",
+            "C:\\Temp.\\dl",
+        ] {
+            let config = with_dl_dir(dir);
+            let error = download_dir_for_service_with(&config, &guards())
+                .expect_err(&format!("{dir} 必须拒绝（尾点/尾空格）"));
+            assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        }
+    }
+
+    /// ⑥ `Program Files` / `Program Files (x86)` 子树。
+    #[test]
+    fn service_download_dir_rejects_program_files_subtree() {
+        for dir in [
+            "C:\\Program Files\\AriaHost\\dl",
+            "C:\\Program Files (x86)\\Other\\dl",
+        ] {
+            let config = with_dl_dir(dir);
+            let error = download_dir_for_service_with(&config, &guards())
+                .expect_err(&format!("{dir} 必须拒绝（程序安装区）"));
+            assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        }
+    }
+
+    /// ⑦ 假绿修正：注入「服务身份的主目录 = SYSTEM profile」再展开 `~`。
+    ///
+    /// 旧断言（在 `crates/ariahost-svc/tests/` 里）用的是进程真 `$HOME`，
+    /// Linux 门禁上恒不含 `systemprofile`，等于没测。这里用注入把真实语义钉住。
+    #[test]
+    fn service_download_dir_rejects_tilde_under_system_profile_home() {
+        let config = with_dl_dir("~/Downloads");
+        let system_home = Path::new("C:\\Windows\\System32\\config\\systemprofile");
+        let error = download_dir_for_service_with_guards(&config, &guards(), Some(system_home))
+            .expect_err("SYSTEM 身份下 `~` 必须被拒");
+        assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        assert!(error.to_string().contains("systemprofile"), "{error}");
+
+        // 同一份配置换成普通用户主目录就必须放行（证明拒绝来自 home 而不是路径写法）。
+        let user_home = Path::new("C:\\Users\\alice");
+        assert_eq!(
+            download_dir_for_service_with_guards(&config, &guards(), Some(user_home))
+                .expect("普通用户主目录放行"),
+            PathBuf::from("C:\\Users\\alice\\Downloads")
+        );
     }
 
     /// 相对路径 / 空目录仍走原有 `download_dir_absolute` 的判据（护栏不越权）。
