@@ -27,6 +27,7 @@ use ariahost_core::{
 };
 
 use crate::logbuf::LogBuffer;
+#[cfg(test)] // task-81：只剩单测用它
 use crate::view::{StatusView, Tone};
 
 /// 停止一次预计要多久（秒）。
@@ -38,6 +39,7 @@ use crate::view::{StatusView, Tone};
 pub const STOP_EXPECTED_SECS: u64 = 4;
 
 /// 启动一次预计要多久（秒）：实测 `STATE starting` → `STATE running` 0.72s。
+#[cfg(test)] // task-81：生产路径改用 core_fabric::decide；此实现只剩单测在用
 pub const START_EXPECTED_SECS: f64 = 1.0;
 
 /// 面板侧看到的运行时状态。
@@ -764,6 +766,7 @@ fn emit(updates: &Sender<HostUpdate>, update: HostUpdate) -> bool {
 }
 
 /// 状态区文案（纯函数，单测覆盖每一种状态）。
+#[cfg(test)] // task-81：生产路径改用 core_fabric::decide；此实现只剩单测在用
 pub fn status_view(state: &HostState, probe: &CoreProbe) -> StatusView {
     let core_line = match &probe.exe {
         Some(exe) => format!("核心：{}", exe.display()),
@@ -860,11 +863,13 @@ pub fn status_view(state: &HostState, probe: &CoreProbe) -> StatusView {
 }
 
 /// RPC 端点行。
+#[cfg(test)] // task-81：生产路径改用 core_fabric::decide；此实现只剩单测在用
 fn rpc_line(port: u16) -> String {
     format!("RPC：http://127.0.0.1:{port}{}", ariahost_aria2::RPC_PATH)
 }
 
 /// 「未安装核心」时的可执行建议。
+#[cfg(test)] // task-81：生产路径改用 core_fabric::decide；此实现只剩单测在用
 fn install_hint(code: Option<ErrorCode>) -> String {
     match code {
         Some(ErrorCode::Aria2NotFound) => {
@@ -888,6 +893,7 @@ fn install_hint(code: Option<ErrorCode>) -> String {
 }
 
 /// 启动/停止失败时的可执行建议（按码分流）。
+#[cfg(test)] // task-81：生产路径改用 core_fabric::decide；此实现只剩单测在用
 fn failure_hint(code: Option<ErrorCode>) -> String {
     match code {
         Some(ErrorCode::Aria2NotFound) => {

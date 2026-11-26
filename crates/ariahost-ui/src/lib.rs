@@ -17,6 +17,9 @@
 
 mod app;
 mod backend;
+// 核心状态的单一解释器（task-81）：服务 / 面板托管 / 端口三方事实只在这里合并，
+// 渲染层只读结论。`pub mod` 的理由同 `theme`：它是被 app 与测试共用的词汇。
+pub mod core_fabric;
 mod core_host;
 mod core_setup;
 pub mod ctl;

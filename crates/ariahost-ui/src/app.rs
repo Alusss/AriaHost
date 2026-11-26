@@ -327,6 +327,8 @@ pub struct PanelApp {
     core_probe: CoreProbe,
     /// 首次运行「核心未就绪」引导（M3-h）：在线下载 / 指定本地 / 稍后。
     guide: CoreGuide,
+    /// 核心/服务/端口的单一判定器（M5-a）；带端口探测缓存，别每帧新建。
+    fabric: crate::core_fabric::Fabric,
     /// 刷新运行时用（核心刚装好时要按新配置重建 host 与 worker）。
     worker_options: crate::worker::WorkerOptions,
     /// 忙态的起点（用来显示「已等待 X 秒」）。
@@ -561,6 +563,7 @@ impl PanelApp {
             // M3-h：核心不可用就展开引导卡（判定用的是启动时那次探测，不做每帧 IO）。
             // **只认 AH-E2001**：配置读不出来走它自己的错误路径，不让引导卡冒充。
             guide: CoreGuide::new(crate::core_setup::guide_needed(&probe)),
+            fabric: crate::core_fabric::Fabric::new(),
             worker_options: worker_options.clone(),
             busy_since: None,
             aria2: None,
@@ -711,6 +714,21 @@ impl PanelApp {
 
     /// 启动核心（按钮/托盘的公共入口）。
     fn request_core_start(&mut self) {
+        // M5-a「绝不抢 6800」：按钮置灰之外再加一道硬闸——服务在跑或端口被别人占时，
+        // 无论从按钮、托盘还是后续新入口调用，都不许面板再 spawn 第二个核心。
+        let decision = crate::core_fabric::decide(&self.fabric_facts());
+        if !decision.start.enabled {
+            let why = decision
+                .view
+                .next_step
+                .clone()
+                .unwrap_or_else(|| decision.start.tip.to_owned());
+            self.set_banner(Banner::new(
+                Tone::Warn,
+                format!("{}（{}）", decision.start.tip, why),
+            ));
+            return;
+        }
         match &self.host {
             Some(host) => {
                 host.start();
@@ -1398,6 +1416,10 @@ impl PanelApp {
                 });
                 ui.add_space(2.0);
             });
+
+        // M5-a：引导卡搬到设置页——「重新配置下载核心」点完就在本页出现，
+        // 不再需要用户自己去下载页找（旧行为是点了没反应）。
+        self.show_core_guide(ui);
 
         // 顶栏：配置文件的真实位置 + 打开目录。
         ui.horizontal(|ui| {
@@ -2124,6 +2146,26 @@ impl PanelApp {
     }
 
     /// 状态区：核心状态机 + 主按钮。
+    /// 把「服务 / 面板托管 / 端口」三类事实收成 fabric 的输入（M5-a）。
+    ///
+    /// 端口事实只在这层探一次：`Fabric` 内部带缓存，避免每帧做 socket 探测。
+    fn fabric_facts(&mut self) -> crate::core_fabric::Facts {
+        let rpc_port = self.worker_options.port;
+        let listening = self.fabric.port_listening(rpc_port);
+        let (port, _) = self.fabric.port_fact(rpc_port, self.core.is_running());
+        crate::core_fabric::Facts {
+            service: crate::core_fabric::service_phase(self.service.as_ref()),
+            local: crate::core_fabric::local_phase(&self.core),
+            port,
+            port_listening: listening,
+            probe_ready: self.core_probe.ready(),
+            local_version: self.core_probe.version.clone(),
+            service_version: None,
+            rpc_port,
+            missing: self.core_probe.missing.clone(),
+        }
+    }
+
     fn show_status(&mut self, ui: &mut egui::Ui) {
         if self.seed_mode() {
             ui.horizontal(|ui| {
@@ -2143,10 +2185,14 @@ impl PanelApp {
             return;
         }
 
-        let view = core_host::status_view(&self.core, &self.core_probe);
+        // M5-a：核心状态只由 fabric 解释一次（服务优先；服务在跑时面板不得再抢 6800）。
+        let facts = self.fabric_facts();
+        let decision = crate::core_fabric::decide(&facts);
+        let view = decision.view;
         let busy = self.core.is_busy();
         let running = self.core.is_running();
-        let ready = self.core_probe.ready();
+        // 「绝不抢 6800」：fabric 说不能由面板启动时（服务在跑 / 端口被别人占），按钮置灰。
+        let ready = decision.start.enabled;
 
         // 状态卡（审计 M-1 / M-2）：**先画右对齐按钮组**，文本再占剩下的宽度并强制折行。
         // 旧写法把按钮放在 `right_to_left` 的末尾，长句（如「找不到 aria2c：…」）只被窗口
@@ -2249,8 +2295,9 @@ impl PanelApp {
                 },
             )
         };
+        // M5-a「绝不抢 6800」：停止键只受忙碌约束，启动键还必须由 fabric 放行
         let button = ui.add_enabled(
-            !busy,
+            !busy && (running || ready),
             egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(116.0, 26.0)),
         );
         let button = button.on_hover_text(tip);
@@ -3642,8 +3689,8 @@ impl PanelApp {
                 self.show_quit_line(ui);
                 self.show_session_bar(ui);
                 self.show_banner(ui);
-                // M3-h：首屏引导卡放在最上面（不是模态：它不挡托盘、不挡关闭，其余页照常可看）。
-                self.show_core_guide(ui);
+                // M5-a：下载页不再挂「核心未就绪」卡——服务在跑时它曾误报「未就绪」。
+                // 引导卡改在设置页（「重新配置下载核心」就在那里），点完当页立刻可见。
                 if !self.seed_mode() {
                     self.show_new_task(ui);
                 }
