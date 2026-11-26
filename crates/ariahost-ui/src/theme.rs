@@ -78,6 +78,12 @@ pub struct Tokens {
     pub info_text: Color32,
     /// chip 底的 alpha（深色 16% / 浅色 10%）。
     pub chip_alpha: u8,
+    /// ok.dot：运行中指示点本体（**只做填充**，必须配 ok_ring 描边才够 3:1）。
+    pub ok_dot: Color32,
+    /// ok.ring：指示点 1px 描边，承担图形 3:1 边界。
+    pub ok_ring: Color32,
+    /// ok.text：「运行中 / 下载中 / 已完成」文字（浅色加深、深色用正绿）。
+    pub ok_text: Color32,
 }
 
 /// 深色（默认）。
@@ -98,15 +104,18 @@ pub const DARK: Tokens = Tokens {
     accent_hover: Color32::from_rgb(0x5C, 0x9C, 0xFF),
     accent_text: Color32::from_rgb(0x86, 0xB4, 0xFF),
     on_accent: Color32::from_rgb(0x0B, 0x12, 0x1C),
-    success: Color32::from_rgb(0x4C, 0xC2, 0x6B),
-    success_text: Color32::from_rgb(0x6F, 0xD9, 0x8C),
+    success: Color32::from_rgb(0x00, 0xC8, 0x53),
+    success_text: Color32::from_rgb(0x00, 0xC8, 0x53),
     warn: Color32::from_rgb(0xE0, 0xA9, 0x3B),
-    warn_text: Color32::from_rgb(0xF0, 0xC0, 0x5A),
+    warn_text: Color32::from_rgb(0xE0, 0xA9, 0x3B),
     danger: Color32::from_rgb(0xF0, 0x61, 0x6D),
-    danger_text: Color32::from_rgb(0xFF, 0x92, 0x9B),
+    danger_text: Color32::from_rgb(0xF0, 0x61, 0x6D),
     info: Color32::from_rgb(0x4F, 0xA8, 0xF5),
-    info_text: Color32::from_rgb(0x7C, 0xC4, 0xFF),
+    info_text: Color32::from_rgb(0x4F, 0xA8, 0xF5),
     chip_alpha: 41, // 16% of 255
+    ok_dot: Color32::from_rgb(0x00, 0xC8, 0x53),
+    ok_ring: Color32::from_rgb(0x0B, 0x6B, 0x34),
+    ok_text: Color32::from_rgb(0x00, 0xC8, 0x53),
 };
 
 /// 浅色。
@@ -127,15 +136,18 @@ pub const LIGHT: Tokens = Tokens {
     accent_hover: Color32::from_rgb(0x18, 0x5F, 0xD1),
     accent_text: Color32::from_rgb(0x0A, 0x58, 0xCA),
     on_accent: Color32::from_rgb(0xFF, 0xFF, 0xFF),
-    success: Color32::from_rgb(0x1A, 0x7F, 0x37),
-    success_text: Color32::from_rgb(0x14, 0x6C, 0x2E),
+    success: Color32::from_rgb(0x15, 0x80, 0x3D),
+    success_text: Color32::from_rgb(0x15, 0x80, 0x3D),
     warn: Color32::from_rgb(0x8A, 0x5A, 0x00),
-    warn_text: Color32::from_rgb(0x7A, 0x4F, 0x00),
+    warn_text: Color32::from_rgb(0x8A, 0x5A, 0x00),
     danger: Color32::from_rgb(0xC4, 0x2B, 0x1C),
-    danger_text: Color32::from_rgb(0xB4, 0x23, 0x18),
+    danger_text: Color32::from_rgb(0xC4, 0x2B, 0x1C),
     info: Color32::from_rgb(0x09, 0x69, 0xDA),
-    info_text: Color32::from_rgb(0x05, 0x50, 0xAE),
+    info_text: Color32::from_rgb(0x09, 0x69, 0xDA),
     chip_alpha: 26, // 10% of 255
+    ok_dot: Color32::from_rgb(0x00, 0xC8, 0x53),
+    ok_ring: Color32::from_rgb(0x0B, 0x6B, 0x34),
+    ok_text: Color32::from_rgb(0x15, 0x80, 0x3D),
 };
 
 /// 当前主题的 token（按 `ui` 的 `dark_mode` 选，不缓存、不猜）。
@@ -510,15 +522,19 @@ mod tests {
         }
         // 不透明度只有 token 一个来源。
         assert_eq!(bg.a(), DARK.chip_alpha, "alpha 必须来自 chip_alpha");
-        // 预乘存储下的 rgb 必须已经被 alpha 缩过：`gamma_multiply` 只在 gamma 空间
-        // 缩放，得到的值不会等于 `原色 * a / 255`，所以这一条能区分两种实现。
-        assert!(
-            bg.r() < want[0] && bg.g() < want[1] && bg.b() < want[2],
-            "预乘 rgb 应小于原色：got ({}, {}, {})",
-            bg.r(),
-            bg.g(),
-            bg.b()
-        );
+        // 预乘存储下的 rgb 必须正好是 `原色 * a / 255`（±1 舍入）：`gamma_multiply`
+        // 只在 gamma 空间缩放，得到的是另一组值，所以这一条能区分两种实现。
+        // 注意不能写成「每个通道都严格变小」：token 里 r 分量可能本来就是 0，0 再乘也还是 0。
+        let a = u32::from(DARK.chip_alpha);
+        for (name, idx, got) in [("r", 0usize, bg.r()), ("g", 1, bg.g()), ("b", 2, bg.b())] {
+            let exact = (u32::from(want[idx]) * a / 255) as i32;
+            let delta = (i32::from(got) - exact).abs();
+            assert!(
+                delta <= 1,
+                "{name} 不是按 alpha 预乘的：got {got} 期望 {exact}（原色 {}）",
+                want[idx]
+            );
+        }
     }
 
     /// 卡片/壳的 frame 必须真的带 fill（否则又是「未铺底」）。

@@ -1178,11 +1178,14 @@ impl PanelApp {
         let state = snapshot.and_then(|snapshot| snapshot.state());
 
         let (label, color) = match (state, snapshot) {
-            (Some(state), _) => (service::state_label(state), service_state_color(state)),
+            (Some(state), _) => (
+                service::state_label(state),
+                service_state_color(crate::theme::tokens(ui), state),
+            ),
             (None, Some(ServiceSnapshot::Failed { .. })) => {
-                ("查询失败", Color32::from_rgb(230, 140, 140))
+                ("查询失败", crate::theme::tokens(ui).danger_text)
             }
-            (None, _) => ("读取中…", Color32::GRAY),
+            (None, _) => ("读取中…", crate::theme::tokens(ui).text2),
         };
 
         ui.add_space(6.0);
@@ -1236,7 +1239,7 @@ impl PanelApp {
                     Some(ServiceSnapshot::Failed { code, .. }) => {
                         ui.label(
                             RichText::new(format!("{}（详见日志）", code.code()))
-                                .color(Color32::from_rgb(230, 160, 140)),
+                                .color(crate::theme::tokens(ui).warn_text),
                         );
                     }
                     _ => {
@@ -1266,9 +1269,9 @@ impl PanelApp {
         if let Some((tone, message)) = self.service_card.notice().cloned() {
             ui.add_space(8.0);
             let color = match tone {
-                service::NoticeTone::Ok => Color32::from_rgb(140, 200, 160),
-                service::NoticeTone::Info => Color32::from_rgb(150, 190, 240),
-                service::NoticeTone::Bad => Color32::from_rgb(230, 140, 140),
+                service::NoticeTone::Ok => crate::theme::tokens(ui).ok_text,
+                service::NoticeTone::Info => crate::theme::tokens(ui).info_text,
+                service::NoticeTone::Bad => crate::theme::tokens(ui).danger_text,
             };
             let response = ui.label(RichText::new(message).color(color));
             self.drive_targets.note("服务结果提示", response.rect);
@@ -1402,7 +1405,7 @@ impl PanelApp {
                     }
                     ui.separator();
                     if dirty {
-                        ui.label(RichText::new("有未保存的改动").color(tone_color(Tone::Warn)));
+                        ui.label(RichText::new("有未保存的改动").color(tone_color(ui, Tone::Warn)));
                     } else {
                         ui.label(RichText::new("没有改动").weak());
                     }
@@ -1448,7 +1451,7 @@ impl PanelApp {
                 None => {
                     ui.label(
                         RichText::new("拿不到 %APPDATA%（配置不可用）")
-                            .color(tone_color(Tone::Bad)),
+                            .color(tone_color(ui, Tone::Bad)),
                     );
                 }
             }
@@ -1457,9 +1460,9 @@ impl PanelApp {
         // 保存/校验结果。
         if let Some(notice) = self.settings.notice.clone() {
             let color = if notice.ok {
-                tone_color(Tone::Good)
+                tone_color(ui, Tone::Good)
             } else {
-                tone_color(Tone::Bad)
+                tone_color(ui, Tone::Bad)
             };
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(notice.headline).color(color));
@@ -1473,7 +1476,8 @@ impl PanelApp {
         if self.settings.leaving {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new("有未保存的改动，确定离开设置页？").color(tone_color(Tone::Warn)),
+                    RichText::new("有未保存的改动，确定离开设置页？")
+                        .color(tone_color(ui, Tone::Warn)),
                 );
                 if ui.button("保存并离开").clicked() {
                     self.save_settings();
@@ -1559,7 +1563,7 @@ impl PanelApp {
         if let Some(reason) = self.settings.error(key) {
             ui.horizontal(|ui| {
                 ui.add_space(150.0);
-                ui.label(RichText::new(reason.to_owned()).color(tone_color(Tone::Bad)));
+                ui.label(RichText::new(reason.to_owned()).color(tone_color(ui, Tone::Bad)));
             });
         }
     }
@@ -1568,9 +1572,9 @@ impl PanelApp {
     fn settings_note(ui: &mut egui::Ui, key: &str, extra: &str) {
         let effect = settings::effect(key);
         let color = match effect {
-            settings::Effect::Immediate => tone_color(Tone::Good),
-            settings::Effect::Restart => tone_color(Tone::Warn),
-            settings::Effect::NotWired => tone_color(Tone::Bad),
+            settings::Effect::Immediate => tone_color(ui, Tone::Good),
+            settings::Effect::Restart => tone_color(ui, Tone::Warn),
+            settings::Effect::NotWired => tone_color(ui, Tone::Bad),
         };
         ui.horizontal(|ui| {
             ui.add_space(150.0);
@@ -1732,7 +1736,7 @@ impl PanelApp {
             }
         });
         if let Some(reason) = self.settings.error("ui.close_action") {
-            ui.label(RichText::new(reason.to_owned()).color(tone_color(Tone::Bad)));
+            ui.label(RichText::new(reason.to_owned()).color(tone_color(ui, Tone::Bad)));
         }
         Self::settings_note(ui, "ui.close_action", "保存后立刻按新值处理点 X");
 
@@ -1762,7 +1766,7 @@ impl PanelApp {
                     RichText::new(
                         "当前构建只带 wgpu（EG-3）：保存后仍按 wgpu 启动，日志会记一条回退说明",
                     )
-                    .color(tone_color(Tone::Warn)),
+                    .color(tone_color(ui, Tone::Warn)),
                 );
             });
         }
@@ -2169,7 +2173,7 @@ impl PanelApp {
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("[自测]")
-                        .color(tone_color(Tone::Idle))
+                        .color(tone_color(ui, Tone::Idle))
                         .strong(),
                 );
                 ui.label(
@@ -2212,7 +2216,7 @@ impl PanelApp {
         if let Some(code) = view.code {
             ui.label(
                 RichText::new(format!("错误码：{code}"))
-                    .color(tone_color(view.tone))
+                    .color(tone_color(ui, view.tone))
                     .monospace(),
             );
         }
@@ -2240,7 +2244,7 @@ impl PanelApp {
         if self.host.as_ref().is_some_and(|host| !host.is_alive()) {
             ui.label(
                 RichText::new("核心托管线程未启动：按钮点击不会有反应（见启动日志）")
-                    .color(tone_color(Tone::Bad)),
+                    .color(tone_color(ui, Tone::Bad)),
             );
         }
     }
@@ -2335,7 +2339,11 @@ impl PanelApp {
         };
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label(RichText::new(text).color(tone_color(Tone::Warn)).small());
+            ui.label(
+                RichText::new(text)
+                    .color(tone_color(ui, Tone::Warn))
+                    .small(),
+            );
         });
     }
 
@@ -2349,7 +2357,7 @@ impl PanelApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(format!("检测到 {count} 个未完成任务，是否继续？"))
-                    .color(tone_color(Tone::Good))
+                    .color(tone_color(ui, Tone::Good))
                     .small(),
             );
             if ui.small_button("继续").clicked() {
@@ -2404,7 +2412,7 @@ impl PanelApp {
                         RichText::new(format!(
                             "托盘不可用（{reason}）：这一档藏不住窗口，请选退出或取消。"
                         ))
-                        .color(crate::view::tone_color(Tone::Warn))
+                        .color(crate::view::tone_color(ui, Tone::Warn))
                         .small(),
                     );
                 }
@@ -2462,7 +2470,7 @@ impl PanelApp {
             self.banner = None;
             return;
         }
-        let color = tone_color(banner.tone);
+        let color = tone_color(ui, banner.tone);
         let mut dismiss = false;
         egui::Frame::NONE
             .fill(color.gamma_multiply(0.14))
@@ -2896,7 +2904,7 @@ impl PanelApp {
             if at.elapsed() < NOTICE_TIMEOUT {
                 ui.label(
                     RichText::new(text)
-                        .color(Color32::from_rgb(140, 200, 255))
+                        .color(crate::theme::tokens(ui).info_text)
                         .small(),
                 );
             } else {
@@ -2915,7 +2923,7 @@ impl PanelApp {
                         failure.summary(),
                         failure.next_step()
                     ))
-                    .color(tone_color(Tone::Warn))
+                    .color(tone_color(ui, Tone::Warn))
                     .small(),
                 );
             }
@@ -3066,7 +3074,7 @@ impl PanelApp {
                         ui.label(
                             RichText::new(&*row.status)
                                 .text_style(egui::TextStyle::Small)
-                                .color(status_color(row.kind)),
+                                .color(status_color(crate::theme::tokens(ui), row.kind)),
                         );
                     });
                     table_row.col(|ui| {
@@ -3229,7 +3237,7 @@ impl PanelApp {
         if let Some(next) = &rpc.next_step {
             ui.label(
                 RichText::new(format!("下一步：{next}"))
-                    .color(tone_color(rpc.tone))
+                    .color(tone_color(ui, rpc.tone))
                     .small(),
             );
         }
@@ -3943,7 +3951,7 @@ fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
 
 /// 状态徽章：底色按语气区分，文字永远是中文状态词。
 fn badge(ui: &mut egui::Ui, view: &StatusView) {
-    let color = tone_color(view.tone);
+    let color = tone_color(ui, view.tone);
     ui.label(
         RichText::new(format!("[{}]", view.badge))
             .color(color)
@@ -3952,14 +3960,14 @@ fn badge(ui: &mut egui::Ui, view: &StatusView) {
 }
 
 /// 任务状态 → 颜色（下载中绿、已暂停黄、出错红、其余灰）。
-fn status_color(kind: TaskStatus) -> Color32 {
+fn status_color(t: &crate::theme::Tokens, kind: TaskStatus) -> Color32 {
     match kind {
-        TaskStatus::Active => tone_color(Tone::Good),
-        TaskStatus::Waiting => Color32::from_rgb(150, 190, 240),
-        TaskStatus::Paused => tone_color(Tone::Warn),
-        TaskStatus::Error => tone_color(Tone::Bad),
-        TaskStatus::Complete => Color32::from_rgb(140, 200, 160),
-        TaskStatus::Removed | TaskStatus::Unknown => tone_color(Tone::Idle),
+        TaskStatus::Active => t.ok_text,
+        TaskStatus::Waiting => t.info_text,
+        TaskStatus::Paused => t.warn_text,
+        TaskStatus::Error => t.danger_text,
+        TaskStatus::Complete => t.ok_text,
+        TaskStatus::Removed | TaskStatus::Unknown => t.text2,
     }
 }
 
@@ -4041,14 +4049,14 @@ fn service_args(op: service::Op) -> (TargetKind, Vec<String>) {
 }
 
 /// 六态 → 颜色（与状态徽章同一套语气：绿=好、黄=可操作、灰=没有、红=异常）。
-fn service_state_color(state: ariahost_svc::ServiceState) -> Color32 {
+fn service_state_color(t: &crate::theme::Tokens, state: ariahost_svc::ServiceState) -> Color32 {
     use ariahost_svc::ServiceState as S;
     match state {
-        S::Running => Color32::from_rgb(140, 200, 160),
-        S::Stopped => Color32::from_rgb(230, 200, 130),
-        S::NotInstalled => Color32::from_rgb(170, 170, 170),
-        S::StartPending | S::StopPending => Color32::from_rgb(150, 190, 240),
-        S::Unknown => Color32::from_rgb(230, 160, 120),
+        S::Running => t.ok_text,
+        S::Stopped => t.warn_text,
+        S::NotInstalled => t.text2,
+        S::StartPending | S::StopPending => t.info_text,
+        S::Unknown => t.warn_text,
     }
 }
 
@@ -4330,11 +4338,15 @@ mod tests {
 
     #[test]
     fn status_colors_distinguish_error_from_success() {
+        let t = &crate::theme::DARK;
         assert_ne!(
-            status_color(TaskStatus::Error),
-            status_color(TaskStatus::Active)
+            status_color(t, TaskStatus::Error),
+            status_color(t, TaskStatus::Active)
         );
-        assert_eq!(status_color(TaskStatus::Paused), tone_color(Tone::Warn));
+        assert_eq!(
+            status_color(t, TaskStatus::Paused),
+            crate::view::tone_text(t, Tone::Warn)
+        );
     }
 
     #[test]

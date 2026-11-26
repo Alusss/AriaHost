@@ -52,14 +52,19 @@ impl StatusView {
     }
 }
 
-/// 语气 → 颜色（深色主题下也够对比）。
-pub fn tone_color(tone: Tone) -> egui::Color32 {
-    use egui::Color32;
+/// 语气 → 颜色。**只返回 token**（ui-spec-v2 §3.2 硬规则：函数体里不许出现
+/// Color32::from_rgb，否则两套主题会各写一份、迟早漂移）。
+pub fn tone_color(ui: &egui::Ui, tone: Tone) -> egui::Color32 {
+    tone_text(crate::theme::tokens(ui), tone)
+}
+
+/// 语气 → 颜色，**只吃 token**（纯函数，单测可直接给两套主题各跑一遍）。
+pub fn tone_text(t: &crate::theme::Tokens, tone: Tone) -> egui::Color32 {
     match tone {
-        Tone::Good => Color32::from_rgb(110, 205, 130),
-        Tone::Warn => Color32::from_rgb(240, 190, 90),
-        Tone::Bad => Color32::from_rgb(235, 110, 110),
-        Tone::Idle => Color32::from_rgb(170, 170, 170),
+        Tone::Good => t.ok_text,
+        Tone::Warn => t.warn_text,
+        Tone::Bad => t.danger_text,
+        Tone::Idle => t.text2,
     }
 }
 
@@ -79,15 +84,12 @@ mod tests {
     #[test]
     fn tones_map_to_distinct_colors() {
         let tones = [Tone::Good, Tone::Warn, Tone::Bad, Tone::Idle];
-        let mut colors = Vec::new();
-        for tone in tones {
-            colors.push(tone_color(tone));
-        }
-        for (index, color) in colors.iter().enumerate() {
-            assert!(
-                !colors[..index].contains(color),
-                "第 {index} 个语气与前面的颜色重复了"
-            );
+        for tokens in [&crate::theme::DARK, &crate::theme::LIGHT] {
+            let colors: Vec<egui::Color32> =
+                tones.iter().map(|tone| tone_text(tokens, *tone)).collect();
+            for (index, color) in colors.iter().enumerate() {
+                assert!(!colors[..index].contains(color), "duplicate tone color");
+            }
         }
     }
 }
