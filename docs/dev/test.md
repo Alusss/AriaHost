@@ -61,7 +61,7 @@ cargo test --workspace -- --include-ignored
 ### 3.1 真机取证手段（锁屏 / 无桌面也能用）
 
 - **UIA 关窗可替代手点 X**：对窗口发 UI Automation 的 `WindowPattern.Close` **确实会走到 eframe 的 `close_requested`**（不是被 winit 吞掉）。探针实测：调完 **0.3s 内**进程退出、`window.json` 被写出（该文件只在 close 分支写）。因此 `ui.close_action` 三档可在锁屏下验收：`tray` → 进程仍在、窗口 `Visible=false`；`ask` → UIA 树里出现对话框文本；`exit` → 约 **4s** 内 `ariahost` 与 `aria2c` 一起消失。方法细节见 [build.md](build.md) §4.3。
-- **内存只认外部采样**（口径不动）：release 构建、窗口真实打开、启动后 **60s 稳态**，取 `GetProcessMemoryInfo → PrivateWorkingSetSize`（进程外 `Get-Counter '\Process(ariahost)\Working Set - Private'`，每 6s 一次取序列）。**不得用程序自报的 `private_kb` 当闸门**——同一状态两者差 3 MB 量级，见 [build.md](build.md) §4.2。
+- **内存只认外部采样**（口径不动）：release 构建、窗口真实打开、启动后 **60s 稳态**，用 `K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize`（**按 PID 打开的句柄**，每 6s 一次取序列）。**不要**拿 `Get-Counter '\Process(ariahost)\Working Set - Private'` 当主口径——它按名字取实例，多实例时会取到别人的进程（见 §6.9）。**不得用程序自报的 `private_kb` 当闸门**——同一状态两者差 3 MB 量级，见 [build.md](build.md) §4.2。
 
 ## 4. 手工验收记录模板
 
@@ -230,7 +230,11 @@ Get-Counter '\Process(ariahost)\Working Set - Private'
 
 **规则**：
 
-1. 一律用 `K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX.PrivateWorkingSetSize`，且句柄来自**你启动的那个进程**（`Start-Process -PassThru` 的 `.Handle`），不是按名字找。
+1. 一律用 `K32GetProcessMemoryInfo → PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize`，且句柄来自**你启动的那个进程**（`OpenProcess(pid)` / `Start-Process -PassThru`），不是按名字找。
+
+   **结构体必须是 `EX2`**（`MEMORY_COUNTERS_EX2`，Win8+）。`PROCESS_MEMORY_COUNTERS_EX` **没有** `PrivateWorkingSetSize` 字段——照 `EX` 的字段表顺手改读 `WorkingSetSize`，拿到的是**总工作集**（含 Vulkan/Intel 驱动映射、字体文件映射等共享页），量级差 2–3 倍。本文旧版第 233 行就误写成 `EX`，2026-11-26 我照它抄出一次 **177 MB 的「破闸门」**，实为总工作集，当场误发给成员当回归处理。参考实现：`.scratch/m3/acceptance/membase-three-scenarios.ps1` 第 25–51 行。
+
+   **取数后必须交叉核对：`PrivateWorkingSetSize ≤ PrivateUsage`**。不成立就说明结构体尺寸/字段偏移读错了，先修脚本再谈结论——不要把矛盾数字报出去。
 2. 采样期必须记录**同时存在的同名实例数**；`>1` 就 INCONCLUSIVE。
 3. 口径写死在输出里：`PWS max = XXX KB（句柄 PID=NNNN）/ 余量 = XXX KB`。
 4. **「没采到数据」永远不是「通过」**：采样数 < N、进程中途退出、变量为空 → 判 `INCONCLUSIVE`，**不得**判 PASS（已发现 4 个脚本犯过 `$null -lt 闸门值 → True` 这类空判）。
