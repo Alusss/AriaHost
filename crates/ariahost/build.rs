@@ -62,7 +62,13 @@ fn main() {
     }
 }
 
-/// 图标绝对路径。rc.exe 只认反斜杠，所以在 Windows 上把分隔符统一成 `\`。
+/// 图标绝对路径，**形态按「谁在编译资源」分流**。
+///
+/// - MSVC 目标：`rc.exe` 只认反斜杠，且这类构建只在 Windows 宿主上跑 → 统一换成 `\`。
+/// - GNU 目标 + 非 Windows 宿主：`windres` 是 POSIX 工具，反斜杠会被当成字面字符，
+///   实测报 `can't open icon file '\mnt\f\...'` → 必须给斜杠形态。
+///
+/// 这一条是 task-99 的实测产物：GNU release 全链接本身没问题，唯一挡住产包的是这个路径形态。
 fn icon_path() -> String {
     let abs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -74,5 +80,16 @@ fn icon_path() -> String {
         "缺少图标文件：{}（应由仓库内 installer/ariahost.ico 提供）",
         abs.display()
     );
-    abs.display().to_string().replace('/', "\\")
+    let raw = abs.display().to_string();
+    if uses_posix_resource_tool() {
+        return raw;
+    }
+    raw.replace('/', "\\")
+}
+
+/// 资源编译器是否是 POSIX 形态（GNU 目标 + 非 Windows 宿主）。
+fn uses_posix_resource_tool() -> bool {
+    let gnu_target = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu");
+    let windows_host = std::env::var("HOST").is_ok_and(|host| host.contains("windows"));
+    gnu_target && !windows_host
 }
