@@ -1,5 +1,24 @@
-# AriaHost — CI 质量门禁（private 仓库 / 配额收敛版）
+# AriaHost — CI 质量门禁（private 仓库 / 配额受限期：2026-11-26 起）
 #
+# 配额事实（实测，不是估计）：本仓 Actions 额度已耗尽；Windows runner 按 **2× 计费**，
+# 一轮完整 CI（fmt + windows x64 + windows-x86 + gate）实测 **26–30 计费分钟/次**，
+# 一天十几次 push 就烧掉几百分钟。额度耗尽期间 GitHub 对**所有** runner 一视同仁，
+# 连 ubuntu 的 fmt job 都起不来——所以「省 Windows」不是为了省钱，是为了让闸门还能亮。
+#
+# 因此本 workflow 按「每次 push 都验什么 / 什么按需」分三层：
+#   1. **每次 push / PR 都跑**：changes、meta、preflight、fmt、**linux**（1× 计费，3–7 分钟）。
+#      linux 腿跑同一份 `clippy --workspace --all-targets --locked -D warnings` + 全量 test。
+#   2. **按需跑 Windows**（2× 计费）：只在 ① 手动 `workflow_dispatch`、
+#      ② push 命中 Windows 专属路径（`changes` 的 `winpaths`：`.github/`、`installer/`、
+#      任何 `build.rs`、`crates/ariahost-svc/**`）时启动。其余情况 skipped（页面上可见）。
+#   3. **windows-x86 只在手动 `-f run_x86=true`**；32 位的常态覆盖移到发版矩阵（release.yml）。
+#
+# **CI 绿 ≠ Windows 绿**：配额受限期 push 默认不跑 Windows 腿，Linux 绿只证明平台无关的部分。
+# Win32 API、Job Object、DPAPI、托盘、服务、AUMID、build.rs 资源嵌入——只有 Windows 编得出来。
+# 提交前必跑的本地闸门见 `docs/dev/ci.md` §7；改动落到那几类路径时记得 `gh workflow run ci.yml`。
+#
+# 下划线之前是原有设计说明（保留，仍有参考价值）：
+# #
 # 计费前提：本仓库是 **private**，Windows runner 按 **2× 分钟**计费；
 # GitHub Free 的 2000 分钟/月 ≈ **1000 分钟**实际 Windows 构建时间。
 # M4-1（2026-11-26）起双架构，但 32 位腿**不跟每次 push 跑**（见下面的触发策略与
@@ -26,6 +45,29 @@
 # 正斜杠路径、Windows 版不接受，Linux 绿灯对 Windows 没有一点证明力（首发 tag 因此失败）。
 #
 # 本 workflow 已真实运行（2026-11-24 首次），一切以 Actions 日志为准。
+#
+# ============================ 配额受限期（2026-11-26 起）============================
+# **事实**：2026-11-26 12:37，run 45756306524 的 `windows / x64` job **0 步、1 秒失败**，
+# check-run annotation 原文：
+#   The job was not started because recent account payments have failed
+#   or your spending limit needs to be increased.
+# 只重跑失败 job 同样 1 秒失败（不是瞬时故障）→ **Actions 免费分钟已耗尽**（org `doaio`，
+# private 仓库，Windows runner 按 **2×** 计费；此前已跑 96 次 CI + 4 次 release × 双架构）。
+# 同轮 Linux job 全部 success（1× 计费、几十秒）——**红的是配额分配，不是代码**。
+#
+# 这是账户层面问题，只有用户能解（提额 / 绑卡 / 等月度重置）。CI 侧能做的是**别再烧**：
+#   1. push 默认只跑 Linux 腿（1× 计费，约 3–5 分钟）；Windows 腿（26–30 计费分钟/轮）
+#      改为**按需**：仅 workflow_dispatch，或 push 改到了「Linux 无法验证」的路径
+#      （见 `changes` job 的 winpaths 判定）；
+#   2. tag 推送不跑本 workflow 的 Windows 腿（release.yml 独立负责出包，避免双烧）；
+#   3. **配额受限期：优先 dispatch 而不是 push**。真需要 Windows 证据时用
+#      `gh workflow run ci.yml`（或 Actions 页面 Run workflow），不要靠 push 触发。
+#
+# 代价（知情接受）：push 不再有 Windows 证据，因此
+#   `clippy --target x86_64-pc-windows-gnu -D warnings` 从「CI 会兜」变成**提交前必跑**，
+#   硬要求与可复制命令见 docs/dev/ci.md §7「Windows 专属 lint 的本地闸门」。
+#   `ci-gate` 的 summary 会显式打印「CI 绿 ≠ Windows 绿」，防止再把 Linux 绿当可发。
+# ================================================================================
 name: CI
 
 on:
@@ -64,12 +106,14 @@ jobs:
     timeout-minutes: 5
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # 改动是否落在「Linux 验证不了、必须 Windows 才能证」的路径上（见 docs/dev/ci.md §7）。
+      winpaths: ${{ steps.filter.outputs.winpaths }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: filter
-        name: 判定是否触及代码或构建配置
+        name: 判定是否触及代码或构建配置（含 Windows 专属路径）
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
@@ -77,6 +121,11 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          # 拿不准 base 时保守：两个输出都给 true（多跑一次比漏跑安全）。
+          conservative() {
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "winpaths=true" >> "$GITHUB_OUTPUT"
+          }
           if [ "$EVENT" = "pull_request" ]; then
             range="${BASE_SHA}...HEAD"
           elif [ -n "${BEFORE_SHA:-}" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
@@ -84,13 +133,27 @@ jobs:
             range="${BEFORE_SHA}...HEAD"
           else
             echo "无法确定 base commit（事件=$EVENT），按代码改动处理。"
-            echo "code=true" >> "$GITHUB_OUTPUT"
+            conservative
             exit 0
           fi
           echo "比较范围：$range"
-          git diff --name-only "$range" > changed.txt || { echo "code=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          git diff --name-only "$range" > changed.txt || { conservative; exit 0; }
           echo "--- 本次改动文件 ---"
           cat changed.txt
+
+          # Windows 专属路径（winpaths）：push 时只有命中这些才启动 Windows 腿。
+          # 判据 = 「Linux 上验不到」：workflow 自身、安装器、Win32 资源/COM/托盘/服务、
+          # 以及任何 Cargo 清单（target 相关依赖与 feature 只影响 Windows 产物）。
+          WINPAT='^(\.github/workflows/|installer/)|^crates/ariahost/build\.rs$|^crates/ariahost/src/aumid\.rs$|^crates/ariahost-ui/src/tray\.rs$|^crates/ariahost-svc/|(^|/)Cargo\.(toml|lock)$'
+          if [ -s changed.txt ] && grep -Eq "$WINPAT" changed.txt; then
+            echo "winpaths=true" >> "$GITHUB_OUTPUT"
+            echo "命中 Windows 专属路径（push 时启动 Windows 腿）："
+            grep -En "$WINPAT" changed.txt || true
+          else
+            echo "winpaths=false" >> "$GITHUB_OUTPUT"
+            echo "未命中 Windows 专属路径：push 只跑 Linux 腿。"
+          fi
+
           # 「不影响编译」的路径白名单（新增顶层目录时记得同步这里）：
           #   docs/**、.scratch/**、任意 *.md、根 LICENSE / LICENSE-*、.gitignore、.editorconfig
           if [ -s changed.txt ] \
@@ -241,13 +304,77 @@ jobs:
       - name: 格式检查
         run: cargo fmt --all -- --check
 
+  # 配额受限期（2026-11-26 起）的主验证腿：**每次 push 都跑**，1× 计费，约 3–7 分钟。
+  # 为什么需要它：Windows 腿改成按需后，push 默认只有 fmt 一道门；没有这条腿就等于
+  # 「push 什么都不验」——那是把费用问题转成质量事故。这条腿在 Linux 上跑同一份
+  # clippy --all-targets --locked -D warnings + 全量 test，覆盖**平台无关**的绝大部分逻辑。
+  # 它证明不了什么（必须说清）：Win32 API 调用、Job Object、DPAPI、托盘、服务、AUMID、
+  # build.rs 的资源嵌入——这些只在 Windows 编得出来，见 docs/dev/ci.md §7 的本地闸门。
+  linux:
+    name: linux（clippy + test）
+    needs: [changes, preflight]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # 系统库：egui/eframe + wgpu 这条栈在 Linux 上要 x11/wayland/xkb 的头，缺了
+      # 连 `cargo clippy` 都过不去（winit/glutin 的 build script 会直接失败）。
+      # 这是本 job 唯一的额外成本（约 20–40s），比被环境红骗一次便宜得多。
+      - name: 安装 Linux 图形栈依赖（Ubuntu 无 X 服务器也能编）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev pkg-config
+      - name: 安装 Rust（显式传 toolchain 输入，版本与 rust-toolchain.toml 一致）
+        id: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: 校验工具链 pin 生效（rustc 1.95.x）
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -V
+          case "$(rustc -V)" in
+            "rustc 1.95."*) echo "OK：rustc 与 rust-toolchain.toml 的 channel = 1.95 一致" ;;
+            *) echo "::error::rustc 版本与 rust-toolchain.toml 不符：$(rustc -V)。"; exit 1 ;;
+          esac
+      - name: 缓存 registry 与 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-linux-${{ hashFiles('**/Cargo.lock') }}-${{ steps.toolchain.outputs.cachekey }}
+          restore-keys: |
+            ${{ runner.os }}-linux-
+      # 与 Windows 腿同口径：--all-targets + --locked + warnings 即错误。
+      # aria2 核心的在线下载在 CI 里不验（真网），本腿只测假服务器路径。
+      - name: Clippy（--all-targets，warnings 即错误）
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 全量测试
+        run: cargo test --workspace --locked
+
   # Windows 侧只留一个 job：clippy → test → build 串行，共用一次 checkout / 工具链安装 / 缓存。
   # 拆成三个 job 会让每份工作重复「装工具链 + 拉缓存 + 全量编译依赖」，在 2× 计费的私有仓里不划算。
   # 代价：clippy 不过就不跑 test/build（先修上游）。
   windows:
     name: windows / x64（clippy + test + build）
     needs: [changes, preflight]
-    if: needs.changes.outputs.code == 'true'
+    # 配额受限期（2026-11-26 起）：**不再随 push / PR 启动**（26–30 计费分钟/轮 × 2×）。
+    # 只在两种时机跑：
+    #   ① 手动 dispatch（配额受限期优先用它取证，见文件头的说明）；
+    #   ② push 改到了 Linux 验证不了的路径（changes 的 winpaths=true）。
+    # tag 推送不跑（本 workflow 的 push.branches 只有 main，tag 本来也不触发；release.yml 独立出包）。
+    # 想临时强制跑：`gh workflow run ci.yml`（默认就跑这一腿）。
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && needs.changes.outputs.winpaths == 'true')
     runs-on: windows-latest
     # M2 起面板引入 egui/eframe + wgpu 整条栈（wgpu-core/naga/winit/fontique/skrifa…），
     # 首次全量编译预计 12–20 分钟（缓存命中后 3–5 分钟），原 30 分钟余量不够；
@@ -583,11 +710,14 @@ jobs:
   windows-x86:
     name: windows / x86（clippy + test + build + dumpbin）
     needs: [changes, preflight]
+    # 配额受限期（2026-11-26 起）：**定时与 push 都不再跑**（45 分钟上限 × 2× 计费）。
+    # 32 位仍有覆盖：① release.yml 的 matrix 每次发版都编 x86 并跑 dumpbin 门禁；
+    # ② 需要时手动 `gh workflow run ci.yml -f run_x86=true`。
+    # 保留「可见的跳过」：job 仍在 Actions 页面显示为 skipped，不是被悄悄删除。
     if: |
       needs.changes.outputs.code == 'true'
-      && (github.event_name == 'schedule'
-          || (github.event_name == 'workflow_dispatch' && inputs.run_x86)
-          || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')))
+      && github.event_name == 'workflow_dispatch'
+      && inputs.run_x86
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -671,7 +801,7 @@ jobs:
   gate:
     name: ci-gate
     if: always()
-    needs: [changes, meta, preflight, fmt, windows, windows-x86]
+    needs: [changes, meta, preflight, fmt, linux, windows, windows-x86]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -679,19 +809,50 @@ jobs:
         shell: bash
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json, os
           needs = json.loads(os.environ['NEEDS_JSON'])
+          event = os.environ.get('EVENT_NAME', '?')
           bad = []
+          ran, skipped = [], []
           for job, info in needs.items():
               result = (info or {}).get('result')
               print(f'{job}: {result}')
               if result not in ('success', 'skipped'):
                   bad.append(f'{job}={result}')
+              elif result == 'skipped':
+                  skipped.append(job)
+              else:
+                  ran.append(job)
           if bad:
               print('::error::存在未通过或被取消的 job：' + ', '.join(bad))
               raise SystemExit(1)
-          print('全部通过（文档改动时编译 job 为 skipped，属正常）。')
+
+          # 「CI 绿 ≠ Windows 绿」必须写在门禁自己的输出里，不能只靠提交者记得：
+          # 配额受限期 push 默认不跑 Windows 腿，Linux 绿只证明平台无关的那部分。
+          win_ran = [j for j in ('windows', 'windows-x86') if j in ran]
+          win_note = (
+              'Windows 腿已跑：' + ', '.join(win_ran)
+              if win_ran
+              else '**Windows 腿本轮未跑**（skipped）：本次绿只覆盖 Linux 能验的部分；'
+                   'Win32/Job Object/DPAPI/托盘/服务/AUMID/build.rs 资源未验证。'
+          )
+          print(win_note)
+          if not win_ran:
+              print('::warning::Windows 腿本轮 skipped（配额受限期按需启动）：CI 绿 ≠ Windows 绿。')
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as fh:
+                  fh.write('### ci-gate\n\n')
+                  fh.write(f'- 事件：`{event}`\n')
+                  fh.write(f'- 实际跑过：{", ".join(ran) or "（无）"}\n')
+                  fh.write(f'- 跳过：{", ".join(skipped) or "（无）"}\n\n')
+                  fh.write(f'> {win_note}\n\n')
+                  fh.write('> 配额受限期：Windows 腿只在 dispatch 或 push 命中 Windows 专属路径时启动，')
+                  fh.write('详见 `docs/dev/ci.md` §7（含提交前必跑的本地 Windows lint 闸门）。\n')
+          print('全部通过（文档改动/配额受限期跳过编译 job，属正常）。')
           PY

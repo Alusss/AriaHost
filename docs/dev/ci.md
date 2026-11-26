@@ -171,3 +171,67 @@ makensis /INPUTCHARSET UTF8 /DVERSION=0.0.0 /DVI_VERSION=0.0.0.0 /DARCH=x64 `
 | `--locked` 报 lock file needs update | 本地 `cargo build`（不带 `--locked`）后提交 `Cargo.lock` |
 | 缓存始终 miss | 检查是否刚改过 `Cargo.lock`/`rust-toolchain.toml`；`restore-keys` 命中时会打 `Cache restored from key` |
 | `build` 报「缺少 ariahost.exe」 | 没有 crate 用 `[[bin]] name = "ariahost"`，或产物路径随 target 变化 |
+
+---
+
+## 7. 配额受限期：Windows 腿按需启动 + 提交前本地必跑清单
+
+> 背景与实测数字见 `.github/workflows/ci.yml` 的文件头。一句话：**额度已耗尽，Windows runner 按 2× 计费，
+> 一轮完整 CI 实测 26–30 计费分钟；额度耗尽期间连 ubuntu 的 fmt job 都起不来。**
+
+### 7.1 现在谁在什么时候跑
+
+| 触发 | changes / meta / preflight / fmt | `linux`（clippy + test） | `windows` x64 | `windows-x86` |
+|---|---|---|---|---|
+| `push` 到 main（普通代码） | 跑 | **跑（1×，3–7 分钟）** | skipped | skipped |
+| `push` 命中 Windows 专属路径 | 跑 | 跑 | **跑（2×，≤45 分钟）** | skipped |
+| `pull_request` | 跑 | 跑 | skipped | skipped |
+| 手动 `gh workflow run ci.yml` | 跑 | 跑 | **跑** | 仅 `-f run_x86=true` |
+| 定时（每周一 03:17） | — | — | — | —（见下） |
+
+**Windows 专属路径**（`changes` job 的 `winpaths` 输出，任一命中就让 Windows 腿跑）：
+
+- `.github/**`（workflow 本身改了就值得跑一次真机）
+- `installer/**`（NSIS 脚本只有 Windows 的 makensis 才验得准）
+- 任何 `**/build.rs`（资源嵌入、`winresource`）
+- `crates/ariahost-svc/**`（SCM / Job Object / 服务生命周期，全是 Win32）
+
+**定时任务**：`schedule` 保留，但它只刷新 Linux 腿——Windows / x86 两条腿在配额受限期不再定时启动
+（45 分钟 × 2× 的周常开销换来的信息，敌不过额度耗尽后整轮 CI 都起不来）。32 位的常态覆盖改由
+`release.yml` 的矩阵承担：**每次发版都编 x86 并跑 dumpbin 静态 CRT 门禁**。
+
+### 7.2 「CI 绿」到底证明了什么（必须记住）
+
+`ci-gate` 会在自己的输出和 Step Summary 里显式写一行 `Windows 腿本轮未跑`，并打 `::warning::`。
+看到绿 + 这行警告时，本次绿的含义只有：
+
+- ✅ 平台无关的 Rust 代码：`clippy --all-targets -D warnings` 干净、全量单测通过
+- ❌ **未验证**：所有 Win32 调用（`windows-sys` 的签名/feature）、Job Object 孤儿守卫、DPAPI、
+  托盘 `Shell_NotifyIcon`、SCM 服务生命周期、AUMID 的 COM 虚表、`build.rs` 的图标与 VersionInfo
+
+### 7.3 提交前本地必跑（改了上面那几类路径时）
+
+没有 Windows CI 兜底时，这三件事**必须在本机跑过再提交**（本机 Rust 1.95 + MSVC 工具链已装）：
+
+```powershell
+# 1) 平台无关部分（等价于 CI 的 linux 腿）
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+
+# 2) Windows 专属代码能不能编（这一步 CI 默认不做了）
+cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+
+# 3) 改了 installer/ 就近编一次 NSI（找不到 makensis 时用 CI 或本地安装的 3.13）
+makensis /V2 /INPUTCHARSET UTF8 /DVERSION=0.1.3 /DVI_VERSION=0.1.3.0 /DARCH=x64 `
+  "/DSRCDIR=<dist\x64 绝对路径，反斜杠>" "/DOUTFILE=<输出绝对路径>" installer\ariahost.nsi
+```
+
+第 2 步是「Windows 腿按需」之后最关键的一条：它能抓出 `windows-sys` feature 漏加、API 签名变更、
+`cfg(windows)` 代码里的借用/类型错误——这些在 Linux 上**根本不参与编译**。
+
+### 7.4 要恢复「每次 push 都跑 Windows」的条件
+
+只有一条：**额度恢复**（充值 / 提额 / 换到不计费的 self-hosted runner）。恢复后把 `windows` 与
+`windows-x86` 两个 job 的 `if:` 改回 `needs.changes.outputs.code == 'true'` 即可，其余不动；
+`linux` 腿建议**保留**（它便宜，且能在 Windows 腿排队/失败时先给出信号）。
