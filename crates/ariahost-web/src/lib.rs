@@ -348,6 +348,40 @@ pub fn selftest_report() -> Result<Server, String> {
         Err(error) => check("index", false, &error.to_string()),
     }
 
+    // 1b) favicon（task-103）：两条独立的二进制资产。报字节数，方便一眼看出
+    // 「是不是把 361 KB 的多档 ICO 塞进来了」。
+    for (name, path, kind, magic) in [
+        (
+            "favicon-ico",
+            "/favicon.ico",
+            "image/x-icon",
+            &[0x00u8, 0x00, 0x01, 0x00][..],
+        ),
+        (
+            "favicon-png",
+            "/favicon-32.png",
+            "image/png",
+            &[0x89u8, 0x50, 0x4e, 0x47][..],
+        ),
+    ] {
+        match request_once(addr, "GET", path, &host, b"") {
+            Ok(response) => check(
+                name,
+                response.status == 200
+                    && response.header("content-type") == Some(kind)
+                    && response.body.starts_with(magic),
+                &format!(
+                    "status={} content-type={:?} body={}B cache-control={:?}",
+                    response.status,
+                    response.header("content-type"),
+                    response.body.len(),
+                    response.header("cache-control")
+                ),
+            ),
+            Err(error) => check(name, false, &error.to_string()),
+        }
+    }
+
     // 2) 静态资源
     for (path, expected) in [
         ("/app.js", "text/javascript; charset=utf-8"),
@@ -567,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn healthz_and_favicon_are_cheap() {
+    fn healthz_stays_cheap_and_favicon_is_really_served() {
         let (server, _upstream) = server_with_fake_upstream("s3cret");
         let host = host_of(&server);
         let health = request_once(server.addr(), "GET", "/healthz", &host, b"").expect("healthz");
@@ -576,9 +610,19 @@ mod tests {
         assert_eq!(value["status"], "ok");
         assert_eq!(value["version"], ariahost_common::VERSION);
 
+        // WEB-3（task-103）：`/favicon.ico` 过去返回 204（标签页无图标，用户反馈）。
+        // 现在必须真给字节——**不许**为了测试变绿改回 204。
         let icon = request_once(server.addr(), "GET", "/favicon.ico", &host, b"").expect("图标");
-        assert_eq!(icon.status, 204);
-        assert!(icon.body.is_empty());
+        assert_eq!(icon.status, 200);
+        assert_eq!(icon.header("content-type"), Some("image/x-icon"));
+        assert!(
+            !icon.body.is_empty(),
+            "图标体不许为空（204 的老行为已废弃）"
+        );
+        assert!(icon.body.len() <= 64 * 1024, "小尺寸图标不许超过 64 KiB");
+        // 图标给浏览器缓存：不是 no-store（那是数据接口的口径）。
+        let cache = icon.header("cache-control").unwrap_or_default();
+        assert!(cache.contains("max-age"), "图标应可缓存，实际：{cache}");
     }
 
     #[test]

@@ -1,16 +1,29 @@
-//! 内嵌静态资源（`include_str!`，零构建、零额外依赖）。
+//! 内嵌静态资源（`include_str!` / `include_bytes!`，零构建、零额外依赖）。
 //!
-//! 为什么不用 `include_dir`：一共三个文件、八个路由，手写一张 `match` 表就够；
+//! 为什么不用 `include_dir`：一共五个文件、十条路由，手写一张 `match` 表就够；
 //! 多一个宏 crate 只是多一份构建时间和供应链面。
 
 /// 一个内嵌资源。
 #[derive(Debug, Clone, Copy)]
 pub struct Asset {
-    /// 文件内容（UTF-8）。
-    pub body: &'static str,
+    /// 文件内容**原字节**（文本资源也是字节；`include_str!` 保证 UTF-8）。
+    ///
+    /// 为什么不是 `&'static str`：favicon 是二进制，塞不进 `str`。统一成字节后
+    /// 静态资产只有一条路径（同一套 Host 校验与安全头），不新开一套二进制分支。
+    pub body: &'static [u8],
     /// `Content-Type`。
     pub content_type: &'static str,
+    /// `Cache-Control` 取值。
+    ///
+    /// 页面 / 脚本 / 样式走 `no-store`：它们随版本变，缓存住会看到旧界面；
+    /// favicon 是「一年改一次」的静态小图，给长缓存免掉每次刷新的请求。
+    pub cache_control: &'static str,
 }
+
+/// 页面类资源：不缓存。
+const NO_STORE: &str = "no-store";
+/// 图标类资源：7 天 + `immutable`（浏览器连条件请求都省掉）。
+const ICON_CACHE: &str = "public, max-age=604800, immutable";
 
 /// 首页。
 pub const INDEX: &str = include_str!("../assets/index.html");
@@ -18,21 +31,43 @@ pub const INDEX: &str = include_str!("../assets/index.html");
 pub const APP_JS: &str = include_str!("../assets/app.js");
 /// 样式表。
 pub const STYLE_CSS: &str = include_str!("../assets/style.css");
+/// 标签页图标（ICO 单文件，**只含 16×16 与 32×32 两档**，约 2.9 KB）。
+///
+/// 源是 `installer/ariahost.ico`（361 KB 多档），生成方式见
+/// `.scratch/web3/make_favicon.py`；生成一次提交二进制，CI 不引绘图工具链。
+pub const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+/// 标签页图标（32×32 PNG，约 2 KB；现代浏览器首选这一张）。
+pub const FAVICON_PNG: &[u8] = include_bytes!("../assets/favicon-32.png");
 
 /// 路径 → 资源。`/` 与 `/index.html` 等价；其余要精确匹配。
 pub fn lookup(path: &str) -> Option<Asset> {
     match path {
         "/" | "/index.html" => Some(Asset {
-            body: INDEX,
+            body: INDEX.as_bytes(),
             content_type: "text/html; charset=utf-8",
+            cache_control: NO_STORE,
         }),
         "/app.js" => Some(Asset {
-            body: APP_JS,
+            body: APP_JS.as_bytes(),
             content_type: "text/javascript; charset=utf-8",
+            cache_control: NO_STORE,
         }),
         "/style.css" => Some(Asset {
-            body: STYLE_CSS,
+            body: STYLE_CSS.as_bytes(),
             content_type: "text/css; charset=utf-8",
+            cache_control: NO_STORE,
+        }),
+        // task-103：标签页图标。走**同一条**静态资产路径（同样的 Host 校验 /
+        // GET·HEAD 白名单 / CSP 与 nosniff），只是 Content-Type 与缓存策略不同。
+        "/favicon.ico" => Some(Asset {
+            body: FAVICON_ICO,
+            content_type: "image/x-icon",
+            cache_control: ICON_CACHE,
+        }),
+        "/favicon-32.png" => Some(Asset {
+            body: FAVICON_PNG,
+            content_type: "image/png",
+            cache_control: ICON_CACHE,
         }),
         _ => None,
     }
@@ -456,6 +491,61 @@ mod tests {
         assert!(
             !body_block.contains("overflow-x"),
             "body 不许设 overflow-x，横向滚动只该出现在 .table-wrap：{body_block}"
+        );
+    }
+
+    /// task-103：favicon 是**二进制**静态资产，与页面/脚本走同一条路径但类型与缓存不同。
+    ///
+    /// 钉四件事：MIME、文件头魔数、体积上界（别把 361 KB 的多档 ICO 塞进来）、
+    /// 以及「ICO 里真的只有 16 与 32 两档」——否则浏览器标签上的图标要么发虚，要么白下载。
+    #[test]
+    fn favicons_are_small_binary_assets_with_the_right_magic() {
+        let ico = lookup("/favicon.ico").expect("缺 /favicon.ico");
+        assert_eq!(ico.content_type, "image/x-icon");
+        assert_eq!(
+            ico.cache_control, ICON_CACHE,
+            "图标必须长缓存（每次刷新都重下没有意义）"
+        );
+        // ICONDIR：reserved=0, type=1(icon), count=2
+        assert_eq!(&ico.body[..4], &[0x00, 0x00, 0x01, 0x00], "ICO 头魔数不对");
+        let count = u16::from_le_bytes([ico.body[4], ico.body[5]]);
+        assert_eq!(count, 2, "ICO 只该有 16 与 32 两档，实际 {count} 档");
+        // ICONDIRENTRY 每项 16 字节，第 1 字节是宽（0 表示 256）。
+        let mut widths: Vec<u8> = (0..count as usize)
+            .map(|index| ico.body[6 + index * 16])
+            .collect();
+        widths.sort_unstable();
+        assert_eq!(widths, vec![16, 32], "ICO 档位必须是 16 与 32");
+        assert!(
+            (1024..10 * 1024).contains(&ico.body.len()),
+            "favicon.ico 体积应落在 1–10 KB，实际 {} B",
+            ico.body.len()
+        );
+
+        let png = lookup("/favicon-32.png").expect("缺 /favicon-32.png");
+        assert_eq!(png.content_type, "image/png");
+        assert_eq!(png.cache_control, ICON_CACHE);
+        assert_eq!(&png.body[..4], b"\x89PNG", "PNG 头魔数不对");
+        assert!(
+            (1024..5 * 1024).contains(&png.body.len()),
+            "favicon-32.png 体积应落在 1–5 KB，实际 {} B",
+            png.body.len()
+        );
+    }
+
+    /// 顺序与回退：先 ico（老浏览器）后 png（新浏览器），且都在样式表之前声明。
+    #[test]
+    fn index_links_both_favicons_before_the_stylesheet() {
+        let ico = INDEX.find(r#"href="/favicon.ico""#).expect("首页没引 ico");
+        let png = INDEX
+            .find(r#"href="/favicon-32.png""#)
+            .expect("首页没引 png");
+        let css = INDEX.find(r#"href="/style.css""#).expect("首页没引样式表");
+        assert!(ico < png, "先 ico 后 png：老浏览器取第一张能用的");
+        assert!(png < css, "图标声明放在样式表之前");
+        assert!(
+            INDEX.contains(r#"rel="icon""#),
+            "link 必须带 rel=\"icon\"，否则浏览器不认"
         );
     }
 }

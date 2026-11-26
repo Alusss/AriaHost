@@ -166,18 +166,33 @@ pub struct Response {
     pub status: u16,
     /// `Content-Type`（`204` 时为空串）。
     pub content_type: &'static str,
-    /// 响应体。
+    /// 响应体**原字节**（文本与二进制走同一条路，见 `assets::Asset::body`）。
     pub body: Vec<u8>,
+    /// `Cache-Control` 取值。
+    ///
+    /// 默认 `no-store`：页面 / 脚本 / 样式随版本变，缓存住会看到旧界面。
+    /// 图标这类「一年改一次」的静态小图用 [`Self::with_cache_control`] 放宽。
+    pub cache_control: &'static str,
 }
 
 impl Response {
-    /// 用给定的状态与类型造响应。
+    /// 用给定的状态与类型造响应（缓存策略默认 `no-store`）。
     pub fn new(status: u16, content_type: &'static str, body: impl Into<Vec<u8>>) -> Self {
         Self {
             status,
             content_type,
             body: body.into(),
+            cache_control: "no-store",
         }
+    }
+
+    /// 改缓存策略（favicon 用长缓存；其余保持默认）。
+    ///
+    /// 单独一个构造器而不是加到 [`Self::new`] 的签名里：调用点绝大多数走默认，
+    /// 多一个必填参数只会让 15 处 `Response::new` 各多传一个 `"no-store"`。
+    pub fn with_cache_control(mut self, value: &'static str) -> Self {
+        self.cache_control = value;
+        self
     }
 
     /// `text/html; charset=utf-8`。
@@ -217,11 +232,6 @@ impl Response {
         )
     }
 
-    /// `204 No Content`（`/favicon.ico`：省掉浏览器控制台的 404 噪音）。
-    pub fn no_content() -> Self {
-        Self::new(204, "", Vec::new())
-    }
-
     /// 状态码对应的原因短语。
     pub const fn reason(&self) -> &'static str {
         match self.status {
@@ -254,7 +264,7 @@ impl Response {
         head.push_str("Content-Security-Policy: default-src 'self'\r\n");
         head.push_str("X-Content-Type-Options: nosniff\r\n");
         head.push_str("Referrer-Policy: no-referrer\r\n");
-        head.push_str("Cache-Control: no-store\r\n");
+        head.push_str(&format!("Cache-Control: {}\r\n", self.cache_control));
         head.push_str("Connection: close\r\n");
         head.push_str("\r\n");
         stream.write_all(head.as_bytes())?;

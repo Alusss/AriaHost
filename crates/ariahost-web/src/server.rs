@@ -139,11 +139,11 @@ fn route(request: &Request, context: &Context) -> Response {
                 });
                 return Response::json(body.to_string());
             }
-            if request.path == "/favicon.ico" {
-                return Response::no_content();
-            }
+            // 包含 `/favicon.ico` 与 `/favicon-32.png`：图标不再走「204 空响应」
+            // 的旧分支，而是和页面/脚本/样式**同一条**静态资产路径（task-103）。
             match assets::lookup(&request.path) {
-                Some(asset) => Response::new(200, asset.content_type, asset.body),
+                Some(asset) => Response::new(200, asset.content_type, asset.body)
+                    .with_cache_control(asset.cache_control),
                 None => Response::not_found(),
             }
         }
