@@ -489,7 +489,7 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace
         .clone();
     println!(
         "SELFTEST adapter={} atlas={}x{} atlas_cap={} surface={}x{} window={}x{} backend={} \
-         frames={} rows={} ok={} wgpu_errors={} private_kb={}",
+         frames={} rows={} ok={} wgpu_errors={} private_kb={} lat={} zh={} fb={}",
         sanitize(&facts.adapter),
         facts.atlas_size[0],
         facts.atlas_size[1],
@@ -504,6 +504,9 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace
         u8::from(facts.ok),
         facts.wgpu_errors,
         facts.private_kb,
+        or_miss(&facts.font_lat),
+        or_miss(&facts.font_zh),
+        or_miss(&facts.font_fallback),
     );
     // 后端选择轨迹：`vulkan:no_adapter>dx12:ready` 这类。现场说「内存高」时，
     // 第一件事就是要知道到底落在哪个后端、以及为什么不是首选的那个。
@@ -527,6 +530,18 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace
 /// 让 `SELFTEST` 行保持「`key=value` 以空白分隔」可解析：值里的空白换成 `_`。
 fn sanitize(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join("_")
+}
+
+/// 字体链字段的取值口径：**没命中就写 `miss`**，不留空值。
+///
+/// 空值在自测行里既可能是「这一档没命中」也可能是「忘了填」，两者必须能区分开，
+/// 否则「中文落到谁」这个问题又回到靠人眼看屏幕。
+fn or_miss(value: &str) -> String {
+    if value.trim().is_empty() {
+        "miss".to_owned()
+    } else {
+        sanitize(value)
+    }
 }
 
 /// 启动模式的中文描述（写进日志）。
@@ -776,6 +791,17 @@ mod tests {
         );
         assert_eq!(sanitize("  多  空白  "), "多_空白");
         assert_eq!(sanitize(""), "");
+    }
+
+    /// task-85 验收第 3 条：字体链必须有运行期可读的证据，且「没命中」要能区分出来。
+    #[test]
+    fn font_fields_write_miss_instead_of_empty() {
+        // 三档都没命中 → 三个 miss，而不是三个空值（空值分不清「没命中」与「忘了填」）。
+        assert_eq!(or_miss(""), "miss");
+        assert_eq!(or_miss("   "), "miss");
+        // 命中时原样给族名，空白按自测行的分隔规则替换。
+        assert_eq!(or_miss("Microsoft YaHei UI"), "Microsoft_YaHei_UI");
+        assert_eq!(or_miss("Segoe UI"), "Segoe_UI");
     }
 
     #[test]

@@ -121,6 +121,18 @@ pub struct RuntimeFacts {
     pub tray: Option<String>,
     /// 点 X 的实际动作（`hide` / `quit` / `ask` / `ask(tray-blocked)`）。
     pub close_plan: Option<String>,
+    /// 逐字形链里**第一个给出拉丁字形**的族名（空串 = 没命中，自测行里写 `miss`）。
+    pub font_lat: String,
+    /// 逐字形链里**第一个给出汉字字形**的族名（空串 = 没命中）。
+    ///
+    /// 为什么要在自测行里给这两个名字：用户报「中文显示怪 / 有方框」时，
+    /// 第一句要问清的是「汉字到底落到哪一族」，而不是「有没有装中文字体」。
+    pub font_zh: String,
+    /// 最终注册给 egui 的字体答案（`FontState::resolved`；空串 = 没拿到）。
+    ///
+    /// 当 `zh=miss` 时，这里就是 fontique 的兜底选择——两条信息一起才说明
+    /// 「是链命中还是兜底命中」。
+    pub font_fallback: String,
 }
 
 /// 内联错误条（面板内的一条，不弹窗）。
@@ -453,7 +465,7 @@ impl PanelApp {
             }
         ));
         // 逐字形链的实际命中情况：报障时第一句要能看出「这台机器上到底用了哪个字体」。
-        log.push(format!("中文字体链：{}", font.chain_summary()));
+        log.push(format!("中文字体：{}", font.supply_summary()));
         log.push(format!(
             "图集上限 {atlas_cap} px 将通过 RawInput.max_texture_side 每帧写回（EG-7 解耦）"
         ));
@@ -461,6 +473,11 @@ impl PanelApp {
         let wgpu_errors = Arc::new(AtomicU64::new(0));
         let mut runtime = RuntimeFacts {
             font_resolved: font.resolved.clone(),
+            // 逐字形链的落点（task-86 判据 1）：拉丁与汉字分开记，谁没命中就留空，
+            // 由 `report()` 统一写成 `miss`——不在这里编「默认字体」这种话。
+            font_lat: font.latin_supplier().unwrap_or_default().to_owned(),
+            font_zh: font.han_supplier().unwrap_or_default().to_owned(),
+            font_fallback: font.resolved.clone().unwrap_or_default(),
             atlas_side: atlas_cap,
             ..RuntimeFacts::default()
         };
@@ -3209,7 +3226,7 @@ impl PanelApp {
                 // 逐字形族链（ui-spec-v2 §2）：用户报「某个汉字是方框」时，第一句要能问清
                 // 是链上哪一级命中的。所以与「中文字体」并列显示，而不是只写启动日志。
                 ui.label("字体族链");
-                ui.label(RichText::new(self.font_state.chain_summary()).small());
+                ui.label(RichText::new(self.font_state.supply_summary()).small());
                 ui.end_row();
 
                 ui.label("单实例锁");
