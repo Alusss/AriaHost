@@ -195,6 +195,23 @@ pub struct Supply {
     pub mono: Option<String>,
 }
 
+/// 一次「字体面注入」的记账（`fonts_line()` 里 `inject=` 的唯一数据源）。
+///
+/// 为什么要记字节数：只报「注入了几面」读不出「真接线还是空壳」，也读不出
+/// 「预算吃了多少」。用户报「粗体没生效」时，第一句要能问的是
+/// 「哪个面真读进来了、多少字节」——那才是可核对的机器事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectRecord {
+    /// 角色：`拉丁` / `汉字` / `拉丁粗` / `汉字粗`。
+    pub role: &'static str,
+    /// 字体文件里登记的内部族名（**不是**我们请求的名字）。
+    pub family: String,
+    /// 真正读进来的字体文件名。
+    pub file: String,
+    /// 实际读入字节数。
+    pub bytes: u64,
+}
+
 /// 字体注册结果，面板信息区显示「字体是否来自系统」「实际供应族」「注入成功哪些面」。
 #[derive(Debug, Clone, Default)]
 pub struct FontState {
@@ -202,8 +219,12 @@ pub struct FontState {
     pub resolved: Option<String>,
     /// 三类字形的实际供应族。
     pub supply: Supply,
-    /// 注入成功的面：`角色=族名←文件名`（按注入顺序，供排障逐条核对）。
-    pub injected: Vec<String>,
+    /// 注入成功的面（按注入顺序）。
+    pub injected: Vec<InjectRecord>,
+    /// 注入被跳过/失败的原因（`角色:原因`），一条一因，不许吞。
+    pub inject_skipped: Vec<String>,
+    /// 本次注入读入的总字节数（`budget=` 的分子）。
+    pub inject_used: u64,
     /// 真粗体族是否真的可用（拉丁粗或汉字粗至少一面注入成功）。
     pub bold_ready: bool,
 }
@@ -223,22 +244,50 @@ impl FontState {
         )
     }
 
-    /// `--panel-selftest` 用的机器可读字体事实（判据：`FONTS latin=<名>|han=<名>|mono=<名>`）。
+    /// `--panel-selftest` 用的机器可读字体事实（判据：`fonts=latin=…|han=…`）。
     ///
-    /// 值是**系统给的族名**（`None` 写 `miss`），绝不回填我们请求的声明名；
-    /// `bold` 是「真粗体族是否可用」，`inject` 是注入成功的面数。
+    /// 口径——四个「谁给的」必须能分开读，不许混成一个名字：
+    /// - `latin=`：拉丁探测字 `A` 的**实际**供应族（系统 provider 返回的名字）；
+    /// - `han=`：汉字探测字 `直` 的**实际**供应族，也就是「中文用的是谁」；
+    /// - `mono=`：`Monospace` 泛族的落点（「等宽用的是谁」）；
+    /// - `resolved=`：预热查询的整串（`system:` 前缀 = 系统 provider 给的），
+    ///   与 selftest 顶层的 `fb=` **同值**——保留两处只为让 `fonts=` 单段可解析；
+    /// - `bold=`：真粗体族（`AriaBold`）是否可用（`yes`/`no`，省略会让判据没法读）；
+    /// - `inject=`：注入成功的面，`族名:字节` 多条以 `;` 分隔，无则 `miss`；
+    /// - `budget=`：`已注入字节/单文件预算上限`（字节，EG-4 口径）；
+    /// - `inject_skip=`：跳过/失败原因（`角色:原因`，多条 `;` 分隔），无则 `none`。
+    ///
+    /// 值里绝不回填我们请求的声明名；未命中一律写 `miss`。
     pub fn fonts_line(&self) -> String {
         let show = |value: &Option<String>| match value {
             Some(name) => name.clone(),
             None => "miss".to_owned(),
         };
+        let inject = if self.injected.is_empty() {
+            "miss".to_owned()
+        } else {
+            self.injected
+                .iter()
+                .map(|record| format!("{}:{}", record.family, record.bytes))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        let inject_skip = if self.inject_skipped.is_empty() {
+            "none".to_owned()
+        } else {
+            self.inject_skipped.join(";")
+        };
         format!(
-            "latin={}|han={}|mono={}|bold={}|inject={}",
+            "latin={}|han={}|mono={}|resolved={}|bold={}|inject={}|budget={}/{}|inject_skip={}",
             show(&self.supply.latin),
             show(&self.supply.han),
             show(&self.supply.mono),
+            show(&self.resolved),
             if self.bold_ready { "yes" } else { "no" },
-            self.injected.len()
+            inject,
+            self.inject_used,
+            INJECT_BUDGET,
+            inject_skip
         )
     }
 
@@ -272,11 +321,13 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     log.push(format!("字体实际供应{}", supply_line(&supply)));
 
     // 1) 常规面：拉丁 + 汉字（链上第一个**有文件**的档注入 Highest，真接线）。
-    let mut injected: Vec<String> = Vec::new();
+    let mut injected: Vec<InjectRecord> = Vec::new();
+    let mut inject_skipped: Vec<String> = Vec::new();
     inject_first(
         ctx,
         log,
         &mut injected,
+        &mut inject_skipped,
         "拉丁",
         &LATIN_REGULAR,
         &FontFamily::Proportional,
@@ -285,6 +336,7 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
         ctx,
         log,
         &mut injected,
+        &mut inject_skipped,
         "汉字",
         &HAN_REGULAR,
         &FontFamily::Proportional,
@@ -292,9 +344,27 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
 
     // 2) 真粗体：注册进命名族 `AriaBold`，`theme::bold()` 直接用。
     let bold_family = FontFamily::Name(Arc::from(BOLD_FAMILY));
-    let latin_bold = inject_first(ctx, log, &mut injected, "拉丁粗", &LATIN_BOLD, &bold_family);
-    let han_bold = inject_first(ctx, log, &mut injected, "汉字粗", &HAN_BOLD, &bold_family);
+    let latin_bold = inject_first(
+        ctx,
+        log,
+        &mut injected,
+        &mut inject_skipped,
+        "拉丁粗",
+        &LATIN_BOLD,
+        &bold_family,
+    );
+    let han_bold = inject_first(
+        ctx,
+        log,
+        &mut injected,
+        &mut inject_skipped,
+        "汉字粗",
+        &HAN_BOLD,
+        &bold_family,
+    );
     let bold_ready = latin_bold || han_bold;
+    // 预算分子只算**真读进来**的字节（跳过的不算），所以它和 `inject=` 的明细自洽。
+    let inject_used: u64 = injected.iter().map(|record| record.bytes).sum();
 
     // 3) 链的落点：注入命中就写「注入」，没文件就写「系统 provider」——两件事不许混为一谈。
     log.push(format!(
@@ -336,6 +406,8 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
         resolved,
         supply,
         injected,
+        inject_skipped,
+        inject_used,
         bold_ready,
     };
     // 落点只经由 `latin_supplier`/`han_supplier` 这两条**同一个判据**输出：日志与面板
@@ -344,6 +416,20 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
         "字体落点：拉丁→{}；汉字→{}",
         state.latin_supplier().unwrap_or("（未解析）"),
         state.han_supplier().unwrap_or("（未解析）"),
+    ));
+    // 注入账：字节数与跳过原因都落盘——用户报「粗体没生效 / 中文发虚」时，
+    // 第一句能照抄的就是这一行（与 `--panel-selftest` 的 `inject=` / `inject_skip=` 同源）。
+    log.push(format!(
+        "字体注入账：成功 {} 面 / {} B（单文件预算 {} MB）；跳过/失败 {} 条{}",
+        state.injected.len(),
+        state.inject_used,
+        INJECT_BUDGET / (1024 * 1024),
+        state.inject_skipped.len(),
+        if state.inject_skipped.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", state.inject_skipped.join("；"))
+        },
     ));
     state
 }
@@ -359,12 +445,15 @@ const fn hit_word(injected: bool) -> &'static str {
 
 /// 按表逐个找文件，**第一个存在的**读进来注入目标族；返回是否注入成功。
 ///
-/// 失败不是错误：没有文件就交给系统 provider（脚本回退），但要在日志里说清是哪一档。
+/// 失败不是错误：没有文件就交给系统 provider（脚本回退），但要在日志里说清是哪一档，
+/// 并把原因记进 `skipped`——`--panel-selftest` 的 `inject_skip=` 就是这份账，
+/// 它让「粗体没生效」这类报障不必靠猜（是没文件、还是超了 EG-4 预算）。
 fn inject_first(
     ctx: &egui::Context,
     log: &LogBuffer,
-    injected: &mut Vec<String>,
-    role: &str,
+    injected: &mut Vec<InjectRecord>,
+    skipped: &mut Vec<String>,
+    role: &'static str,
     faces: &[Face],
     into: &FontFamily,
 ) -> bool {
@@ -380,11 +469,17 @@ fn inject_first(
                     meta.len() / (1024 * 1024),
                     INJECT_BUDGET / (1024 * 1024),
                 ));
+                skipped.push(format!(
+                    "{role}:超预算({}MB>{}MB)",
+                    meta.len() / (1024 * 1024),
+                    INJECT_BUDGET / (1024 * 1024),
+                ));
                 continue;
             }
             Ok(_) => {}
             Err(error) => {
                 log.push(format!("{role}面读取失败：{}（{error}）", path.display()));
+                skipped.push(format!("{role}:元数据失败({error})"));
                 continue;
             }
         }
@@ -392,9 +487,11 @@ fn inject_first(
             Ok(bytes) => bytes,
             Err(error) => {
                 log.push(format!("{role}面读取失败：{}（{error}）", path.display()));
+                skipped.push(format!("{role}:读取失败({error})"));
                 continue;
             }
         };
+        let len = bytes.len() as u64;
         let mut data = FontData::from_owned(bytes);
         data.index = face.index;
         // 名字只在本进程内当索引用（egui 会把字体按名字登记），带上字重角色便于日志辨认。
@@ -407,13 +504,26 @@ fn inject_first(
                 priority: FontPriority::Highest,
             }],
         ));
-        injected.push(format!("{role}={}←{}", face.family, face.file));
+        injected.push(InjectRecord {
+            role,
+            family: face.family.to_owned(),
+            file: face.file.to_owned(),
+            bytes: len,
+        });
         log.push(format!(
-            "{role}面已注入（真接线）：{} ← {}（face {}）",
+            "{role}面已注入（真接线）：{} ← {}（face {}，{len} B）",
             face.file, face.family, face.index
         ));
         return true;
     }
+    skipped.push(format!(
+        "{role}:候选文件都不存在({})",
+        faces
+            .iter()
+            .map(|face| face.file)
+            .collect::<Vec<_>>()
+            .join("/")
+    ));
     log.push(format!(
         "{role}面未注入：链上候选 {} 在本机字体目录都不存在",
         faces
@@ -592,8 +702,8 @@ mod tests {
                 han: Some("system:Microsoft YaHei:400:0".to_owned()),
                 mono: None,
             },
-            injected: Vec::new(),
-            bold_ready: false,
+            inject_used: 0,
+            ..FontState::default()
         };
         let text = state.supply_summary();
         assert!(text.contains("汉字=system:Microsoft YaHei:400:0"), "{text}");
@@ -614,7 +724,14 @@ mod tests {
                 han: Some("system:Microsoft YaHei:400:0".to_owned()),
                 mono: None,
             },
-            injected: vec!["拉丁粗=Segoe UI←segoeuib.ttf".to_owned()],
+            injected: vec![InjectRecord {
+                role: "拉丁粗",
+                family: "Segoe UI".to_owned(),
+                file: "segoeuib.ttf".to_owned(),
+                bytes: 947_092,
+            }],
+            inject_skipped: vec!["汉字:Word 装的是 .ttc，按设计跳过".to_owned()],
+            inject_used: 947_092,
             bold_ready: true,
         };
         let line = state.fonts_line();
@@ -625,9 +742,16 @@ mod tests {
         assert!(line.contains("|han=system:Microsoft YaHei"), "{line}");
         assert!(line.contains("|mono=miss"), "{line}");
         assert!(line.contains("|bold=yes"), "{line}");
-        assert!(line.contains("|inject=1"), "{line}");
+        // 注入必须同时给出「哪个族、多少字节」，只报面数读不出真接线。
+        assert!(line.contains("|inject=Segoe UI:947092"), "{line}");
+        assert!(line.contains("|budget=947092/"), "{line}");
+        assert!(line.contains("|inject_skip=汉字:"), "{line}");
         // 无粗体时必须写 no，不许省略这个字段（省略会让判据没法读）。
         assert!(FontState::default().fonts_line().contains("|bold=no"));
+        assert!(FontState::default().fonts_line().contains("|inject=miss"));
+        assert!(FontState::default()
+            .fonts_line()
+            .contains("|inject_skip=none"));
     }
 
     #[test]
