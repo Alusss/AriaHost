@@ -534,6 +534,28 @@ mod tests {
             expected.display().to_string(),
             "默认下载目录必须与 NSI 的 EnsureUserConfig 一致（<用户主目录>\\Downloads）"
         );
+        // 更强的一层：走**服务侧那条链**（`load_for_service_from`）把刚建的文件读回来。
+        // 写进注册表后，服务启动时正是按第 1 级（Parameters\ConfigPath）命中这份文件。
+        let chain = ariahost_common::config::load_for_service_from(
+            &ariahost_common::config::ServiceConfigCandidates {
+                service_parameter: Some(config.display().to_string()),
+                machine_wide: None,
+            },
+        );
+        assert_eq!(
+            chain.config.dl.dir,
+            expected.display().to_string(),
+            "服务侧必须在第 1 级就读到自建的那份配置：{:?}",
+            chain.notes
+        );
+        assert!(
+            matches!(
+                chain.source,
+                ariahost_common::config::ServiceConfigSource::ServiceParameter(_)
+            ),
+            "自建配置必须作为第 1 级命中，实际：{:?}",
+            chain.source
+        );
         // 必须是字面量字符串形态（单引号）：TOML 基本字符串里 `\U` 是非法转义。
         let text = std::fs::read_to_string(&config).expect("读回");
         assert!(
