@@ -27,6 +27,11 @@ pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# task-106：图集容量探针要捕获 epaint 自己的溢出告警（`texture_atlas.rs` 的
+# `log::warn!("epaint texture atlas overflowed!")`）。`log` 早就在依赖树里（eframe 带入），
+# 这里只是让 ui 能直接用它，不新增任何 crate。
+log = "0.4"
+
 [target.'cfg(windows)'.dependencies]
 # M2-3：托盘图标（只 Windows 目标；Linux 侧 WSL 的 cargo check 不进这条分支）。
 tray-icon.workspace = true

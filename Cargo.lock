@@ -282,6 +282,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_system_font_provider",
+ "log",
  "pollster",
  "serde",
  "serde_json",

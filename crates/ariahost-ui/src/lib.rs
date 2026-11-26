@@ -16,6 +16,10 @@
 //! （`.github/workflows/ci.yml` 的 windows job），不要以本地 `cargo build` 为据。
 
 mod app;
+// 图集容量探针（task-106）：`--atlas-probe` 的实现，对外公开是因为 bin 的 CLI 要调它；
+// 数据表保持私有（它只是探针的输入，不是 API）。
+pub mod atlas_probe;
+mod atlas_probe_data;
 mod backend;
 // 核心状态的单一解释器（task-81）：服务 / 面板托管 / 端口三方事实只在这里合并，
 // 渲染层只读结论。`pub mod` 的理由同 `theme`：它是被 app 与测试共用的词汇。
@@ -254,6 +258,15 @@ pub fn run_selftest(
     drive: Option<String>,
 ) -> i32 {
     run(Some(frames), size, backend, seed_rows, None, drive)
+}
+
+/// `--atlas-probe [--chars N[,N...]]`：汉字字形图集容量探针（隐藏入口，不进 `--help`）。
+///
+/// 与 `--panel-selftest` 的区别：**不开窗、不要 wgpu**。`Context::run_ui` 排版、
+/// `Context::tessellate` 触发光栅化，所以 CI（ubuntu）与无显卡机器都能跑；
+/// 数字只与「这台机器的字体链 + 图集上限」有关。字段口径见 [`atlas_probe`] 模块文档。
+pub fn run_atlas_probe(chars: Option<&[usize]>) -> i32 {
+    crate::atlas_probe::run(chars)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。

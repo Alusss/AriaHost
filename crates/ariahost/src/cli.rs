@@ -65,6 +65,14 @@ pub enum Command {
         /// 场景名（目前只有 `settings`）。
         scenario: String,
     },
+    /// `--atlas-probe [--chars N[,N...]]`：汉字字形图集容量探针（隐藏入口，不进 `--help`）。
+    ///
+    /// 不开窗、不要 wgpu：`Context::run_ui` 排版 + `Context::tessellate` 触发光栅化，
+    /// 因此 CI 与用户机器都能跑；字段口径见 `ariahost_ui::atlas_probe` 模块文档。
+    AtlasProbe {
+        /// 要测的字数阶梯；`None` = 默认阶梯（500 → 3755）。
+        chars: Option<Vec<usize>>,
+    },
     /// `--web-selftest`：隐藏自检入口，跑一遍网页管理页的端到端自检（不出现在 `--help`）。
     WebSelftest,
     /// `--service`：ServiceHost。
@@ -219,6 +227,28 @@ impl QuitOutcome {
     }
 }
 
+/// `--atlas-probe --chars` 的取值：逗号分隔的字数，每项 1..=[`ariahost_ui::atlas_probe::MAX_ATLAS_CHARS`]。
+fn parse_atlas_chars(value: &str) -> Result<Vec<usize>, UsageError> {
+    let mut out = Vec::new();
+    for item in value.split(',') {
+        let text = item.trim();
+        if text.is_empty() {
+            return Err(UsageError::new("--chars 里有空项"));
+        }
+        let count: usize = text
+            .parse()
+            .map_err(|_| UsageError::new(format!("--chars 需要正整数：{text}")))?;
+        if count == 0 || count > ariahost_ui::atlas_probe::MAX_ATLAS_CHARS {
+            return Err(UsageError::new(format!(
+                "--chars 取值越界（1..={}）：{count}",
+                ariahost_ui::atlas_probe::MAX_ATLAS_CHARS
+            )));
+        }
+        out.push(count);
+    }
+    Ok(out)
+}
+
 /// 解析参数（不含程序名）。
 ///
 /// 严格模式：已识别的子命令不接受额外参数；未知参数一律 [`ErrorCode::Usage`]。
@@ -232,6 +262,33 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
 
     if first == "--panel-selftest" {
         return parse_selftest(rest);
+    }
+
+    // 图集容量探针（task-106）：隐藏入口，不出现在 `--help`。
+    // 它不开窗、不读配置、不碰 SCM，只量「这台机器的字体链 + 图集上限」。
+    if first == "--atlas-probe" {
+        let mut chars: Option<Vec<usize>> = None;
+        let mut index = 0;
+        while index < rest.len() {
+            match rest[index].as_str() {
+                "--chars" => {
+                    let value = rest
+                        .get(index + 1)
+                        .ok_or_else(|| UsageError::new("--chars 缺少取值"))?;
+                    if chars.is_some() {
+                        return Err(UsageError::new("--chars 重复"));
+                    }
+                    chars = Some(parse_atlas_chars(value)?);
+                    index += 2;
+                }
+                other => {
+                    return Err(UsageError::new(format!(
+                        "--atlas-probe 不认识的参数：{other}"
+                    )));
+                }
+            }
+        }
+        return Ok(Command::AtlasProbe { chars });
     }
 
     // 面板的 `--backend`：只影响渲染后端，不影响任何退出码。
@@ -627,6 +684,7 @@ fn execute(command: &Command) -> i32 {
             backend,
             seed_rows,
         } => ariahost_ui::run_selftest(*frames, *size, *backend, *seed_rows, None),
+        Command::AtlasProbe { chars } => ariahost_ui::run_atlas_probe(chars.as_deref()),
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {
