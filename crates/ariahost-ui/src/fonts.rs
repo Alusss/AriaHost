@@ -65,6 +65,16 @@ pub const INJECT_BUDGET: u64 = 17 * 1024 * 1024;
 /// 拉丁链（声明顺序，UI-5 §2.1）：`Inter` 打头，系统 `Segoe UI` 兜底。
 pub const LATIN_CHAIN: [&str; 2] = ["Inter", "Segoe UI"];
 
+/// 随包字体目录名（相对 exe 所在目录）。
+///
+/// 安装器把 `Inter-Regular.ttf` / `Inter-SemiBold.ttf` 装进 `$INSTDIR\fonts\`
+/// （`installer\ariahost.nsi` 的 SEC_MAIN），本模块把它排在字体目录候选的**第一位**。
+/// 为什么不是「装进系统字体」：写 `%WINDIR%\Fonts` 要管理员 + 重启字体缓存，
+/// 卸载还得回滚；而 exe 旁的目录由安装器自己的 File 指令负责，卸载跟着 RMDir 走，
+/// 生命周期和程序本体一致。代价是 `cargo run` 的 dev 跑法读不到（没有安装目录），
+/// 那种情况按既有逻辑回落到系统字体——不是错误，但 `inject_skip=` 会写明原因。
+pub const BUNDLED_FONT_SUBDIR: &str = "fonts";
+
 /// 汉字链（声明顺序）：`Source Han Sans SC`（思源黑体）打头，`Microsoft YaHei UI` 兜底。
 ///
 /// 为什么不写 `Noto Sans CJK SC`：思源黑体与 Noto Sans CJK 是同一套字形的两个发行名，
@@ -539,7 +549,7 @@ fn inject_first(
     false
 }
 
-/// 在「用户级字体目录」与「系统字体目录」里找文件（Windows 两处都可能有）。
+/// 按 [`font_dirs`] 的顺序找文件：**exe 旁 `fonts\`（随包 Inter）→ 用户级字体目录 → 系统字体目录**。
 fn find_font_file(file: &str) -> Option<PathBuf> {
     for dir in font_dirs() {
         let candidate = dir.join(file);
@@ -550,9 +560,25 @@ fn find_font_file(file: &str) -> Option<PathBuf> {
     None
 }
 
-/// 字体目录候选（用户安装的字体在 `%LOCALAPPDATA%`，系统字体在 `%WINDIR%\Fonts`）。
+/// 字体目录候选，**顺序即优先级**（见 [`font_dirs_with`]）。
 fn font_dirs() -> Vec<PathBuf> {
+    font_dirs_with(std::env::current_exe().ok().as_deref())
+}
+
+/// 字体目录候选（纯函数，`exe` 由调用方给，便于单测）。
+///
+/// 顺序：
+/// 1. **随包目录** `<exe 所在目录>\fonts\`——内置 Inter 在这里（[`BUNDLED_FONT_SUBDIR`]）；
+/// 2. 用户级字体目录 `%LOCALAPPDATA%\Microsoft\Windows\Fonts`；
+/// 3. 系统字体目录 `%WINDIR%\Fonts`。
+///
+/// 把随包目录排第一，判据才可复述：`inject=` 说「文件注入」就是**内置那份**起作用了，
+/// 说「系统 provider」就是内置那份没找到——不用再猜是不是被系统同名字体顶掉。
+fn font_dirs_with(exe: Option<&std::path::Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    if let Some(dir) = exe.and_then(std::path::Path::parent) {
+        dirs.push(dir.join(BUNDLED_FONT_SUBDIR));
+    }
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         dirs.push(
             PathBuf::from(local)
@@ -696,6 +722,54 @@ mod tests {
     }
 
     #[test]
+    fn bundled_font_dir_comes_first_and_tracks_the_exe() {
+        // 随包目录必须是第一顺位——`inject=` 说「文件注入」时才等于「内置那份起作用」。
+        //
+        // 用**本测试进程自己的 exe** 做样本，而不是拼一个 `C:\Apps\...`：Windows 上
+        // 反斜杠是分隔符，Linux 上只是个普通字符（`parent()` 会返回空串），写死盘符路径
+        // 的断言在 CI 的 Linux 侧必挂，且挂的原因与「顺序」无关。
+        let exe = std::env::current_exe().expect("取当前测试 exe 路径");
+        let expected = exe
+            .parent()
+            .expect("exe 必有父目录")
+            .join(BUNDLED_FONT_SUBDIR);
+        let dirs = font_dirs_with(Some(&exe));
+        assert_eq!(dirs.first(), Some(&expected), "{dirs:?}");
+        // 没有 exe 路径时不许凭空造一个相对目录（否则会去找当前工作目录下的 fonts\）。
+        let none = font_dirs_with(None);
+        assert!(
+            !none
+                .iter()
+                .any(|dir| dir == &PathBuf::from(BUNDLED_FONT_SUBDIR)),
+            "{none:?}"
+        );
+    }
+
+    #[test]
+    fn bundled_inter_ships_in_the_repo() {
+        // 随包文件是**安装器**的载荷（`installer\fonts\`），不是本 crate 的资产；
+        // 这条测试守的是「文件被谁误删/误移」——装机包里没有 Inter，`inject=` 会静默
+        // 回落成系统 provider，用户只会看到「字体没变成 Inter」，看不出原因。
+        let repo_fonts =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../installer/fonts");
+        for (file, min_bytes) in [
+            ("Inter-Regular.ttf", 300_000u64),
+            ("Inter-SemiBold.ttf", 300_000u64),
+            ("OFL.txt", 1_000u64),
+        ] {
+            let path = repo_fonts.join(file);
+            let meta = std::fs::metadata(&path)
+                .unwrap_or_else(|error| panic!("随包字体缺失：{}（{error}）", path.display()));
+            assert!(
+                meta.len() >= min_bytes,
+                "{} 只有 {} B，像是占位文件而不是真字体",
+                path.display(),
+                meta.len()
+            );
+        }
+    }
+
+    #[test]
     fn summary_never_echoes_the_requested_family() {
         // 这是本文件最重要的一条回归：曾经 `han` 显示成「Segoe UI」，
         // 而 Segoe UI 根本不含汉字——名字来自我们自己的提问，不是系统事实。
@@ -785,5 +859,66 @@ mod tests {
                 face.file
             );
         }
+    }
+
+    /// 取证探针（默认忽略）：①随包 Inter 是否真被读进 `Proportional`；②汉字图集容量。
+    ///
+    /// 为什么 `#[ignore]`：它要把 Inter 拷到**测试二进制旁的 `fonts\`** 才有意义，
+    /// 而常规门禁不该依赖本机装了什么字体。跑法见 `docs/dev/build.md` §4.5。
+    #[test]
+    #[ignore = "取证探针：需把 Inter 拷到测试二进制旁的 fonts\\ 目录；常规门禁不跑"]
+    fn probe_inject_and_atlas_capacity() {
+        let log = crate::logbuf::LogBuffer::new();
+        let ctx = egui::Context::default();
+        let state = install(&ctx, &log);
+        println!("PROBE_FONTS {}", state.fonts_line());
+        // 逐条打印注入账：判据要能核对「哪个文件进了哪个族、多少字节」。
+        for record in &state.injected {
+            println!(
+                "PROBE_INJECT role={} family={} file={} bytes={}",
+                record.role, record.family, record.file, record.bytes
+            );
+        }
+
+        for n in [500_usize, 1000, 1500, 2000, 2500, 3000, 3500, 4000] {
+            let text: String = (0..n)
+                .filter_map(|offset| char::from_u32(0x4E00 + offset as u32))
+                .collect();
+            render_once(&ctx, &text);
+            let (size, fill) =
+                ctx.fonts(|fonts| (fonts.font_image_size(), fonts.font_atlas_fill_ratio()));
+            println!(
+                "PROBE_ATLAS chars={n} atlas={}x{} fill={fill:.3}",
+                size[0], size[1]
+            );
+            if fill > 0.995 {
+                println!("PROBE_ATLAS_OVERFLOW chars={n}");
+                break;
+            }
+        }
+    }
+
+    /// 用真实的 `run_ui` 把文本按四档语义字号各排一遍——只有排过才会光栅化进图集。
+    ///
+    /// 只用 `TextStyle`、不用 `.size(`：字号阶梯是唯一来源，探针也不许绕过去。
+    fn render_once(ctx: &egui::Context, text: &str) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            for style in [
+                egui::TextStyle::Heading,
+                egui::TextStyle::Body,
+                egui::TextStyle::Small,
+            ] {
+                ui.label(egui::RichText::new(text).text_style(style));
+            }
+        });
+        // 不交出这一帧的纹理增量会 panic（drive.rs 的测试踩过同一个坑）。
+        output.textures_delta.clear();
     }
 }

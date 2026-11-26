@@ -239,6 +239,66 @@ PWS max = NNN,NNN KB（PID=NNNN，余量=NNN,NNN KB）→ PASS|FAIL|INCONCLUSIVE
 
 **判据演化（写明，避免被当成无声放宽）**：task-58 的判据 2 原文是「用 `--panel-selftest` 跑一次，再检查落盘文件」。实现上 `--panel-selftest` **有意不落盘**（`cli::inits_file_log` 只对 `Panel | Service` 返回真）：这是**安全不变量**——并发 CI 自检会互踩同一个文件，短命自检会污染用户日志。因此该判据拆成两条替代证据：**A** 用 `--log-selftest --dir <隔离目录>` 验写入器与脱敏（exit 0、500 行、`leak=false`、落盘可见 `token:***` 与 `--rpc-secret=***`）；**B** 用真面板（隔离 `APPDATA`、45 s）验探针轨迹上盘 + 写盘有界（即上表）。拆法的覆盖面**大于**原判据：原判据只要求「轨迹进了文件」，B 还证明了「日志不会把磁盘写爆」，并顺带否掉「每帧写盘」这个真实风险。
 
+### 4.5 内置拉丁字体 Inter（UI-7 / task-105）
+
+**为什么随包**：`Inter` 不进系统，浏览器/系统菜单里看到的效果和面板里不一样；而「整套界面字体统一」是需求原文的一条。随包只放**拉丁**两个字重（Regular 309,828 B / SemiBold 315,756 B，合计 ≈ 0.6 MB），汉字仍走系统（内嵌 CJK 面一个就 10–17 MB，直接吃掉 <100 MB 的余量）。
+
+**装到哪**（安装器 `installer/ariahost.nsi`）：
+
+```
+$INSTDIR\fonts\Inter-Regular.ttf
+$INSTDIR\fonts\Inter-SemiBold.ttf
+$INSTDIR\licenses\OFL.txt      # SIL OFL-1.1 原文，随包必备
+```
+
+源文件在 `installer\fonts\`（已入库；sha256 见 [THIRD-PARTY-NOTICES.md](../../THIRD-PARTY-NOTICES.md)）。`nsi` 用 `!if /FileExists "${__FILEDIR__}\fonts\Inter-Regular.ttf"` 门禁：**文件缺失是编译期 `!error`**，不会出一个「静默少字体」的包。卸载段**逐文件 `Delete` 再 `RMDir "$INSTDIR\fonts"`**（故意不用 `RMDir /r`：字体就在 exe 旁边、目录名可猜，可执行文件旁的递归删除风险比省两行代码大——注释在 nsi 卸载段）。
+
+**解析顺序**（`fonts.rs::font_dirs_with`，顺序即优先级）：
+
+1. `<exe 所在目录>\fonts\`（随包 → 绿色版/解压即用也生效）
+2. `%LOCALAPPDATA%\Microsoft\Windows\Fonts`（用户装的字体）
+3. `%WINDIR%\Fonts`（系统字体）
+
+命中的面以 `FontPriority::Highest` 注入 `FontFamily::Proportional`，并额外登记一个命名族 `AriaBold` 专供粗体（`theme::bold()` 是唯一消费者）；SemiBold 与 Regular **同一个族名**，靠族内字重区分——这是 `egui 0.37` 的 `FontInsert` 唯一可行路径（provider 不按 family/weight 选面）。
+
+**可观测**：`--panel-selftest` 的 `fonts=` 字段是唯一权威口径（格式见 `fonts.rs::fonts_line`）：
+
+```powershell
+.\ariahost.exe --panel-selftest --frames 60
+# fonts=latin=<实际族>|han=<实际族>|mono=<实际族>|resolved=<预热查询>|bold=yes|inject=Inter:309828|budget=309828/17825792|inject_skip=none
+```
+
+- `latin=` / `han=` / `mono=`：**实际**落到的族名（系统 provider 返回的名字），未命中写 `miss`，**绝不回填我们请求的声明名**；
+- `bold=yes|no`：命名族 `AriaBold` 是否真注入成功（`no` 时 `theme::bold()` 自动退回常规字重并落一条告警）；
+- `inject=<族名>:<字节>`（多条 `;` 分隔）/ `inject=miss`：注入到底成没成；
+- `budget=已用/上限`：单文件 17 MB 预算（`INJECT_BUDGET`，防两个大面一起注入）；
+- `inject_skip=<角色>:<原因>`（多条 `;` 分隔）/ `none`：每个没注入的面**为什么**没注入（文件不存在 / 超预算 / 读失败），不再静默。
+
+> 在 WSL 上跑同一条命令，`latin=`/`han=` 会落到 `system:DejaVu_Sans…` / `system:WenQuanYi_Zen_Hei…`，且 `inject=miss`——因为测试二进制的 exe 旁没有 `fonts\` 目录。**这是预期**，不是缺陷；Windows 侧要看的是 `latin=` 里出现 `Inter`、`inject=Inter:…`、`bold=yes`。
+
+**汉字图集容量实测**（`fonts.rs` 的 `#[ignore]` 探针 `probe_inject_and_atlas_capacity`，默认不跑；需要时 `cargo test -p ariahost-ui -- --ignored --nocapture probe_inject_and_atlas_capacity`）：
+
+实测序列（不同汉字数 × 4 档语义字号 20/16/14/12，同一进程逐级扩大；测于 Linux/WSL + 系统汉字面 `WenQuanYi Zen Hei`）：
+
+| 不同汉字数 | 图集尺寸 | 填充率 |
+|---|---|---|
+| 500 | 2048 × 256 | 8.8% |
+| 1000 | 2048 × 512 | 17.3% |
+| 1500 | 2048 × 1024 | 26.4% |
+| 2000 | 2048 × 1024 | 34.8% |
+| 2500 | 2048 × 1024 | 43.9% |
+| 3000 | 2048 × 2048 | 52.8% |
+| 3500 | 2048 × 2048 | 61.2% |
+| 4000 | 2048 × 2048 | 69.8% |
+
+结论与代价（这两条是**判据**，不是观感）：
+
+- **容量**：图集宽被 `max_texture_side`（EG-7 的 2048）钉住，只有高度在翻倍。按线性外推，2048×2048 装满约 **5700 个不同汉字**（4 档字号同时用到）。面板实际文案是数百字量级，常态占用个位数百分比；`--panel-selftest` 里看到的 `atlas=2048x64` 就是常态。
+- **代价**：图集是 RGBA8，2048×2048 = **16.8 MB**（GPU 纹理 + 一份 CPU 侧 `ColorImage`）。所以「把几千行日志铺满屏」这类改法会让图集翻到最大档、多背 ~17–34 MB，**可能吃掉 100 MB 闸门的余量**——改日志视图时必须重跑内存闸门（§4.2）。
+- 溢出 / 失败字：0 / 0（到 4000 字为止没有出现 atlas overflow）。
+
+> 这是**容量口径**的证据（「数千汉字 × 4 档不会撑爆 2048 图集」），不是 Windows 字形观感的证据。Windows 侧的真实 `fonts=` 行（`latin=Inter…`、`bold=yes`）必须用 CI 产物复跑，见 §5.1 的顺序。
+
 ## 5. 本地绿的边界（必读）
 
 这里的「绿」指本地命令跑过、退出码 0。**本机的绿只覆盖跨平台那部分**，不是 CI 绿的等价物。下表四条判据，按它决定「这条改动能不能在本地下结论」。

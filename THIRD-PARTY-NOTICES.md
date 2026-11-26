@@ -34,7 +34,24 @@ AriaHost 与 aria2 是两个独立进程，通过命令行与 JSON-RPC 交互，
 
 ---
 
-## 2. Rust 依赖
+## 2. Inter（字体，SIL Open Font License 1.1）
+
+`installer\fonts\Inter-Regular.ttf` 与 `installer\fonts\Inter-SemiBold.ttf` 随安装包分发，安装到 `<安装目录>\fonts\`（见 `installer/ariahost.nsi`），由面板启动时读入并注册为比例族（`FontPriority::Highest`），用于拉丁字母与数字。
+
+| 项 | 值 |
+|---|---|
+| 上游 | Inter（Rasmus Andersson），https://github.com/rsms/inter |
+| 取件来源 | npm 包 `inter-font@3.19.0` 的 `ttf/Inter-Regular.ttf`、`ttf/Inter-SemiBold.ttf`（与上游 release 同一字体文件） |
+| 下载地址 | `https://cdn.jsdelivr.net/npm/inter-font@3.19.0/ttf/Inter-Regular.ttf` / `.../Inter-SemiBold.ttf` |
+| 许可 | SIL Open Font License 1.1（允许嵌入与再分发；不得单独售卖字体本身） |
+| 许可全文 | 仓库 `installer/fonts/OFL.txt`，安装后为 `<安装目录>\licenses\OFL.txt`（卸载时随 `licenses\` 整目录删除） |
+| SHA-256 | Regular `41AB0F707A2BFAB8133CCDFCDAB52282F5F79E5751F43A264805451C7BB95FB8`（309,828 B）<br>SemiBold `E8CBC2B88BC4268237FF5E251776D3C54EDCB14E015A9E66E4883BDE4B55F13F`（315,756 B） |
+
+复核命令：`Get-FileHash installer\fonts\Inter-*.ttf -Algorithm SHA256`（应与上表逐字一致；不一致就是取件被换过，不许合入）。
+
+---
+
+## 3. Rust 依赖
 
 AriaHost 自身以 `MIT OR Apache-2.0` 双许可发布。编译进 `ariahost.exe` 的第三方 crate 全部为宽松许可（MIT / Apache-2.0 / BSD / ISC / Zlib / MPL-2.0 等）或同等宽松的双许可，**不含 GPL/AGPL 系列代码**。
 

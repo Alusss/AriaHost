@@ -845,6 +845,36 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   !endif
 !endif
 
+  ; 内置拉丁字体 Inter（OFL-1.1，task-105 A 条）：装到 **exe 旁的 fonts\**。
+  ;
+  ; 为什么不是装进系统字体（`$WINDIR\Fonts`）：那要管理员权限、要刷字体缓存、
+  ; 卸载还得回滚；而 exe 旁的目录由本脚本自己的 File 指令负责，卸载跟着 RMDir 走，
+  ; 生命周期与程序本体一致。读取方是 `crates/ariahost-ui/src/fonts.rs` 的
+  ; `font_dirs_with()`——它把这个目录排在候选第一位（顺序即优先级）。
+  ;
+  ; 为什么是 fail-closed 而不是「缺了就跳过」：字体缺失在运行期只表现为
+  ; 「字体没变成 Inter」，`inject=` 会回落成系统 provider，用户和 CI 都看不出少了什么；
+  ; 只有在编译期报错，才有人会去修。两个文件都是 OFL 授权的真字体（非子集、非改写）。
+  !if /FileExists "${__FILEDIR__}\fonts\Inter-Regular.ttf"
+  !else
+    !error "Bundled font fonts\Inter-Regular.ttf is missing. The installer ships Inter (OFL-1.1) next to the exe so Latin text renders with Inter instead of falling back to Segoe UI; without it the panel silently degrades. Fix: restore installer\fonts\Inter-Regular.ttf (see THIRD-PARTY-NOTICES.md for source and SHA-256)."
+  !endif
+  !if /FileExists "${__FILEDIR__}\fonts\Inter-SemiBold.ttf"
+  !else
+    !error "Bundled font fonts\Inter-SemiBold.ttf is missing (true SemiBold face for the Inter family). Fix: restore installer\fonts\Inter-SemiBold.ttf."
+  !endif
+  !insertmacro TraceWrite "[install] 装内置字体：fonts\Inter-Regular.ttf + fonts\Inter-SemiBold.ttf"
+  SetOutPath "$INSTDIR\fonts"
+  File "${__FILEDIR__}\fonts\Inter-Regular.ttf"
+  File "${__FILEDIR__}\fonts\Inter-SemiBold.ttf"
+  ; 许可全文与字体**同进同退**：OFL-1.1 要求随发行副本附带许可。
+  SetOutPath "$INSTDIR"
+  CreateDirectory "$INSTDIR\licenses"
+  SetOutPath "$INSTDIR\licenses"
+  File "${__FILEDIR__}\fonts\OFL.txt"
+  SetOutPath "$INSTDIR"
+  !insertmacro TraceWrite "[install] 许可：licenses\OFL.txt（Inter，SIL Open Font License 1.1）"
+
   ; 静默模式必须让失败可见（task-55 C 条）：/S 下 MessageBox 被抑制、DetailPrint
   ; 没人看，于是"复制失败"会以 exit 0 收场——automation 以为装好了，实际没有 exe。
   ; 两道判定：${Errors} 捕获 File 的运行时写失败；FileExists 是最终事实（唯一可信）。
@@ -1043,6 +1073,14 @@ Section "Uninstall"
   ; 第三方来源说明放在**顶层**（用户一眼能看到，见安装段注释）；它由本脚本 New 出来，
   ; 卸载必须自己删——漏了就会让 RMDir "$INSTDIR" 失败，只在目录里留一个孤儿 md。
   Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
+  ; 内置字体（task-105 A 条）只删我们放的**两个文件**，再用非 /r 的 RMDir 收目录。
+  ; 为什么这里不用 `RMDir /r`（licenses 用的是 /r）：`fonts\` 就在 exe 旁边、名字可猜，
+  ; 用户很可能往里丢自己的字体；/r 会把他的文件一起删掉。非 /r 的 RMDir 只在目录空了
+  ; 才成功，剩下用户文件时它失败——紧接着的「安装目录仍有残留」判定会把这件事报出来
+  ; （$R0=2），既不静默删用户文件，也不假装卸干净了。
+  Delete "$INSTDIR\fonts\Inter-Regular.ttf"
+  Delete "$INSTDIR\fonts\Inter-SemiBold.ttf"
+  RMDir "$INSTDIR\fonts"
   ; 内置核心的许可是我们放的目录（aria2c.exe 与它同生共死），整目录删。
   RMDir /r "$INSTDIR\licenses"
   RMDir "$INSTDIR"
