@@ -130,7 +130,18 @@ function buildRow(task) {
   name.title = taskName(task);
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.textContent = statusText(task) + (task.errorMessage ? "：" + task.errorMessage : "");
+  // 状态做成「胶囊」：正绿点只给运行中，出错的走 --bad。
+  // 深浅主题下都靠 CSS 令牌取色，脚本里不出现任何颜色字面量。
+  const state = document.createElement("span");
+  state.className =
+    task.status === "active" ? "state active" : task.status === "error" ? "state error" : "state";
+  state.textContent = statusText(task);
+  meta.appendChild(state);
+  if (task.errorMessage) {
+    const detail = document.createElement("span");
+    detail.textContent = " · " + task.errorMessage;
+    meta.appendChild(detail);
+  }
   nameCell.appendChild(name);
   nameCell.appendChild(meta);
   tr.appendChild(nameCell);
@@ -150,10 +161,12 @@ function buildRow(task) {
   tr.appendChild(progressCell);
 
   const speedCell = document.createElement("td");
+  speedCell.className = "num";
   speedCell.textContent = formatSpeed(task.downloadSpeed);
   tr.appendChild(speedCell);
 
   const etaCell = document.createElement("td");
+  etaCell.className = "num";
   etaCell.textContent = formatEta(task);
   tr.appendChild(etaCell);
 

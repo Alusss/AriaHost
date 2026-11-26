@@ -125,4 +125,175 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------
+    // UI-4（task-89）：令牌层 / 字体与几何 / 对比度（规格 §4.1、§5.4）
+    // ---------------------------------------------------------------
+
+    /// 取「`marker` 之后第一个 `{` 到与之配对的 `}`」之间的文本，用于分别读两套主题的令牌。
+    fn block_after(css: &str, marker: &str) -> String {
+        let start = css
+            .find(marker)
+            .unwrap_or_else(|| panic!("CSS 里找不到标记 {marker}"));
+        let open = start + css[start..].find('{').expect("标记之后应有 '{'");
+        let body = &css[open + 1..];
+        let close = body.find('}').expect("块未闭合");
+        body[..close].to_owned()
+    }
+
+    /// 解析 `--name: #rrggbb;` 形态的令牌。非颜色令牌（px、字体链）不在这里出现。
+    fn color_tokens(block: &str) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        for line in block.lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix("--") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(':') else {
+                continue;
+            };
+            let value = value.trim().trim_end_matches(';').trim();
+            if value.starts_with('#') {
+                map.insert(name.trim().to_owned(), value.to_owned());
+            }
+        }
+        map
+    }
+
+    /// sRGB 单通道 → 线性光（WCAG 2.x 相对亮度）。
+    fn linear(channel: u8) -> f64 {
+        let c = f64::from(channel) / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn luminance(hex: &str) -> f64 {
+        let digits = hex.trim_start_matches('#');
+        assert_eq!(digits.len(), 6, "只接受 #rrggbb：{hex}");
+        let part = |range: std::ops::Range<usize>| {
+            u8::from_str_radix(&digits[range], 16).unwrap_or_else(|_| panic!("非法色值：{hex}"))
+        };
+        0.2126 * linear(part(0..2)) + 0.7152 * linear(part(2..4)) + 0.0722 * linear(part(4..6))
+    }
+
+    /// WCAG 对比度（1:1 – 21:1）。
+    fn contrast(fg: &str, bg: &str) -> f64 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn style_css_keeps_colors_inside_the_token_layer() {
+        // 规格 §5.4 的硬约束：颜色只在令牌层定义一次，规则里一律 var(--x)。
+        // 注释行与令牌定义行之外出现 `#` 就是有人绕过令牌层写死了颜色。
+        let mut definitions = 0_usize;
+        for (index, line) in STYLE_CSS.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+            if trimmed.starts_with("--") {
+                definitions += 1;
+                continue;
+            }
+            assert!(
+                !line.contains('#'),
+                "第 {} 行有裸色值（改成 var(--x)）：{line}",
+                index + 1
+            );
+            assert!(
+                !line.contains(':') || !line.contains("rgb("),
+                "第 {} 行用 rgb() 写死了颜色：{line}",
+                index + 1
+            );
+        }
+        assert!(
+            definitions >= 24,
+            "令牌定义只有 {definitions} 条，疑似令牌层被裁掉"
+        );
+    }
+
+    #[test]
+    fn style_css_typography_and_geometry_match_the_spec() {
+        // §2.1：中文系统必须有 YaHei UI 变体，且以通用族收尾。
+        assert!(
+            STYLE_CSS.contains(r#""Segoe UI", "Microsoft YaHei UI""#),
+            "字体链必须是 Segoe UI → Microsoft YaHei UI 的顺序"
+        );
+        assert!(
+            STYLE_CSS.contains("system-ui") && STYLE_CSS.contains("sans-serif"),
+            "字体链必须以 system-ui / sans-serif 兜底"
+        );
+        // §4.1：卡片圆角 8、控件圆角 6（与面板 theme.rs 同值）。
+        assert!(
+            STYLE_CSS.contains("--radius-card: 8px"),
+            "卡片圆角必须是 8px"
+        );
+        assert!(
+            STYLE_CSS.contains("--radius-ctl: 6px"),
+            "控件圆角必须是 6px"
+        );
+        // 数字列右对齐 + 等宽数字（否则轮询时数字会左右跳）。
+        assert!(STYLE_CSS.contains("text-align: right"), "数字列必须右对齐");
+        assert!(
+            STYLE_CSS.contains("tabular-nums"),
+            "数字要用等宽数字，避免刷新时抖动"
+        );
+    }
+
+    #[test]
+    fn style_css_contrast_meets_wcag_in_both_themes() {
+        // 对比度是量出来的，不是看出来的：深浅两套令牌逐对算 WCAG 比值。
+        // 正文 7:1（AAA）、次要文字/状态字 4.5:1（AA）、
+        // 非文字（焦点环、控件描边、进度条）3:1（1.4.11）。
+        let cases = [
+            ("light", block_after(STYLE_CSS, ":root {")),
+            ("dark", block_after(STYLE_CSS, "prefers-color-scheme: dark")),
+        ];
+        for (theme, block) in cases {
+            let tokens = color_tokens(&block);
+            assert!(
+                tokens.len() >= 12,
+                "{theme} 主题只解析出 {} 个颜色令牌",
+                tokens.len()
+            );
+            let pick = |name: &str| -> String {
+                tokens
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{theme} 缺令牌 --{name}"))
+            };
+            for (fg, bg, min) in [
+                ("text", "card", 7.0),
+                ("text", "bg", 7.0),
+                ("muted", "card", 4.5),
+                ("muted", "bg", 4.5),
+                ("link", "card", 4.5),
+                ("ok", "card", 4.5),
+                ("bad", "card", 4.5),
+            ] {
+                let ratio = contrast(&pick(fg), &pick(bg));
+                assert!(
+                    ratio >= min,
+                    "{theme}：--{fg} 叠在 --{bg} 上只有 {ratio:.2}:1，要求 ≥{min}:1"
+                );
+            }
+            for (fg, bg, min) in [("accent", "card", 3.0), ("line-control", "card", 3.0)] {
+                let ratio = contrast(&pick(fg), &pick(bg));
+                assert!(
+                    ratio >= min,
+                    "{theme}：非文字色 --{fg} 对 --{bg} 只有 {ratio:.2}:1，要求 ≥{min}:1"
+                );
+            }
+            let on_accent = contrast(&pick("on-accent"), &pick("accent"));
+            assert!(
+                on_accent >= 4.5,
+                "{theme}：主按钮文字对 --accent 只有 {on_accent:.2}:1，要求 ≥4.5:1"
+            );
+        }
+    }
 }

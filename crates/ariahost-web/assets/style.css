@@ -1,122 +1,272 @@
-/* AriaHost 网页管理页 —— 一屏够用的样式，不引任何框架/字体/图标。
-   CSP 是 default-src 'self'：所以这张表是唯一的外部资源，且不允许内联样式。 */
+/* AriaHost 网页管理页样式（视觉对齐 docs/design/ui-spec-v2.md §5.4）。
+ *
+ * 三条硬约束（都有单测守着，见 src/assets.rs）：
+ * 1. **令牌层**：颜色/圆角/字体只在这里定义一次；规则里一律 `var(--x)`，
+ *    除变量定义行外不许出现裸色值。改色 = 改此处一处。
+ * 2. **跟随系统主题**：`prefers-color-scheme` 切浅/深，色值与面板 `theme.rs` 同源。
+ * 3. **零外部依赖**：不引任何框架、字体文件、图标库（CSP 是 default-src 'self'，
+ *    引外站只会被拦成半张裸页）。
+ */
 
 :root {
-  --bg: #14161a;
-  --panel: #1d2027;
-  --line: #2b303a;
-  --text: #e6e8ee;
-  --muted: #9aa2b1;
-  --accent: #4c9aff;
-  --ok: #46c37b;
-  --bad: #ff6b6b;
+  color-scheme: light dark;
+
+  /* ---- 颜色（与 crates/ariahost-ui/src/theme.rs 的 LIGHT 同名同值）---- */
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --hover: #eef1f5;
+  --line: #e8ecf1;
+  /* 控件描边专用：比主题 border_strong 压深一档，白底上 3.45:1（WCAG 1.4.11 要求 ≥3:1） */
+  --line-control: #838b95;
+  --text: #1b1f23;
+  --muted: #59626b;
+  --link: #0a58ca;
+  --accent: #1f6feb;
+  --on-accent: #ffffff;
+  --ok: #15803d;
+  --ok-dot: #00c853;
+  --ok-ring: #0b6b34;
+  --warn: #8a5a00;
+  --bad: #c42b1c;
+
+  /* ---- 圆角 ---- */
+  /* 与 panel 的 theme.rs 同值：卡片 8、控件 6（窗口 10 只用于原生窗口，网页没有） */
+  --radius-card: 8px;
+  --radius-ctl: 6px;
+
+  /* ---- 字体链（四级；中文系统必须有 YaHei UI 变体，见规格 §2.1）---- */
+  --font-ui: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "Consolas", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-* { box-sizing: border-box; }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181b;
+    --card: #1c2024;
+    --hover: #242a2f;
+    --line: #2b3138;
+    --line-control: #6b757e;
+    --text: #e6e9ec;
+    --muted: #a7b0b8;
+    --link: #86b4ff;
+    --accent: #4c8df6;
+    --on-accent: #0b121c;
+    --ok: #00c853;
+    --warn: #e0a93b;
+    --bad: #f0616d;
+  }
+}
 
 body {
   margin: 0;
-  padding: 0 16px 48px;
+  padding: 16px 24px 48px;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font: 14px/20px var(--font-ui);
+  -webkit-font-smoothing: antialiased;
 }
 
+/* ---- 顶栏 ---- */
 header {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 12px;
-  padding: 18px 0 12px;
-  border-bottom: 1px solid var(--line);
+  padding: 8px 0 16px;
+}
+h1 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 600;
+}
+.status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 17px;
+}
+.status.bad {
+  color: var(--bad);
 }
 
-h1 { margin: 0; font-size: 18px; font-weight: 600; }
+main {
+  max-width: 1080px;
+}
 
-.status { margin: 0; color: var(--muted); font-variant-numeric: tabular-nums; }
-.status.bad { color: var(--bad); }
+/* ---- 卡片：替代页面级分割线（规格 §4.1）---- */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  padding: 16px;
+  margin-bottom: 16px;
+}
 
-main { max-width: 1080px; }
-
-.add { display: flex; gap: 8px; margin: 16px 0; }
-
+/* ---- 添加行 ---- */
+/* 不写 margin：外距统一由 `.card` 提供（表单同时挂了 `.add card`） */
+.add {
+  display: flex;
+  gap: 8px;
+}
 .add input {
   flex: 1;
   min-width: 240px;
   padding: 8px 10px;
   color: var(--text);
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font: inherit;
+  background: var(--card);
+  border: 1px solid var(--line-control);
+  border-radius: var(--radius-ctl);
+  font: 14px/20px var(--font-ui);
 }
-
-.add input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.add input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
 
 button {
-  padding: 6px 12px;
+  padding: 8px 14px;
   color: var(--text);
-  background: #262b34;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  font: inherit;
+  background: var(--hover);
+  border: 1px solid transparent;
+  border-radius: var(--radius-ctl);
+  font: 14px/20px var(--font-ui);
   cursor: pointer;
 }
-
-button:hover { background: #303644; border-color: var(--accent); }
-
-.add button { background: var(--accent); border-color: var(--accent); color: #08101c; font-weight: 600; }
-.add button:hover { filter: brightness(1.08); }
-
-.notice {
-  margin: 0 0 16px;
-  padding: 10px 12px;
-  color: #ffd9d9;
-  background: #3a1f22;
-  border: 1px solid #6d3338;
-  border-radius: 6px;
+button:hover {
+  background: var(--card);
+  border-color: var(--accent);
+}
+.add button {
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.add button:hover {
+  filter: brightness(1.08);
 }
 
-table { width: 100%; border-collapse: collapse; }
-
+/* ---- 表格：无行线，只留表头下沿 1px；行 hover ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
 thead th {
   padding: 8px 10px;
   color: var(--muted);
+  font-size: 12px;
+  line-height: 17px;
   font-weight: 500;
   text-align: left;
   border-bottom: 1px solid var(--line);
   white-space: nowrap;
 }
+tbody td {
+  padding: 10px;
+  vertical-align: middle;
+  font: 14px/20px var(--font-ui);
+}
+tbody tr:hover {
+  background: var(--hover);
+}
+td.num {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 
-tbody td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
-
+/* 任务名与它下面那行说明 */
 .name {
-  max-width: 380px;
+  max-width: 460px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
-.meta { color: var(--muted); font-size: 12px; }
-
-.bar {
-  width: 160px;
-  height: 6px;
-  margin-bottom: 4px;
-  background: #262b34;
-  border-radius: 3px;
-  overflow: hidden;
+.meta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 17px;
+}
+.actions {
+  white-space: nowrap;
+}
+.actions button {
+  margin-right: 6px;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+.actions button:last-child {
+  margin-right: 0;
 }
 
-.fill { height: 100%; width: 0; background: var(--ok); transition: width 0.3s ease; }
+/* ---- 状态：正绿点 + 深绿字（#00c853 只作填充，边界靠 --ok-ring 描边）---- */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--muted);
+}
+.state.active {
+  color: var(--ok);
+}
+.state.active::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok-dot);
+  box-shadow: 0 0 0 1px var(--ok-ring);
+}
+.state.error {
+  color: var(--bad);
+}
 
-.percent { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+/* ---- 进度条：实色，不用半透明 ---- */
+.bar {
+  width: 160px;
+  height: 8px;
+  margin-bottom: 4px;
+  background: var(--hover);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+}
+.percent {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
 
-.actions { display: flex; flex-wrap: wrap; gap: 6px; }
-
-.empty { color: var(--muted); padding: 24px 4px; }
+/* ---- 通告与空态 ---- */
+.notice {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius-ctl);
+  border-left: 3px solid var(--bad);
+  background: var(--card);
+  color: var(--text);
+}
+.empty {
+  color: var(--muted);
+  padding: 24px 4px;
+}
 
 @media (max-width: 760px) {
-  .bar { width: 96px; }
-  .name { max-width: 180px; }
+  .bar {
+    width: 96px;
+  }
+  .name {
+    max-width: 180px;
+  }
 }
