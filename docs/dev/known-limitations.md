@@ -329,31 +329,32 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 
 > **已销账（2026-11-25，v2.11）**：原 `L12`「诊断包 `os_version` 在 MSVC 产物上报假值」已修并**在 MSVC 产物上复验通过**（`e4c6c9c`；`env.json` = `{10,0,26200, ntdll-rtlgetversion}`，TRACE `branch=ntdll`）。按本文写入规则整条删除，编号不回收，来龙去脉记在架构文档 §24。
 
-## L17 汉字图集在 3500 字 × 3 档时溢出（`max_texture_side=2048` 的上限，非缺陷）
+## L17 汉字图集在「3755 字（GB2312 一级全集）× `worst`（四档全排）」下溢出（`max_texture_side=2048` 的上限，非缺陷）
 
-**现象**：`--atlas-probe`（task-106 新增的隐藏入口）实测：3500 个不同汉字在 14pt/16pt
-两档下把 2048×2048 图集填到 81%，再加 20pt 这一档就**溢出**——epaint 把光标重置
-（`d_h=-1024`，填充率从 0.812 掉到 0.389），先前字形被覆盖，用户侧表现为部分汉字变
-方框/串字。
+**现象**：`--atlas-probe`（隐藏入口）实测，边界在**字库全集 × 最坏档位**这一组合上，不在 3500：
+
+- **3500 字 × `worst`（四档各 3500）→ 不溢出**：Windows MSVC 产物（2026-11-27）`atlas=2048x2048 fill=0.974 overflow=0`，刚好塞满、余量 2.6%（`docs/dev/build.md` §4.6）。
+- **3755 字 × `worst` → 溢出**：epaint 把光标重置（`d_h=-1024`、`reset=1`、`stopped=overflow`），先前字形被覆盖，用户侧表现为部分汉字变方框/串字。
+- 真实负载（`real`）两处都远未到：3500 字仅 `fill=0.227`、`atlas=2048x512`。
 
 **为什么不现在修**：面板实际文案是数百字量级，常态 `atlas=2048x64`；「整本一级字库 × 三档
 同时出现」只可能出现在压测或未来的长列表全汉字渲染里。三条候选方案（子集化 / 提高
 `ATLAS_MAX_SIDE` / 砍档位）都涉及产品口径与内存预算（EG-4 的 <100MB 余量只剩十几 MB），
 需要单独立项裁决。
 
-**什么条件下该修**：真机（Windows + 雅黑/思源）复跑 `--atlas-probe` 确认同一临界点，且
-产品决定支持「全字库 × 三档」的渲染场景。
+**什么条件下该修**：产品决定支持「全字库 3755 字 × 四档同时出现」的渲染场景（当前只有压测
+会触发）；届时才在三条候选方案（子集化 / 提高 `ATLAS_MAX_SIDE` / 砍档位）里裁决。
 
 **取证命令**：`ariahost.exe --atlas-probe`（看 `ATLAS step=… overflow=… reset=…` 与
 `ATLAS_PROBE … overflow_total=…`）。
 
-## L18 汉字图集容量只按「四档语义字号 + 系统汉字面」测过，两处未覆盖
+## L18 汉字图集容量未覆盖等宽档（其余已由 Windows MSVC 实测覆盖）
 
-**现象**：`--atlas-probe`（`docs/dev/build.md` §4.6）是三档实测（`single` / `real` / `worst`），但覆盖面有两处缺口，且都是**判据层面的缺口**，不是观感问题：
+**现象**：`--atlas-probe`（`docs/dev/build.md` §4.6）是三档实测（`single` / `real` / `worst`），覆盖面只剩**一处**判据层面的缺口：
 
 1. **等宽档未计入**（`Monospace 13` / `AriaNumber 16`）。理由是这两档排 RPC 端点、路径、JSON、键名与数字（ASCII），汉字不进图集；但这是**设计意图**，不是实测排除——若哪天中文误入等宽档（例如把日志行整行用 `monospace()` 画），探针**测不到**这部分负载。已在 `atlas_probe.rs` 的档位注释与单测里写明排除理由与边界。
-2. **只用本机系统汉字面测过**（Linux/WSL 的 `WenQuanYi Zen Hei`）。Windows 侧的字形面（`Microsoft YaHei UI`，或用户装的 `Source Han Sans SC`）字形宽度不同，同样字数的填充率会变。本机没有 Windows 构建与字形面，因此 §4.6 的数字是**容量口径的下界参照**，不是 Windows 的实测值。
+2. ~~只用本机系统汉字面测过（Linux/WSL）~~ **已覆盖（2026-11-27）**：CI MSVC x64 产物 + 内置 Inter + 系统 `Microsoft YaHei UI` 已按 `--chars 500,1500,3500` 三 profile 实测（`single` fill 0.191 / `real` 0.227 / `worst` 0.974，全 `overflow=0`，`missing=0`），数据落在 `docs/dev/build.md` §4.6；Linux/WenQuanYi 那组已明确标为不可移植的历史测量。
 
-**为什么不现在修**：等宽档缺口要改的是「探针需要知道哪些 TextStyle 会排汉字」，而 `theme::text_styles()` 只给字号、不给用途标签；补用途标签是一次设计阶梯的语义扩充（会牵动 theme 的单测与文档），超出本批。Windows 侧只能等 CI 产物在本机复跑 `--atlas-probe`。
+**为什么不现在修**：等宽档缺口要改的是「探针需要知道哪些 TextStyle 会排汉字」，而 `theme::text_styles()` 只给字号、不给用途标签；补用途标签是一次设计阶梯的语义扩充（会牵动 theme 的单测与文档），超出本批。
 
-**什么条件下该修**：① 出现任何「中文进了等宽档」的改动时（含日志整行 monospace），必须同步扩探针并重测；② 下一批 Windows 产物可用时，用同一命令复跑三档，把 §4.6 表格补成 Windows 实测值，并核对「`real` 档余量仍 ≥ 3 倍」这条结论。
+**什么条件下该修**：出现任何「中文进了等宽档」的改动时（含日志整行 monospace），必须同步扩探针并重测。

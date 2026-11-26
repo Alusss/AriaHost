@@ -291,24 +291,30 @@ $INSTDIR\licenses\OFL.txt      # SIL OFL-1.1 原文，随包必备
 
 **档位不硬编码**：`atlas_probe::sizes()` 从 `theme::text_styles()` 取产品真实的四档语义阶梯（Heading 20 / AriaSubtitle 16 / Body 14 / Small 12），单测 `sizes_are_the_real_theme_ladder` 钉住这组值防漂移。等宽档（Monospace 13 / AriaNumber 16）**不计入**：它排的是 RPC 端点、路径、JSON、数字（ASCII），汉字不进图集；这是排除理由，不是"已覆盖等宽档"的结论（见 known-limitations L18）。
 
-**实测（Linux/WSL + 系统汉字面 `WenQuanYi Zen Hei`，ppp=1.00，同一进程逐级扩大，判据取自 `ATLAS_PROBE` 汇总行）**：
+**实测（Windows MSVC x64 / CI 产物，ppp=1.00，判据取自 `ATLAS_PROBE` 汇总行）**。原始 stdout 42 行在 `.scratch/m5/atlas-probe-windows-msvc.txt`（不复制进文档，避免转录失真）。
 
-| profile | 每档字数 | 步数 | `atlas_max` | `fill` 峰值 | `overflow_total` | 停止点 |
+产物与字体面（取自同一次 BEGIN 行）：`ariahost.exe` **20,366,848 B**（artifact 15141482907，2026-11-27）；exe 旁 `fonts\` 带内置 `Inter-Regular.ttf` 309,828 B + `Inter-SemiBold.ttf` 315,756 B；汉字面 `han=system:Microsoft_YaHei_UI:1:1`（内置思源未装 → `inject_skip=汉字:候选文件都不存在(...)`），拉丁面 `latin=injected:Inter`、`bold=yes`。
+
+**命令与档数**：`--atlas-probe --chars 500,1500,3500 --profile <single|real|worst>`，三 profile × 三档 N（500/1500/3500），共 3/12/12 步：
+
+| profile | 每档字数 | 步数 | 3500 字时 `atlas` | `fill` 峰值 | `overflow_total` | `missing_max` |
 |---|---|---|---|---|---|---|
-| `single` | Body 14 档 = N 字 | 8 | 2048 × 512 | 0.224 | 0 | 走完全部 8 步（N=3755） |
-| `real` | Body 全量 / Small 15% / Subtitle 3% / Heading 1.5% | 32 | 2048 × 1024 | 0.286 | 0 | 走完全部 32 步（N=3755） |
-| `worst` | 四档各 N 字（上界，非真实用法） | 24 | 2048 × 2048 | 0.827 | **1** | `chars=3000 size=20` 处溢出（`reset=1`、`d_h=-1024`），`stopped=overflow` |
+| `single` | 只 Body 14 档 = N 字 | 3 | 2048 × 512 | 0.191 | 0 | 0 |
+| `real` | Body 全量 / Small 15% / Subtitle 3% / Heading 1.5% | 12 | 2048 × 512 | 0.227 | 0 | 0 |
+| `worst` | 四档各 N 字（理论上界，非真实用法） | 12 | 2048 × 2048 | **0.974**（20pt 档） | 0 | 0 |
 
-结论（**判据**，不是观感）：
+结论（**Windows 口径，判据不是观感**）：
 
-- **真实负载离上限很远**：`real` 档跑完 3755 个一级汉字，图集只到 2048×1024 的 28.6%，**余量 ≈ 3.5 倍**；`single` 档更宽松（512 高，22.4%）。所以「产品文案把汉字撑爆图集」不成立。
-- **上界在哪**：`worst`（每档都排全量汉字，现实中不会出现）在 2048×2048 撑住约 **3000 字 × 3.7 档 ≈ 11000 个 (字, 字号) 槽位**，第 4 档（20pt）放不下。溢出表现为 epaint **重置光标、图集高度回落**（`d_h<0`），不是报错——所以探针的 overflow 判据是「epaint 日志 warn **或** 高度回落」两路取或（只认日志会在默认过滤级别下静默漏计）。
-- **代价**：图集 RGBA8，2048×2048 = **16.8 MB**（GPU 纹理 + 一份 CPU 侧 `ColorImage`）。常态是 `atlas=2048x64`（`--panel-selftest` 里能看到）；若真把图集推到最大档，会多背 17–34 MB，**必须重跑内存闸门（§4.2）**。
-- 失败字（`missing=`）：三种 profile 全程 **0**——本机汉字面无缺字；这只能证明"字体面在本机不缺字"，不能证明 Windows 侧字形观感。
+- **「真实字号档 + 3500 个一级汉字」在 2048² 下全放得下**：`real` 只到 2048×512、`fill` **0.227**，余量约 **4.4 倍**；`single` 更宽松（`fill` 0.191）。
+- **理论上界也放得下**：`worst`（四档各排全量 3500 字，真实 UI 不会出现）刚好塞满 2048×2048、`fill` **0.974**，距溢出只剩 **2.6%**。它是**上界**，不是产品负载——不要拿它当「余量不足」的结论。
+- **3500 与 3755 必须分开写**：`--chars 3500` 三 profile 全 `overflow=0`；要 `N=3755`（GB2312 一级全集）**且** `--profile worst`，才在 20pt 档溢出（`reset=1`、`d_h=-1024`、`stopped=overflow`，见 known-limitations L17）。前者是「产品文案上限」，后者是「字库全集压测」，互不替代。
+- **拉丁换内置 Inter 不影响容量**：同机 GNU 裸产物（拉丁落系统 Arial）与本 MSVC 产物（`latin=injected:Inter`）三 profile 的 `atlas_max`/`fill`/`overflow` 逐项一致——汉字字形由系统雅黑决定，Inter 只占极小拉丁面。这佐证「内置 Inter 不威胁图集闸门」。
+- **代价**：图集 RGBA8，2048×2048 = **16.8 MB**（GPU 纹理 + 一份 CPU 侧 `ColorImage`）。常态 `atlas=2048x64`（`--panel-selftest` 可见）；若真推到最大档，多背 17–34 MB，**必须重跑内存闸门（§4.2）**。
+- **`missing=0` 只证明"这台机器的汉字面不缺字"**，不是字形观感的证据（观感口径见 §4.5 的字体链日志）。
+
+> **Linux/WSL 那组数字不可移植，只作历史测量**：WSL + `WenQuanYi Zen Hei` + ppp=1.00、步长取 8 档（500…3755）时曾记下 `real → 2048×1024 / fill 0.286`，`worst` 在 2048×2048 上 `fill` 0.827 后第 24 步（`chars=3000`、20pt）溢出（`overflow_total=1`）。同一份代码在 Windows（雅黑、3 档步长）上 worst 到 3500 字 `fill` 才 0.974、real 只到 0.227 —— 差异来自**字形面不同 + 步长口径不同**，不是代码回退。**引用容量结论只引上表**，不要引这一段。
 
 > 旧口径（`fonts.rs` 的 `#[ignore]` 探针 `probe_inject_and_atlas_capacity`，固定 20/16/14/12 三档、把字号硬编码在探针里）**已由 `--atlas-probe` 取代**：它与产品阶梯漂移、且溢出判据只认日志会漏计（旧文档记的"0 溢出"是假阴性）。该 `#[ignore]` 测试保留为注入链自检，不再作为容量口径。
->
-> 这是**容量口径**的证据，不是 Windows 字形观感的证据。Windows 侧的真实 `fonts=` 行（`latin=Inter…`、`bold=yes`）必须用 CI 产物复跑，见 §5.1 的顺序。
 
 ## 5. 本地绿的边界（必读）
 
