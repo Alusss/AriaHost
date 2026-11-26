@@ -428,6 +428,13 @@ h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; }
 
 main { max-width: 1080px; }
 
+/* 居中留白的**出现阈值**（task-102 实测）：内容列的 max-width 是 content-box，
+   加上左右各 24px 内边距后 border-box = 1080 + 48 = **1128 CSS px**。
+   视口 ≥1128 CSS px 才有居中留白；＜1128（包括浏览器 200% 缩放时 CSS 视口缩到 960）
+   走「撑满 + 左右各 24px 内边距」分支——这是阈值行为，不是缺陷。
+   实测（真实浏览器 iframe 360 / 768 / 1280 / 1920）：居中误差 0 px、标题与卡片左沿同线、
+   scrollWidth == clientWidth 无页面横向溢出。 */
+
 /* 卡片：替代所有页面级分割线 */
 .card {
   background: var(--card);
