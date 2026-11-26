@@ -195,8 +195,15 @@ a {
 }
 
 /* ---- 表格：无行线，只留表头下沿 1px；行 hover ---- */
+/* 窄屏（375px 手机）时五列表必然放不下：滚动**发生在卡片内部**（这层容器），
+   而不是让整个页面横向溢出——`documentElement.scrollWidth <= clientWidth` 必须成立。
+   `table` 的 `min-width` 保证列不被压扁成两行文字：小于它就在容器里横向滚。 */
+.table-wrap {
+  overflow-x: auto;
+}
 table {
   width: 100%;
+  min-width: 620px;
   border-collapse: collapse;
 }
 thead th {

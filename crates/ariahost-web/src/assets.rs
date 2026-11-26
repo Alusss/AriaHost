@@ -416,4 +416,46 @@ mod tests {
             }
         }
     }
+
+    /// 窄屏（375px）下五列表放不下：**滚动必须发生在卡片内部**，页面本身不许横向溢出。
+    ///
+    /// 这条只钉结构（外包层 + `overflow-x: auto` + 表格最小宽度）；真实像素判据
+    /// （`documentElement.scrollWidth <= clientWidth`）由浏览器实测覆盖，两者互补。
+    #[test]
+    fn table_scrolls_inside_the_card_on_narrow_screens() {
+        // ① 表格外面必须有一层容器，且容器在 `<table>` 之前开、之后合。
+        let open = INDEX
+            .find(r#"<div class="table-wrap">"#)
+            .expect("缺少 .table-wrap 容器");
+        let table = INDEX.find("<table>").expect("缺少 <table>");
+        let table_end = INDEX.find("</table>").expect("缺少 </table>");
+        let close = INDEX.find("</div>").expect("缺少 </div>");
+        assert!(open < table, "容器必须在表格之前开始");
+        assert!(close > table_end, "容器必须在表格之后结束");
+
+        // ② 容器自己带横向滚动。
+        let block = block_after(STYLE_CSS, ".table-wrap");
+        assert!(
+            block.contains("overflow-x: auto"),
+            ".table-wrap 必须 overflow-x: auto，实际块：{block}"
+        );
+
+        // ③ 表格有最小宽度，否则列被压扁而不是滚动（压扁会把「剩余」挤成两行）。
+        let table_block = block_after(STYLE_CSS, "table {");
+        assert!(
+            table_block.contains("min-width: 620px"),
+            "table 必须给 min-width，实际块：{table_block}"
+        );
+
+        // ④ 不「藏」横向溢出——那只是把症状盖住，实测判据会失真。
+        assert!(
+            !STYLE_CSS.contains("overflow-x: hidden"),
+            "不许用 overflow-x: hidden 掩盖溢出"
+        );
+        let body_block = block_after(STYLE_CSS, "body {");
+        assert!(
+            !body_block.contains("overflow-x"),
+            "body 不许设 overflow-x，横向滚动只该出现在 .table-wrap：{body_block}"
+        );
+    }
 }
