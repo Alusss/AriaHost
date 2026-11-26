@@ -1501,6 +1501,129 @@ pub fn resolve_secret(config: &mut Config, secret_path: &Path) -> Result<String,
     Ok(generated)
 }
 
+/// 解析**服务平面**的 RPC secret，并在写出后收紧该单文件的 ACL（M5-g）。
+///
+/// 与 [`resolve_secret`] 的两点不同（都是服务平面独有）：
+///
+/// 1. **ACL 收紧**：`%ProgramData%\AriaHost\secret.bin` 原先吃的是 `C:\ProgramData`
+///    继承来的 `BUILTIN\Users:(I)(RX)`——密文对本机任何用户可读。这里把该**单文件**
+///    的 DACL 设成「`SYSTEM:F` + `Administrators:F`，并去掉继承」（`D:P`）。
+/// 2. **失败只报告**：返回的 `Option<String>` 是收紧失败的可读原因，调用方记一条 WARN
+///    就继续——第二道防线（DPAPI `CRYPTPROTECT_LOCAL_SYSTEM`，仅 SYSTEM 可解）仍在，
+///    「ACL 没设上」不等于「明文泄漏」。
+///
+/// # 为什么 user 平面**不**收紧
+///
+/// `%APPDATA%\AriaHost\secret.bin` 是**面板自己**要读要用（它解出明文去连 aria2 RPC）。
+/// 收紧到 `SYSTEM+Administrators` 会让普通用户解不开，直接打坏 headless/面板形态。
+/// 而 `%APPDATA%\AriaHost` 本身已只有「当前用户 + SYSTEM + Administrators」可访问，
+/// 继承下来的 DACL 对 user 平面**就是够的**——这里不是偷懒，是两层语义不同。
+///
+/// # 为什么不动目录 ACL
+///
+/// `C:\ProgramData\AriaHost\` 必须保留 `Users:(RX)`：面板要读同目录的 `status.json`
+/// （M5-e）与 `config.toml`。收紧目录会把面板一起打死，所以只对这一个文件设 `D:P`。
+pub fn resolve_secret_for_service(
+    config: &mut Config,
+    secret_path: &Path,
+) -> Result<(String, Option<String>), ConfigError> {
+    let secret = resolve_secret(config, secret_path)?;
+    // 显式写在配置里的 secret 不落盘 → 没有文件可收紧（也不该凭空造一个）。
+    if !secret_path.is_file() {
+        return Ok((secret, None));
+    }
+    Ok((secret, harden_secret_acl(secret_path).err()))
+}
+
+/// 服务平面 secret 的目标 SDDL：**受保护的 DACL**，只给 SYSTEM 与 Administrators 完全控制。
+///
+/// 拆成常量是为了能被单测逐字节钉住——这段字符串写错的后果是「以为收紧了其实没有」，
+/// 比编译错误危险得多。
+pub const SERVICE_SECRET_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+/// 给服务平面 `secret.bin` 收紧 ACL（best-effort；失败返回可读原因）。
+///
+/// 用 `SetNamedSecurityInfoW` + `PROTECTED_DACL_SECURITY_INFORMATION`（`D:P` 的语义）：
+/// 后者让新 DACL **不继承**父目录的任何 ACE——这正是那个 `Users:(I)(RX)` 的来源。
+#[cfg(not(windows))]
+pub fn harden_secret_acl(_path: &Path) -> Result<(), String> {
+    // Linux 只在开发期跑门禁；ACL 语义不存在，这里如实说「没做」而不是假装成功。
+    Err("非 Windows 目标：不支持文件 DACL，未收紧".to_owned())
+}
+
+#[cfg(windows)]
+pub fn harden_secret_acl(path: &Path) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let sddl = wide(SERVICE_SECRET_SDDL);
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: sddl 以 NUL 结尾；descriptor 指向本地变量，成功后由 LocalFree 释放。
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(format!(
+            "解析 SDDL 失败（GetLastError={}）",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // 取出 SD 里的 DACL 指针：SetNamedSecurityInfoW 要的是 ACL，不是整份描述符。
+    let mut present = 0i32;
+    let mut defaulted = 0i32;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: descriptor 由上面的成功调用产出，仍有效。
+    let got_dacl =
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+    if got_dacl == 0 || present == 0 || dacl.is_null() {
+        // SAFETY: 同一次分配，只释放一次。
+        unsafe { LocalFree(descriptor) };
+        return Err("安全描述符里没有 DACL（不该发生）".to_owned());
+    }
+
+    let mut path_wide = wide(&path.display().to_string());
+    // SAFETY: path_wide 是可写的 NUL 结尾宽字符串（API 形参是 PWSTR）；dacl 指向仍在
+    // descriptor 生命周期内的内存，调用期间 descriptor 未释放，故指针有效。
+    let applied = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: descriptor 由 ConvertStringSecurityDescriptorToSecurityDescriptorW 分配，
+    // 这里用完（DACL 已复制进文件安全描述符）再释放，只释放一次。
+    unsafe { LocalFree(descriptor) };
+
+    if applied != 0 {
+        return Err(format!(
+            "SetNamedSecurityInfo 失败（Win32 {applied}）——多半是没在管理员/SYSTEM 上下文"
+        ));
+    }
+    Ok(())
+}
+
 /// 读「当前生效的 RPC secret」，**但绝不生成**（诊断包/只读工具用）。
 ///
 /// 与 [`resolve_secret`] 只差一条：secret 既不在配置里、也解不开 `secret.bin` 时返回 `None`，
@@ -2390,5 +2513,169 @@ beta = "two"
         let error = download_dir_for_service_with(&relative, &guards())
             .expect_err("相对路径必须还是原来的错");
         assert_eq!(error.kind(), ConfigErrorKind::PathUnavailable);
+    }
+
+    // ---- M5-g：服务平面 secret.bin 的 ACL ----------------------------------
+
+    /// SDDL 本身被逐项钉住：写错这段字符串的后果是「以为收紧了其实没有」。
+    #[test]
+    fn service_secret_sddl_is_protected_and_grants_only_system_and_admins() {
+        let sddl = SERVICE_SECRET_SDDL;
+        assert!(
+            sddl.starts_with("D:P"),
+            "必须是受保护 DACL（去继承）：{sddl}"
+        );
+        assert!(sddl.contains("(A;;FA;;;SY)"), "SYSTEM 要给完全控制：{sddl}");
+        assert!(
+            sddl.contains("(A;;FA;;;BA)"),
+            "Administrators 要给完全控制：{sddl}"
+        );
+        // 这两个是本任务要清掉的那类主体：谁被写进来就等于没收紧。
+        for forbidden in [";;;BU)", ";;;WD)", ";;;AU)", ";;;CO)"] {
+            assert!(
+                !sddl.contains(forbidden),
+                "SDDL 不得授予 {forbidden}：{sddl}"
+            );
+        }
+    }
+
+    /// 非 Windows 上如实说「没做」——不许假装收紧成功（那会让调用方以为已收紧）。
+    #[cfg(not(windows))]
+    #[test]
+    fn secret_acl_is_reported_as_unsupported_off_windows() {
+        let dir = TestDir::new("acl-linux");
+        let file = dir.0.join("secret.bin");
+        fs::write(&file, b"blob").expect("写占位文件");
+        let error = harden_secret_acl(&file).expect_err("非 Windows 必须如实报「未支持」");
+        assert!(error.contains("非 Windows"), "{error}");
+    }
+
+    /// 显式写在配置里的 secret 不落盘 → 没有文件可收紧，也不该凭空造一个。
+    #[test]
+    fn service_secret_with_explicit_value_creates_no_file() {
+        let dir = TestDir::new("acl-explicit");
+        let path = dir.0.join("secret.bin");
+        let mut config = Config::default();
+        config.aria2.rpc.secret = "explicit-secret".to_owned();
+        let (secret, acl) = resolve_secret_for_service(&mut config, &path).expect("解析 secret");
+        assert_eq!(secret, "explicit-secret");
+        assert!(acl.is_none(), "没有文件就不该有 ACL 结论");
+        assert!(!path.exists(), "不该为了设 ACL 凭空写一个 secret.bin");
+    }
+
+    /// Windows 功能测试：把 SDDL 真正应用到临时文件，再**读回 DACL 的 SID 列表**断言。
+    ///
+    /// 断言的对象是「读回来的 ACE」，不是「调用返回成功」——后者在权限不足时也可能骗人。
+    /// 非管理员上下文（UAC 未提权的开发者机）无法改文件 DACL，这里打印 SKIP 后返回：
+    /// **不伪造通过**，也不把「环境跑不了」伪装成「代码正确」。
+    #[cfg(windows)]
+    #[test]
+    fn service_secret_acl_really_drops_users_and_everyone() {
+        let dir = TestDir::new("acl-win");
+        let file = dir.0.join("secret.bin");
+        fs::write(&file, b"blob").expect("写占位文件");
+
+        match harden_secret_acl(&file) {
+            Ok(()) => {}
+            Err(detail) => {
+                println!("SKIP 无法应用 DACL（多半是非管理员上下文）：{detail}");
+                return;
+            }
+        }
+
+        let sids = dacl_sids(&file).expect("读回 DACL");
+        println!("DACL_SIDS {sids:?}");
+        assert!(
+            !sids.iter().any(|sid| sid == "S-1-1-0"),
+            "不得有 Everyone：{sids:?}"
+        );
+        assert!(
+            !sids.iter().any(|sid| sid == "S-1-5-32-545"),
+            "不得有 BUILTIN\\Users：{sids:?}"
+        );
+        assert!(
+            sids.iter().any(|sid| sid == "S-1-5-18"),
+            "SYSTEM 必须保留：{sids:?}"
+        );
+        assert!(
+            sids.iter().any(|sid| sid == "S-1-5-32-544"),
+            "Administrators 必须保留：{sids:?}"
+        );
+    }
+
+    /// 读回文件的 DACL，把每个 ACE 的 SID 转成字符串（Windows 功能测试用）。
+    #[cfg(windows)]
+    fn dacl_sids(path: &Path) -> Option<Vec<String>> {
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetAce, GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR,
+        };
+
+        fn wide(text: &str) -> Vec<u16> {
+            text.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        let mut path_wide = wide(&path.display().to_string());
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: path_wide 以 NUL 结尾并可写；descriptor 由 API 分配，末尾 LocalFree 释放。
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                path_wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS || dacl.is_null() {
+            return None;
+        }
+
+        let mut present = 0i32;
+        let mut defaulted = 0i32;
+        let mut found: *mut ACL = std::ptr::null_mut();
+        // SAFETY: descriptor 由上面的成功调用产出。
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut found, &mut defaulted) };
+
+        let mut sids = Vec::new();
+        if present != 0 && !found.is_null() {
+            let count = unsafe { (*found).AceCount } as u32;
+            for index in 0..count {
+                let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+                // SAFETY: index 在 AceCount 范围内；ace 指向 ACL 内部内存。
+                if unsafe { GetAce(found, index, &mut ace) } == 0 || ace.is_null() {
+                    continue;
+                }
+                // ACE 的 SidStart 是结构里第一个 SID 的偏移；ACCESS_ALLOWED_ACE 的布局可行。
+                // SAFETY: ace 指向一个 ACE；取其 SidStart 字段地址作为 SID 指针。
+                let sid = unsafe {
+                    std::ptr::addr_of_mut!((*(ace as *mut ACCESS_ALLOWED_ACE)).SidStart)
+                        as *mut std::ffi::c_void
+                };
+                let mut text: *mut u16 = std::ptr::null_mut();
+                // SAFETY: sid 指向 ACE 内的 SID；text 由 API 分配，末尾 LocalFree。
+                if unsafe { ConvertSidToStringSidW(sid, &mut text) } != 0 && !text.is_null() {
+                    let mut len = 0usize;
+                    // SAFETY: text 是以 NUL 结尾的宽字符串。
+                    while unsafe { *text.add(len) } != 0 {
+                        len += 1;
+                    }
+                    let slice = unsafe { std::slice::from_raw_parts(text, len) };
+                    sids.push(String::from_utf16_lossy(slice));
+                    unsafe { LocalFree(text as *mut std::ffi::c_void) };
+                }
+            }
+        }
+        // SAFETY: descriptor 只释放一次。
+        unsafe { LocalFree(descriptor) };
+        Some(sids)
     }
 }

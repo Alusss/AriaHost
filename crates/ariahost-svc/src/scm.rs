@@ -298,8 +298,19 @@ impl Aria2Supervisor {
             detail: "拿不到 %ProgramData%（服务平面运行时目录不可用）".to_owned(),
         })?;
         let secret_path = paths.runtime.join(config_layer::SECRET_FILE_NAME);
-        let secret =
-            config_layer::resolve_secret(&mut config, &secret_path).map_err(unavailable)?;
+        // M5-g：服务平面 secret.bin 收单文件 ACL（SYSTEM+Administrators，去继承）。
+        // 失败只 WARN：DPAPI `LOCAL_SYSTEM` 仍是第二道防线，别把「权限没设上」升级成启动失败。
+        let (secret, acl_note) =
+            config_layer::resolve_secret_for_service(&mut config, &secret_path)
+                .map_err(unavailable)?;
+        if let Some(detail) = acl_note {
+            log.warn(&format!(
+                "服务 secret.bin 的 ACL 未能收紧（不影响运行，DPAPI 仍只允许 SYSTEM 解密）：\
+                 {}；文件 {}",
+                detail,
+                secret_path.display()
+            ));
+        }
 
         // 护栏：拒绝把下载目录落到系统保留范围。失败要**同时**进日志与 status.json，
         // 否则面板只会看到「服务没起来」而不知道是配置问题。
