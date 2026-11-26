@@ -176,6 +176,10 @@ CLI 如实回 `quit: timeout` + `exit=2`；再往上还有面板自己的 `QUIT_
 > 本条的旧版把预算写成「CLI 10 s / 安装器 15 s」——那是 2026-11-25 之前的数（`QUIT_BUDGET` 于 commit `11d25d2` 抬到 25 s，
 > 安装器于 task-61 抬到 20 s）。现象未变，数字与推论已按现常量重写。
 
+**边界**：本条说的是 **worst-case**（每个字号档都排全量汉字，现实中不会出现）。
+按产品文案结构实测（`--atlas-probe --profile real`，3755 字）只用到 2048×1024 的 28.6%，
+余量约 3.5 倍——见 build.md §4.6。所以这不是「产品会溢出」，而是「别把每档都铺满全字库」。
+
 **什么条件下该修**：真机 TRACE 出现「走到了 `forceShutdown`」的实例后按实测重估 `stop_grace`；
 或任一层预算改数时同步复核本表与 §11.1（2026-11-26 复核：一致）。
 
@@ -342,3 +346,14 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 
 **取证命令**：`ariahost.exe --atlas-probe`（看 `ATLAS step=… overflow=… reset=…` 与
 `ATLAS_PROBE … overflow_total=…`）。
+
+## L18 汉字图集容量只按「四档语义字号 + 系统汉字面」测过，两处未覆盖
+
+**现象**：`--atlas-probe`（`docs/dev/build.md` §4.6）是三档实测（`single` / `real` / `worst`），但覆盖面有两处缺口，且都是**判据层面的缺口**，不是观感问题：
+
+1. **等宽档未计入**（`Monospace 13` / `AriaNumber 16`）。理由是这两档排 RPC 端点、路径、JSON、键名与数字（ASCII），汉字不进图集；但这是**设计意图**，不是实测排除——若哪天中文误入等宽档（例如把日志行整行用 `monospace()` 画），探针**测不到**这部分负载。已在 `atlas_probe.rs` 的档位注释与单测里写明排除理由与边界。
+2. **只用本机系统汉字面测过**（Linux/WSL 的 `WenQuanYi Zen Hei`）。Windows 侧的字形面（`Microsoft YaHei UI`，或用户装的 `Source Han Sans SC`）字形宽度不同，同样字数的填充率会变。本机没有 Windows 构建与字形面，因此 §4.6 的数字是**容量口径的下界参照**，不是 Windows 的实测值。
+
+**为什么不现在修**：等宽档缺口要改的是「探针需要知道哪些 TextStyle 会排汉字」，而 `theme::text_styles()` 只给字号、不给用途标签；补用途标签是一次设计阶梯的语义扩充（会牵动 theme 的单测与文档），超出本批。Windows 侧只能等 CI 产物在本机复跑 `--atlas-probe`。
+
+**什么条件下该修**：① 出现任何「中文进了等宽档」的改动时（含日志整行 monospace），必须同步扩探针并重测；② 下一批 Windows 产物可用时，用同一命令复跑三档，把 §4.6 表格补成 Windows 实测值，并核对「`real` 档余量仍 ≥ 3 倍」这条结论。

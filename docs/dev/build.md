@@ -276,28 +276,39 @@ $INSTDIR\licenses\OFL.txt      # SIL OFL-1.1 原文，随包必备
 
 > 在 WSL 上跑同一条命令，`latin=`/`han=` 会落到 `system:DejaVu_Sans…` / `system:WenQuanYi_Zen_Hei…`，且 `inject=miss`——因为测试二进制的 exe 旁没有 `fonts\` 目录。**这是预期**，不是缺陷；Windows 侧要看的是 `latin=` 里出现 `Inter`、`inject=Inter:…`、`bold=yes`。
 
-**汉字图集容量实测**（`fonts.rs` 的 `#[ignore]` 探针 `probe_inject_and_atlas_capacity`，默认不跑；需要时 `cargo test -p ariahost-ui -- --ignored --nocapture probe_inject_and_atlas_capacity`）：
+### 4.6 汉字字形图集容量（UI-8 / task-107：`--atlas-probe`）
 
-实测序列（不同汉字数 × 4 档语义字号 20/16/14/12，同一进程逐级扩大；测于 Linux/WSL + 系统汉字面 `WenQuanYi Zen Hei`）：
+**唯一权威口径是隐藏入口 `--atlas-probe`**（不进 `--help`；不开窗、不读配置、不碰 SCM）：
 
-| 不同汉字数 | 图集尺寸 | 填充率 |
-|---|---|---|
-| 500 | 2048 × 256 | 8.8% |
-| 1000 | 2048 × 512 | 17.3% |
-| 1500 | 2048 × 1024 | 26.4% |
-| 2000 | 2048 × 1024 | 34.8% |
-| 2500 | 2048 × 1024 | 43.9% |
-| 3000 | 2048 × 2048 | 52.8% |
-| 3500 | 2048 × 2048 | 61.2% |
-| 4000 | 2048 × 2048 | 69.8% |
+```powershell
+.\ariahost.exe --atlas-probe                       # 默认 --profile worst
+.\ariahost.exe --atlas-probe --profile real        # 按产品文案结构的真实负载
+.\ariahost.exe --atlas-probe --profile single      # 只有 Body 一档用到全量汉字
+.\ariahost.exe --atlas-probe --profile real --chars 500,1500
+```
 
-结论与代价（这两条是**判据**，不是观感）：
+三处实现约束（踩过，别"简化"）：光栅化只在 `Context::tessellate` 里发生，**同帧读尺寸会读到上一帧的值**；`Context::fonts_mut` 在第一次 pass 前会 panic，必须先空跑一帧暖机；测容量**不能**把排版包进 `ScrollArea`（裁剪后的字形不计入负载）。
 
-- **容量**：图集宽被 `max_texture_side`（EG-7 的 2048）钉住，只有高度在翻倍。按线性外推，2048×2048 装满约 **5700 个不同汉字**（4 档字号同时用到）。面板实际文案是数百字量级，常态占用个位数百分比；`--panel-selftest` 里看到的 `atlas=2048x64` 就是常态。
-- **代价**：图集是 RGBA8，2048×2048 = **16.8 MB**（GPU 纹理 + 一份 CPU 侧 `ColorImage`）。所以「把几千行日志铺满屏」这类改法会让图集翻到最大档、多背 ~17–34 MB，**可能吃掉 100 MB 闸门的余量**——改日志视图时必须重跑内存闸门（§4.2）。
-- 溢出 / 失败字：0 / 0（到 4000 字为止没有出现 atlas overflow）。
+**档位不硬编码**：`atlas_probe::sizes()` 从 `theme::text_styles()` 取产品真实的四档语义阶梯（Heading 20 / AriaSubtitle 16 / Body 14 / Small 12），单测 `sizes_are_the_real_theme_ladder` 钉住这组值防漂移。等宽档（Monospace 13 / AriaNumber 16）**不计入**：它排的是 RPC 端点、路径、JSON、数字（ASCII），汉字不进图集；这是排除理由，不是"已覆盖等宽档"的结论（见 known-limitations L18）。
 
-> 这是**容量口径**的证据（「数千汉字 × 4 档不会撑爆 2048 图集」），不是 Windows 字形观感的证据。Windows 侧的真实 `fonts=` 行（`latin=Inter…`、`bold=yes`）必须用 CI 产物复跑，见 §5.1 的顺序。
+**实测（Linux/WSL + 系统汉字面 `WenQuanYi Zen Hei`，ppp=1.00，同一进程逐级扩大，判据取自 `ATLAS_PROBE` 汇总行）**：
+
+| profile | 每档字数 | 步数 | `atlas_max` | `fill` 峰值 | `overflow_total` | 停止点 |
+|---|---|---|---|---|---|---|
+| `single` | Body 14 档 = N 字 | 8 | 2048 × 512 | 0.224 | 0 | 走完全部 8 步（N=3755） |
+| `real` | Body 全量 / Small 15% / Subtitle 3% / Heading 1.5% | 32 | 2048 × 1024 | 0.286 | 0 | 走完全部 32 步（N=3755） |
+| `worst` | 四档各 N 字（上界，非真实用法） | 24 | 2048 × 2048 | 0.827 | **1** | `chars=3000 size=20` 处溢出（`reset=1`、`d_h=-1024`），`stopped=overflow` |
+
+结论（**判据**，不是观感）：
+
+- **真实负载离上限很远**：`real` 档跑完 3755 个一级汉字，图集只到 2048×1024 的 28.6%，**余量 ≈ 3.5 倍**；`single` 档更宽松（512 高，22.4%）。所以「产品文案把汉字撑爆图集」不成立。
+- **上界在哪**：`worst`（每档都排全量汉字，现实中不会出现）在 2048×2048 撑住约 **3000 字 × 3.7 档 ≈ 11000 个 (字, 字号) 槽位**，第 4 档（20pt）放不下。溢出表现为 epaint **重置光标、图集高度回落**（`d_h<0`），不是报错——所以探针的 overflow 判据是「epaint 日志 warn **或** 高度回落」两路取或（只认日志会在默认过滤级别下静默漏计）。
+- **代价**：图集 RGBA8，2048×2048 = **16.8 MB**（GPU 纹理 + 一份 CPU 侧 `ColorImage`）。常态是 `atlas=2048x64`（`--panel-selftest` 里能看到）；若真把图集推到最大档，会多背 17–34 MB，**必须重跑内存闸门（§4.2）**。
+- 失败字（`missing=`）：三种 profile 全程 **0**——本机汉字面无缺字；这只能证明"字体面在本机不缺字"，不能证明 Windows 侧字形观感。
+
+> 旧口径（`fonts.rs` 的 `#[ignore]` 探针 `probe_inject_and_atlas_capacity`，固定 20/16/14/12 三档、把字号硬编码在探针里）**已由 `--atlas-probe` 取代**：它与产品阶梯漂移、且溢出判据只认日志会漏计（旧文档记的"0 溢出"是假阴性）。该 `#[ignore]` 测试保留为注入链自检，不再作为容量口径。
+>
+> 这是**容量口径**的证据，不是 Windows 字形观感的证据。Windows 侧的真实 `fonts=` 行（`latin=Inter…`、`bold=yes`）必须用 CI 产物复跑，见 §5.1 的顺序。
 
 ## 5. 本地绿的边界（必读）
 
@@ -382,7 +393,11 @@ Remove-Item -Recurse -Force dist  # 清暂存产物
 | 想截图取证却截到锁屏 / 黑屏 | 机器锁屏或无桌面，截图没有意义。改用 UI Automation 读文本节点，见 §4.3 |
 | CI 的**许可逐字节对账**假红（18,431 B vs 18,092 B） | `actions/checkout` 按 autocrlf 把 LF 改写成 CRLF（差 339 B = 行数）。确认 `.gitattributes` 有 `installer/licenses/** -text`，并核 blob 侧应为 **18,092 B / `8177F975…B880643`**；本地复现用 `git -c core.autocrlf=true clone` 再量字节。**不要删这条 `-text`**，详见 [release.md](release.md) §7 |
 
-### 4.6 汉字图集容量：`--atlas-probe` 复测，并作废 §4.5 的旧表（task-106）
+#### 4.6.1 首测记录（task-106，14/16/20 三档）——判据已被上面 §4.6 取代
+
+> 下面这组数字只代表 **worst-case**（每个字号档都排全量汉字），**不是产品真实负载**；
+> 真实负载（`--profile real`）的余量约 3.5 倍，见本节上面的表与 §4.6 结论。
+> 保留这段只为追溯「旧表为什么作废」，不要拿它算容量。
 
 §4.5 末尾那张「不同汉字数 × **4 档**语义字号」的表**已作废**，理由三条：① 旧探针是
 `fonts.rs` 里的 `#[ignore]` 单测，CI 产物上跑不了，用户机器无法复现；② 它写「4 档」，

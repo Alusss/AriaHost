@@ -65,13 +65,16 @@ pub enum Command {
         /// 场景名（目前只有 `settings`）。
         scenario: String,
     },
-    /// `--atlas-probe [--chars N[,N...]]`：汉字字形图集容量探针（隐藏入口，不进 `--help`）。
+    /// `--atlas-probe [--chars N[,N...]] [--profile worst|real|single]`：汉字字形图集
+    /// 容量探针（隐藏入口，不进 `--help`）。
     ///
     /// 不开窗、不要 wgpu：`Context::run_ui` 排版 + `Context::tessellate` 触发光栅化，
     /// 因此 CI 与用户机器都能跑；字段口径见 `ariahost_ui::atlas_probe` 模块文档。
     AtlasProbe {
         /// 要测的字数阶梯；`None` = 默认阶梯（500 → 3755）。
         chars: Option<Vec<usize>>,
+        /// 排版分布：`worst`（每档全量）/ `real`（按产品文案结构）/ `single`（只 Body）。
+        profile: ariahost_ui::atlas_probe::Profile,
     },
     /// `--web-selftest`：隐藏自检入口，跑一遍网页管理页的端到端自检（不出现在 `--help`）。
     WebSelftest,
@@ -268,6 +271,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
     // 它不开窗、不读配置、不碰 SCM，只量「这台机器的字体链 + 图集上限」。
     if first == "--atlas-probe" {
         let mut chars: Option<Vec<usize>> = None;
+        let mut profile: Option<ariahost_ui::atlas_probe::Profile> = None;
         let mut index = 0;
         while index < rest.len() {
             match rest[index].as_str() {
@@ -281,6 +285,18 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                     chars = Some(parse_atlas_chars(value)?);
                     index += 2;
                 }
+                "--profile" => {
+                    let value = rest
+                        .get(index + 1)
+                        .ok_or_else(|| UsageError::new("--profile 缺少取值"))?;
+                    if profile.is_some() {
+                        return Err(UsageError::new("--profile 重复"));
+                    }
+                    profile = Some(ariahost_ui::atlas_probe::Profile::parse(value).ok_or_else(
+                        || UsageError::new(format!("--profile 只认 worst|real|single：{value}")),
+                    )?);
+                    index += 2;
+                }
                 other => {
                     return Err(UsageError::new(format!(
                         "--atlas-probe 不认识的参数：{other}"
@@ -288,7 +304,11 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
                 }
             }
         }
-        return Ok(Command::AtlasProbe { chars });
+        return Ok(Command::AtlasProbe {
+            chars,
+            // 默认 worst = task-106 的既有行为（压测上界），保持向后兼容。
+            profile: profile.unwrap_or(ariahost_ui::atlas_probe::Profile::Worst),
+        });
     }
 
     // 面板的 `--backend`：只影响渲染后端，不影响任何退出码。
@@ -684,7 +704,9 @@ fn execute(command: &Command) -> i32 {
             backend,
             seed_rows,
         } => ariahost_ui::run_selftest(*frames, *size, *backend, *seed_rows, None),
-        Command::AtlasProbe { chars } => ariahost_ui::run_atlas_probe(chars.as_deref()),
+        Command::AtlasProbe { chars, profile } => {
+            ariahost_ui::run_atlas_probe(chars.as_deref(), *profile)
+        }
         Command::Service => match ariahost_svc::run() {
             Ok(()) => EXIT_OK,
             Err(error) => {

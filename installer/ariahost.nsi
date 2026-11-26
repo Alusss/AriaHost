@@ -855,23 +855,23 @@ Section "AriaHost 主程序（必需）" SEC_MAIN
   ; 为什么是 fail-closed 而不是「缺了就跳过」：字体缺失在运行期只表现为
   ; 「字体没变成 Inter」，`inject=` 会回落成系统 provider，用户和 CI 都看不出少了什么；
   ; 只有在编译期报错，才有人会去修。两个文件都是 OFL 授权的真字体（非子集、非改写）。
-  !if /FileExists "${__FILEDIR__}\fonts\Inter-Regular.ttf"
+  !if /FileExists "fonts\Inter-Regular.ttf"
   !else
     !error "Bundled font fonts\Inter-Regular.ttf is missing. The installer ships Inter (OFL-1.1) next to the exe so Latin text renders with Inter instead of falling back to Segoe UI; without it the panel silently degrades. Fix: restore installer\fonts\Inter-Regular.ttf (see THIRD-PARTY-NOTICES.md for source and SHA-256)."
   !endif
-  !if /FileExists "${__FILEDIR__}\fonts\Inter-SemiBold.ttf"
+  !if /FileExists "fonts\Inter-SemiBold.ttf"
   !else
     !error "Bundled font fonts\Inter-SemiBold.ttf is missing (true SemiBold face for the Inter family). Fix: restore installer\fonts\Inter-SemiBold.ttf."
   !endif
   !insertmacro TraceWrite "[install] 装内置字体：fonts\Inter-Regular.ttf + fonts\Inter-SemiBold.ttf"
   SetOutPath "$INSTDIR\fonts"
-  File "${__FILEDIR__}\fonts\Inter-Regular.ttf"
-  File "${__FILEDIR__}\fonts\Inter-SemiBold.ttf"
+  File "fonts\Inter-Regular.ttf"
+  File "fonts\Inter-SemiBold.ttf"
   ; 许可全文与字体**同进同退**：OFL-1.1 要求随发行副本附带许可。
   SetOutPath "$INSTDIR"
   CreateDirectory "$INSTDIR\licenses"
   SetOutPath "$INSTDIR\licenses"
-  File "${__FILEDIR__}\fonts\OFL.txt"
+  File "fonts\OFL.txt"
   SetOutPath "$INSTDIR"
   !insertmacro TraceWrite "[install] 许可：licenses\OFL.txt（Inter，SIL Open Font License 1.1）"
 

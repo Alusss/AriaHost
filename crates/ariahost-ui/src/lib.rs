@@ -265,8 +265,8 @@ pub fn run_selftest(
 /// 与 `--panel-selftest` 的区别：**不开窗、不要 wgpu**。`Context::run_ui` 排版、
 /// `Context::tessellate` 触发光栅化，所以 CI（ubuntu）与无显卡机器都能跑；
 /// 数字只与「这台机器的字体链 + 图集上限」有关。字段口径见 [`atlas_probe`] 模块文档。
-pub fn run_atlas_probe(chars: Option<&[usize]>) -> i32 {
-    crate::atlas_probe::run(chars)
+pub fn run_atlas_probe(chars: Option<&[usize]>, profile: crate::atlas_probe::Profile) -> i32 {
+    crate::atlas_probe::run(chars, profile)
 }
 
 /// 共用启动流程：单实例 → 建窗 → 渲染 → 返回退出码。
