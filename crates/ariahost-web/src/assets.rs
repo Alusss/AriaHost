@@ -282,7 +282,9 @@ mod tests {
                     "{theme}：--{fg} 叠在 --{bg} 上只有 {ratio:.2}:1，要求 ≥{min}:1"
                 );
             }
-            for (fg, bg, min) in [("accent", "card", 3.0), ("line-control", "card", 3.0)] {
+            // 控件边界用 --border-strong（theme.rs 的 border_strong）：它只在 --card 上
+            // 才过 3:1（浅 3.15 / 深 3.49）；压在 --bg 上会掉下去，所以控件一律放进卡片。
+            for (fg, bg, min) in [("accent", "card", 3.0), ("border-strong", "card", 3.0)] {
                 let ratio = contrast(&pick(fg), &pick(bg));
                 assert!(
                     ratio >= min,
@@ -294,6 +296,124 @@ mod tests {
                 on_accent >= 4.5,
                 "{theme}：主按钮文字对 --accent 只有 {on_accent:.2}:1，要求 ≥4.5:1"
             );
+        }
+    }
+
+    /// 色板只有一个来源：面板的 `theme.rs`。
+    ///
+    /// 网页页的令牌值必须**逐字**等于那里的 LIGHT / DARK 两套——
+    /// task-89 首版就漂了三条（`--line` 用了 #d9dde3 而非 border 的 #d6dbe1，
+    /// `--line-control` 在浅色用了 --text 的 #1b1f23 而非 border_strong，
+    /// 于是控件边框看起来比面板重一倍）。两套界面分开维护，下次改色只会改一边，
+    /// 用户在面板和网页页之间切换就会看到两种品牌色，所以这里把值钉死。
+    #[test]
+    fn style_css_palette_matches_the_panel_theme() {
+        let light = color_tokens(&block_after(STYLE_CSS, ":root {"));
+        let dark = color_tokens(&block_after(STYLE_CSS, "prefers-color-scheme: dark"));
+
+        // LIGHT：theme.rs 的 LIGHT 全 15 条。
+        let expected_light = [
+            ("bg", "#f6f7f9"),
+            ("card", "#ffffff"),
+            ("hover", "#eef1f5"),
+            ("border", "#d6dbe1"),
+            ("border-strong", "#8a929c"),
+            ("text", "#1b1f23"),
+            ("muted", "#59626b"),
+            ("link", "#0a58ca"),
+            ("accent", "#1f6feb"),
+            ("on-accent", "#ffffff"),
+            ("ok", "#15803d"),
+            ("bad", "#c42b1c"),
+            ("warn", "#8a5a00"),
+            ("ok-dot", "#00c853"),
+            ("ok-ring", "#0b6b34"),
+        ];
+        for (name, want) in expected_light {
+            assert_eq!(
+                light.get(name).map(String::as_str),
+                Some(want),
+                "--{name} 与 theme.rs LIGHT 不一致（改色请改 theme.rs 再同步到这里）"
+            );
+        }
+        assert_eq!(
+            light.len(),
+            expected_light.len(),
+            "LIGHT 令牌条数与 theme.rs 对不上，多出或少了：{light:?}"
+        );
+
+        // DARK：只覆盖会变的那 13 条。--ok-dot / --ok-ring 在 theme.rs 里深浅同值，
+        // 因此只在 :root 定义一次（不重复定义 = 不会漂）。
+        let expected_dark = [
+            ("bg", "#15181b"),
+            ("card", "#1c2024"),
+            ("hover", "#242a2f"),
+            ("border", "#353c43"),
+            ("border-strong", "#6b757e"),
+            ("text", "#e6e9ec"),
+            ("muted", "#a7b0b8"),
+            ("link", "#86b4ff"),
+            ("accent", "#4c8df6"),
+            ("on-accent", "#0b121c"),
+            ("ok", "#00c853"),
+            ("bad", "#f0616d"),
+            ("warn", "#e0a93b"),
+        ];
+        for (name, want) in expected_dark {
+            assert_eq!(
+                dark.get(name).map(String::as_str),
+                Some(want),
+                "--{name} 与 theme.rs DARK 不一致（改色请改 theme.rs 再同步到这里）"
+            );
+        }
+        assert_eq!(
+            dark.len(),
+            expected_dark.len(),
+            "DARK 令牌条数与 theme.rs 对不上，多出或少了：{dark:?}"
+        );
+    }
+
+    /// 字号只有五档（`theme.rs::text_styles()`：20 / 16 / 14 / 13 / 12），
+    /// 而且每一档都必须**真的被规则用到**——task-89 首版把 16px 定义出来却没人使用，
+    /// 于是网页页没有「次级标题」这一层，视觉层级比面板少一级。
+    #[test]
+    fn style_css_font_sizes_follow_the_five_step_ladder() {
+        for (token, px) in [
+            ("heading", "20px"),
+            ("subtitle", "16px"),
+            ("body", "14px"),
+            ("mono", "13px"),
+            ("small", "12px"),
+        ] {
+            let line = format!("--fs-{token}: {px};");
+            assert!(STYLE_CSS.contains(&line), "缺字号令牌 `{line}`");
+            let uses = STYLE_CSS.matches(&format!("var(--fs-{token})")).count();
+            assert!(uses > 0, "字号令牌 --fs-{token} 定义了却没有任何规则使用");
+        }
+
+        // `font:` 简写会把字号顶掉（`font: 14px/20px ...`），等于绕过令牌层。
+        assert!(
+            !STYLE_CSS.contains("font:"),
+            "别用 `font:` 简写——它绕开字号令牌；请分开写 font-family / font-size / line-height"
+        );
+
+        // 规则区不许出现裸字号。
+        for (index, line) in STYLE_CSS.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty()
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')
+                || trimmed.starts_with("--")
+            {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("font-size:") {
+                assert!(
+                    rest.trim_start().starts_with("var(--fs-"),
+                    "第 {} 行字号没走令牌：{line}",
+                    index + 1
+                );
+            }
         }
     }
 }
