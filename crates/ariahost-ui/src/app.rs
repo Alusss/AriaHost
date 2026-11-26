@@ -3195,6 +3195,12 @@ impl PanelApp {
                 );
                 ui.end_row();
 
+                // 逐字形族链（ui-spec-v2 §2）：用户报「某个汉字是方框」时，第一句要能问清
+                // 是链上哪一级命中的。所以与「中文字体」并列显示，而不是只写启动日志。
+                ui.label("字体族链");
+                ui.label(RichText::new(self.font_state.chain_summary()).small());
+                ui.end_row();
+
                 ui.label("单实例锁");
                 ui.label(
                     RichText::new(self.lock.as_ref().map_or_else(
