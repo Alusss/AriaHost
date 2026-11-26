@@ -252,7 +252,16 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 - **产品侧判据**：`HostUpdate` 被 app 消费 → 文本重绘；`Starting` 期重绘节拍 100 ms（`BUSY_REPAINT`），且 `Starting→Running` 切换时另有一次 `request_refresh`，故应 ≤ ~150 ms（外部观测上限按 300 ms 判）。
 - **测具侧口径**：外部观测值 = 产品延迟 + 一次 UIA 枚举 + 轮询粒度，**不能拿观测值直接与 300 ms 比**。报数时必须同时给出 `uiPollAvg`/`uiFind`，或报「观测值 − 单次枚举成本」的下界。
 
-**2026-11-26 实测基线**（v0.1.1 MSVC 产物、`idle` 条件、n=21、**未含**本批 100/400 ms 改动）：S0 p95 27 ms / max 121 ms；S1 p95 87 ms / max 92 ms；S2 p95 23 ms / max 25 ms；**S3 avg 918 ms / p95 1026 ms / max 1280 ms（同期 `uiPollAvg` 254 ms、`uiFind` 307 ms）**。即 S0/S1/S2 远合规，S3 的观测值几乎全是测具成本——不是产品缺陷。
+**2026-11-26 复测（含 100/400 ms 改动，v0.1.3 / GNU 交叉产物，每条件 n=10，样本 `segments-<cond>.csv`）**：
+
+| 条件 | S0 avg/max | S1 avg/max | S2 avg/max | S3 avg/max | total avg/max | `uiPollAvg` |
+|---|---|---|---|---|---|---|
+| `idle` | 72 / 171 | 64 / 103 | 5 / 32 | **789 / 1113** | 931 / 1206 | 250 |
+| `residual` | 59 / 155 | 78 / 134 | 7 / 44 | **904 / 1086** | 1049 / 1219 | 327 |
+
+- **S0/S1/S2 远合规**（S0 上限 171 ms < 300 ms；S2 上限 44 ms ≪ 400 ms），即「点一下到 aria2c 真起来」这一段没有攒延迟。
+- **S3 观测值 789–904 ms 仍越 300 ms 线，但它是测具成本**：`pollN` 只有 2–6 轮，S3 ≈ `pollN × uiPollAvg`，说明观测分辨率就是 250–330 ms 级；扣除一次 UIA 枚举后下界约 500 ms，仍不能归因到产品重绘路径（该路径 `BUSY_REPAINT=100 ms` + `Starting→Running` 的 `request_refresh`）。
+- **`portbusy` 条件结构性不可测**：端口被占时「启动 aria2」按钮处于禁用态（`Invoke` 报 `Unrecognized error`），10/10 无 spawn、S0–S3 全空。**附带结论**：原始 `task-59` 里那 2/20「点启动后 5 秒还在启动中」不可能是 portbusy 分支（该分支压根不启动），且本次 idle/residual 共 20 例 `total` 最大 **1219 ms**，**未复现** 5 秒级停滞。
 
 **什么条件下重开**：某真机四段计时里 **S2 > 1.5 s**（说明还有别的东西在压制探测）、或**扣除单次 UIA 枚举成本后 S3 > 300 ms**、或「启动中」稳定超过 8 s 变成可复现现象。
 
