@@ -47,6 +47,15 @@ const SIZE_TOLERANCE: i64 = 2;
 /// 「通道里有没有新结果」。500ms 足够跟手（刷新本身是 2s 一次），又不会烧 CPU。
 const IDLE_REPAINT: Duration = Duration::from_millis(500);
 
+/// 底部「运行信息…」展开体占视口高度的比例（task-101 定值：40%）。
+const DIAG_BODY_RATIO: f32 = 0.40;
+
+/// 展开体高度下限（pt）：再小就看不清一行 Grid，等于没展开。
+const DIAG_BODY_MIN: f32 = 240.0;
+
+/// 展开体高度上限（pt）：再大就把任务表压得没地方了。
+const DIAG_BODY_MAX: f32 = 520.0;
+
 /// 隐藏到托盘后的唤醒周期（2Hz：足够及时处理托盘点击，又不会常驻动画）。
 const HIDDEN_WAKE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -328,6 +337,11 @@ pub struct PanelApp {
     selftest_reported: bool,
     /// IME 自检输入框内容（EG-2 门禁的真机验证载体）。
     ime_probe: String,
+    /// 底部「运行信息、输入法自检与日志」的展开体是否打开（task-101：自管展开态）。
+    ///
+    /// 为什么不用 `CollapsingHeader`：它只会**向下**展开，会把版本行往下顶走，
+    /// 版本行就再也贴不住底了——而用户报障时第一眼要抄的正是那一行。
+    diag_open: bool,
     last_memory_kb: Option<u64>,
     last_memory_at: Instant,
     /// wgpu 未捕获错误计数（与错误回调共享）。
@@ -577,6 +591,7 @@ impl PanelApp {
             frames: 0,
             selftest_reported: false,
             ime_probe: String::new(),
+            diag_open: false,
             last_memory_kb: metrics::private_working_set_kb(),
             last_memory_at: Instant::now(),
             wgpu_errors,
@@ -3167,12 +3182,55 @@ impl PanelApp {
         }
     }
 
-    /// 折叠区：运行信息 / 输入法自检 / 内部日志。
+    /// 底部区：**展开体（若有）→「运行信息…」标题行 → 版本/核心行**。
+    ///
+    /// 顺序是硬要求（task-101）：展开时新内容出现在标题行**上方**，版本行永远留在
+    /// 最底、不被顶走。`ariahost_diag` 这个 bottom Panel 的高度由内容决定，所以
+    /// 「向上生长」是布局的自然结果，不需要另外指定方向。
     fn show_footer(&mut self, ui: &mut egui::Ui) {
+        if self.diag_open {
+            let height = diag_body_height(ui.ctx().content_rect().height());
+            let width = ui.available_width();
+            let body = ui.allocate_ui_with_layout(
+                egui::vec2(width, height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    // 一个 ScrollArea 装三块；日志是环形缓冲（最多 500 行），
+                    // `stick_to_bottom` 让新行始终在视野里（打开即贴底＝先看到日志尾部，
+                    // 要看配置项往上滚一下）。
+                    egui::ScrollArea::vertical()
+                        .id_salt("ariahost_diag_body")
+                        .max_height(height)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            self.show_facts(ui);
+                            ui.add_space(10.0);
+                            self.show_probe(ui);
+                            ui.add_space(10.0);
+                            self.show_log(ui);
+                        });
+                },
+            );
+            self.drive_targets.note("诊断展开体", body.response.rect);
+        }
+
+        // 标题行：自管展开态。用 `Button(frame(false))` 而不是 `selectable_label`
+        // 或 `CollapsingHeader`：前者在 accesskit 里不是可执行控件（辅助技术点不动，
+        // 真机验收踩过），后者只能向下展开、会把版本行顶走。
+        let arrow = if self.diag_open { "▾" } else { "▸" };
+        let title = ui.add(
+            egui::Button::new(RichText::new(format!("{arrow} 运行信息、输入法自检与日志")))
+                .frame(false),
+        );
+        if title.clicked() {
+            self.diag_open = !self.diag_open;
+        }
+        self.drive_targets.note("诊断标题", title.rect);
+
         // 「关于」常显一行（不折叠）：用户报障时第一句要能抄出「版本 + 核心来源与版本」，
         // 否则「安装包自带核心」这条在界面上无从证实（task-54 C-UI）。
         // 产品名**不在这里重复**（UI-Spec §6.1 规则 2：产品名只在壳里出现一次）。
-        ui.horizontal_wrapped(|ui| {
+        let about = ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("v{VERSION}")).small().weak());
             ui.label(RichText::new("·").small().weak());
             ui.label(
@@ -3181,15 +3239,7 @@ impl PanelApp {
                     .weak(),
             );
         });
-        egui::CollapsingHeader::new("运行信息、输入法自检与日志")
-            .id_salt("ariahost_diag")
-            .show(ui, |ui| {
-                self.show_facts(ui);
-                ui.add_space(10.0);
-                self.show_probe(ui);
-                ui.add_space(10.0);
-                self.show_log(ui);
-            });
+        self.drive_targets.note("版本行", about.response.rect);
     }
 
     /// 信息区：渲染后端 / 图集上限 / 中文字体 / 单实例 / 内存 / RPC / SCM。
@@ -3794,6 +3844,14 @@ fn banner_level(tone: Tone) -> Option<Level> {
     }
 }
 
+/// 展开体高度：视口的 40%，夹在 [`DIAG_BODY_MIN`, `DIAG_BODY_MAX`] 之间（task-101 定值）。
+///
+/// 既不是「内容多高就多高」（500 行日志环形缓冲会把任务表压到零高），也不是写死一个
+/// 值（1080p 上吃掉一半，4K 上又显得太矮）。
+fn diag_body_height(viewport_h: f32) -> f32 {
+    (viewport_h * DIAG_BODY_RATIO).clamp(DIAG_BODY_MIN, DIAG_BODY_MAX)
+}
+
 /// 「核心」一行的人话总结（信息区与「关于」**共用同一份**，不各写一套）。
 ///
 /// 口径（M3-j / task-54 C-UI）：
@@ -4142,6 +4200,19 @@ mod tests {
         assert_eq!(title, PRODUCT_NAME);
         // 版本号不许再进标题（它由「关于」行承载）。
         assert!(!title.contains(VERSION), "{title}");
+    }
+
+    /// 展开体高度：40% 视口，且必须夹在上下限里（task-101 判据 3 的纯逻辑一半）。
+    #[test]
+    fn diag_body_height_is_forty_percent_clamped() {
+        // 1080p 客户区约 1040 pt：40% = 416，落在 240..=640 内 → 原样。
+        assert!((diag_body_height(1040.0) - 416.0).abs() < 0.01);
+        // 矮窗口不许把任务表挤没：取下限。
+        assert_eq!(diag_body_height(400.0), DIAG_BODY_MIN);
+        // 超高窗口不许吃掉整屏：取上限。
+        assert_eq!(diag_body_height(4000.0), DIAG_BODY_MAX);
+        // 常量本身要自洽（下限 < 上限），否则 clamp 会 panic。
+        const { assert!(DIAG_BODY_MIN < DIAG_BODY_MAX) };
     }
 
     /// 关窗判定的唯一口径：**托盘没通就不许藏窗**（v0.1.2 用户报障的根因）。
