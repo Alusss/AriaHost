@@ -1,5 +1,9 @@
 # AriaHost 界面设计系统规格（UI Spec v1）
 
+> **已被 `ui-spec-v2.md` 取代（v2，2026-11-26）。** 本文保留为历史审计记录；施工以 v2 为准。
+> v2 修订了四件事：字体家族（Segoe UI + YaHei UI 逐字形回退）、字号阶梯（对齐 Fluent 2 的 12/14/16/20）、
+> 颜色令牌（新增正绿 `ok.dot/ok.text/ok.ring`，状态色全部改为令牌）与卡片化分隔（删除页面内分割线）。
+
 > 适用范围：`crates/ariahost-ui`（eframe / egui 0.37，纯立即模式，无 CSS、无样式表）。
 > 本文件是**规格**（要改成什么样），不是现状描述；现状逐条问题见 [ui-audit.md](ui-audit.md)。
 > 所有颜色对比度由 `.scratch/design/contrast_report.py` 实算，实测表见 `.scratch/design/contrast-current.md`（现状）与 `.scratch/design/contrast-tokens.md`（本规格提案，全部 PASS）。
