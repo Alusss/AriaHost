@@ -209,7 +209,7 @@ Q8 已定：v1 发布**不签名**，Release notes 与 README 都明说「未知
 URL 形态只有两种，不要混：
 
 - CDN 行：`<net.cdn_base><文件名>`（基址默认 `https://ah.335772.xyz/releases/`，`net.cdn_base = ""` 即跳过该行）；
-- 直连行：`{url}` 占位符替换成 GitHub 资产完整 URL；旧的「前缀 + 完整 URL」镜像模板保留在代码里（`DEFAULT_MIRROR_TEMPLATE`），但**不进默认顺序**（该镜像已整体 404）。
+- 直连行：`{url}` 占位符替换成 GitHub 资产完整 URL。**直连还是走前缀代理**由 `net.core_proxy_mode`（`direct` / `proxy`，默认 `direct`）决定；`proxy` 时把 GitHub 资产**完整 URL** 拼在 `net.core_proxy_url`（默认 `https://ghproxy.net/`）后面。**旧的「前缀 + 完整 URL」镜像模板 `DEFAULT_MIRROR_TEMPLATE` 已由 task-76 从代码中删除**（`r.alusss.cn` 整体 404），不要再加回来；也不要把它和 `net.proxy`（aria2c 的下载代理）混为一谈。
 
 哈希纪律（与随包分发同一套）：`KNOWN_SHA256` 锁死 **1.37.0 的 64 位与 32 位两个包**。命中则硬校验，不符即 `AH-E6003`，**且在装库之前失败**（旧版本原封不动）；没有已知哈希的版本走 `HashState::Unverified` + 一条进 `FetchOutcome::warnings` 的显式告警（UI 不得声称「已校验」），这是既定的诚实降级，**不要为了「看起来更严」去编造校验值**。新增线路或放宽哈希等于打开供应链口子，改之前必须确认。
 
