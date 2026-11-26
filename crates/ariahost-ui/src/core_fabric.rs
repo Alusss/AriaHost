@@ -177,6 +177,34 @@ pub struct Decision {
     pub reason: Option<String>,
 }
 
+impl Decision {
+    /// 「关于」行用的一句话：**来源 + 状态徽章**。
+    ///
+    /// 为什么在这里而不是 UI 里：序列 2 真机验出过口径不一致——顶层状态区说
+    /// 「服务：运行中」，底部「关于」行却仍按**本地探针**说「未就绪（找不到 aria2c）」，
+    /// 同一屏上两个结论互相打脸。凡是从这份 Decision 派生，就不会再分叉。
+    pub fn about(&self) -> String {
+        format!("{}（{}）", self.origin.label_zh(), self.view.badge)
+    }
+}
+
+/// 面板自有核心的启动硬闸（M5-a「绝不抢 6800」的**唯一**判据）。
+///
+/// `Some(原因)` = **不许** spawn 自有核心：调用方（`app::request_core_start`）必须在
+/// `host.start()` 之前返回。抽成函数不是为了好看，是为了让「服务在跑时 spawn 入口
+/// 不可达」这条**能被单测钉住**——非提权会话里装不了服务，序列 2 只能这样取证。
+pub fn local_start_blocked(decision: &Decision) -> Option<String> {
+    if decision.start.enabled {
+        return None;
+    }
+    let why = decision
+        .view
+        .next_step
+        .as_deref()
+        .unwrap_or(decision.start.tip.as_str());
+    Some(format!("{}（{why}）", decision.start.tip))
+}
+
 /// 端口被外部程序占用时的下一步（可执行，不甩锅）。
 fn foreign_port_next(port: u16) -> String {
     format!("先在任务管理器里结束占用 {port} 的程序；或到「设置 → 下载 → 下载核心」改端口后重启")
@@ -493,6 +521,39 @@ mod tests {
         );
         assert!(decision.view.headline.starts_with("服务：运行中"));
         assert_eq!(decision.rpc_port, 6800);
+    }
+
+    #[test]
+    fn service_running_makes_the_spawn_entry_unreachable() {
+        // 任务书 D.2 的「序列 2」（服务在跑 + 面板不许抢 6800）在非提权会话里**没法真机取证**
+        // （SCM 写操作必失败 AH-E5002），所以把结论钉在 spawn 入口真正读的那个函数上。
+        let decision = decide(&facts(
+            ServicePhase::Running,
+            LocalPhase::Idle,
+            PortOwner::Ours,
+            true,
+        ));
+        let blocked = local_start_blocked(&decision)
+            .expect("服务在跑时，面板自有核心的 spawn 必须被硬闸拦住");
+        assert!(
+            blocked.contains("服务"),
+            "拦截原因要点明「服务在托管」，不能只说「按钮不可用」：{blocked}"
+        );
+    }
+
+    #[test]
+    fn idle_and_local_running_do_not_block_the_same_way() {
+        // 反证：硬闸不能把「什么都没跑」也一起拦掉，否则面板永远起不来。
+        let idle = decide(&facts(
+            ServicePhase::NotRunning,
+            LocalPhase::Idle,
+            PortOwner::Ours,
+            true,
+        ));
+        assert!(
+            local_start_blocked(&idle).is_none_or(|why| !why.contains("服务")),
+            "服务没在跑时，硬闸不该拿「服务」当理由"
+        );
     }
 
     #[test]

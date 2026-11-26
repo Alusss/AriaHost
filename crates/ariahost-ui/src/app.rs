@@ -719,16 +719,8 @@ impl PanelApp {
         // M5-a「绝不抢 6800」：按钮置灰之外再加一道硬闸——服务在跑或端口被别人占时，
         // 无论从按钮、托盘还是后续新入口调用，都不许面板再 spawn 第二个核心。
         let decision = crate::core_fabric::decide(&self.fabric_facts());
-        if !decision.start.enabled {
-            let why = decision
-                .view
-                .next_step
-                .clone()
-                .unwrap_or_else(|| decision.start.tip.to_owned());
-            self.set_banner(Banner::new(
-                Tone::Warn,
-                format!("{}（{}）", decision.start.tip, why),
-            ));
+        if let Some(reason) = crate::core_fabric::local_start_blocked(&decision) {
+            self.set_banner(Banner::new(Tone::Warn, reason));
             return;
         }
         match &self.host {
