@@ -1,4 +1,4 @@
-﻿﻿#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   推送中继：经 GitHub REST API（api.github.com）把本地提交重放到远端。
 
@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
-$repo = 'Alusss/Ariahost'
+$repo = 'Alusss/AriaHost'
 $branch = 'main'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $root

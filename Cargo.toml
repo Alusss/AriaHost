@@ -15,7 +15,7 @@ version = "0.1.4"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Alusss/Ariahost"
+repository = "https://github.com/Alusss/AriaHost"
 
 [workspace.dependencies]
 # 面板 UI 栈：整条 pin 在 0.37（EG-1，防版本漂移；MSRV 1.95 与本仓库工具链 pin 一致）。
