@@ -1176,139 +1176,143 @@ impl PanelApp {
 
     /// 六态状态卡片：状态 / 启动方式 / PID / 等待态 / 结果提示。
     fn show_service_card(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.service;
-        let state = snapshot.and_then(|snapshot| snapshot.state());
+        crate::theme::card(ui).show(ui, |ui| {
+            let snapshot = self.service;
+            let state = snapshot.and_then(|snapshot| snapshot.state());
 
-        let (label, color) = match (state, snapshot) {
-            (Some(state), _) => (
-                service::state_label(state),
-                service_state_color(crate::theme::tokens(ui), state),
-            ),
-            (None, Some(ServiceSnapshot::Failed { .. })) => {
-                ("查询失败", crate::theme::tokens(ui).danger_text)
-            }
-            (None, _) => ("读取中…", crate::theme::tokens(ui).text2),
-        };
+            let (label, color) = match (state, snapshot) {
+                (Some(state), _) => (
+                    service::state_label(state),
+                    service_state_color(crate::theme::tokens(ui), state),
+                ),
+                (None, Some(ServiceSnapshot::Failed { .. })) => {
+                    ("查询失败", crate::theme::tokens(ui).danger_text)
+                }
+                (None, _) => ("读取中…", crate::theme::tokens(ui).text2),
+            };
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("状态").weak());
-            let badge = ui.label(
-                RichText::new(label)
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("状态").weak());
+                let badge = ui.label(
+                    RichText::new(label)
                 .strong()
                 // 字号只从 `text_styles` 阶梯取（§2.2 规则 1），不写字面量字号。
                 .font(subtitle_font(ui))
                 .color(color),
-            );
-            self.drive_targets.note("服务状态", badge.rect);
-            ui.label(
-                RichText::new(format!("服务名 {}", ariahost_svc::SERVICE_NAME))
-                    .weak()
-                    .small(),
-            );
-        });
-
-        if let Some(state) = state {
-            ui.label(RichText::new(service::state_hint(state)).weak());
-        }
-
-        ui.add_space(6.0);
-        egui::Grid::new("ariahost_service_facts")
-            .num_columns(2)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("启动方式").weak());
-                let start_mode = match snapshot {
-                    Some(ServiceSnapshot::State(report)) => report.start_type,
-                    _ => None,
-                };
-                ui.label(service::start_mode_label(start_mode));
-                ui.end_row();
-
-                ui.label(RichText::new("PID").weak());
-                let pid = match snapshot {
-                    Some(ServiceSnapshot::State(report)) => report.pid,
-                    _ => None,
-                };
-                ui.label(pid.map_or_else(
-                    || "—（未运行或 SCM 未给）".to_owned(),
-                    |pid| pid.to_string(),
-                ));
-                ui.end_row();
-
-                ui.label(RichText::new("查询失败原因").weak());
-                match snapshot {
-                    Some(ServiceSnapshot::Failed { code, .. }) => {
-                        ui.label(
-                            RichText::new(format!("{}（详见日志）", code.code()))
-                                .color(crate::theme::tokens(ui).warn_text),
-                        );
-                    }
-                    _ => {
-                        ui.label(RichText::new("—").weak());
-                    }
-                }
-                ui.end_row();
+                );
+                self.drive_targets.note("服务状态", badge.rect);
+                ui.label(
+                    RichText::new(format!("服务名 {}", ariahost_svc::SERVICE_NAME))
+                        .weak()
+                        .small(),
+                );
             });
 
-        // 等待态：进度 + 说明 + 计时（停止是两段式，见 `service::waiting_text`）。
-        if let Some((progress, hint, counter)) =
-            service::waiting_text(self.service_card.stage(), Instant::now())
-        {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.spinner();
-                let line = ui.label(RichText::new(progress).strong());
-                self.drive_targets.note("服务等待态", line.rect);
-            });
-            ui.label(RichText::new(hint).weak());
-            if let Some(counter) = counter {
-                ui.label(RichText::new(counter).weak().small());
+            if let Some(state) = state {
+                ui.label(RichText::new(service::state_hint(state)).weak());
             }
-        }
 
-        // 结果提示：成功绿 / 信息灰（取消授权走这里，**不是红条**）/ 失败红。
-        if let Some((tone, message)) = self.service_card.notice().cloned() {
-            ui.add_space(8.0);
-            let color = match tone {
-                service::NoticeTone::Ok => crate::theme::tokens(ui).ok_text,
-                service::NoticeTone::Info => crate::theme::tokens(ui).info_text,
-                service::NoticeTone::Bad => crate::theme::tokens(ui).danger_text,
-            };
-            let response = ui.label(RichText::new(message).color(color));
-            self.drive_targets.note("服务结果提示", response.rect);
-        }
-
-        if !self.elevated {
             ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "当前以普通权限运行：每次装/卸/启停都会弹一次 Windows 授权框。\
-                     想免掉它，可右键面板 →「以管理员身份运行」。",
-                )
-                .weak()
-                .small(),
-            );
-        }
+            egui::Grid::new("ariahost_service_facts")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("启动方式").weak());
+                    let start_mode = match snapshot {
+                        Some(ServiceSnapshot::State(report)) => report.start_type,
+                        _ => None,
+                    };
+                    ui.label(service::start_mode_label(start_mode));
+                    ui.end_row();
 
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("查看服务日志").clicked() {
-                self.open_service_log();
-            }
-            if ui.button("刷新状态").clicked() {
-                if let Some(worker) = &self.worker {
-                    worker.burst_service();
+                    ui.label(RichText::new("PID").weak());
+                    let pid = match snapshot {
+                        Some(ServiceSnapshot::State(report)) => report.pid,
+                        _ => None,
+                    };
+                    ui.label(pid.map_or_else(
+                        || "—（未运行或 SCM 未给）".to_owned(),
+                        |pid| pid.to_string(),
+                    ));
+                    ui.end_row();
+
+                    ui.label(RichText::new("查询失败原因").weak());
+                    match snapshot {
+                        Some(ServiceSnapshot::Failed { code, .. }) => {
+                            ui.label(
+                                RichText::new(format!("{}（详见日志）", code.code()))
+                                    .color(crate::theme::tokens(ui).warn_text),
+                            );
+                        }
+                        _ => {
+                            ui.label(RichText::new("—").weak());
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            // 等待态：进度 + 说明 + 计时（停止是两段式，见 `service::waiting_text`）。
+            if let Some((progress, hint, counter)) =
+                service::waiting_text(self.service_card.stage(), Instant::now())
+            {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let line = ui.label(RichText::new(progress).strong());
+                    self.drive_targets.note("服务等待态", line.rect);
+                });
+                ui.label(RichText::new(hint).weak());
+                if let Some(counter) = counter {
+                    ui.label(RichText::new(counter).weak().small());
                 }
-                self.log.push("手动刷新服务状态".to_owned());
             }
-            ui.label(
-                RichText::new("服务日志在 %ProgramData%\\AriaHost\\logs，需管理员权限才写得进去")
+
+            // 结果提示：成功绿 / 信息灰（取消授权走这里，**不是红条**）/ 失败红。
+            if let Some((tone, message)) = self.service_card.notice().cloned() {
+                ui.add_space(8.0);
+                let color = match tone {
+                    service::NoticeTone::Ok => crate::theme::tokens(ui).ok_text,
+                    service::NoticeTone::Info => crate::theme::tokens(ui).info_text,
+                    service::NoticeTone::Bad => crate::theme::tokens(ui).danger_text,
+                };
+                let response = ui.label(RichText::new(message).color(color));
+                self.drive_targets.note("服务结果提示", response.rect);
+            }
+
+            if !self.elevated {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "当前以普通权限运行：每次装/卸/启停都会弹一次 Windows 授权框。\
+                     想免掉它，可右键面板 →「以管理员身份运行」。",
+                    )
                     .weak()
                     .small(),
-            );
+                );
+            }
+
+            ui.add_space(10.0);
+            ui.add_space(10.0);
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("查看服务日志").clicked() {
+                    self.open_service_log();
+                }
+                if ui.button("刷新状态").clicked() {
+                    if let Some(worker) = &self.worker {
+                        worker.burst_service();
+                    }
+                    self.log.push("手动刷新服务状态".to_owned());
+                }
+                ui.label(
+                    RichText::new(
+                        "服务日志在 %ProgramData%\\AriaHost\\logs，需管理员权限才写得进去",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
         });
     }
 
@@ -1394,7 +1398,7 @@ impl PanelApp {
                     if reset_response.clicked() {
                         self.settings.reset_defaults();
                     }
-                    ui.separator();
+                    ui.add_space(10.0);
                     // M3-h：核心来源的**常驻入口**——卡片收掉（「稍后再说」）之后，
                     // 用户还能从这里把引导叫回来，不必去找命令行。
                     let core_response = ui.button("重新配置下载核心");
@@ -1405,7 +1409,7 @@ impl PanelApp {
                         self.guide.reopen();
                         self.log.push("设置页：重新打开核心引导卡".to_owned());
                     }
-                    ui.separator();
+                    ui.add_space(10.0);
                     if dirty {
                         ui.label(RichText::new("有未保存的改动").color(tone_color(ui, Tone::Warn)));
                     } else {
@@ -1502,7 +1506,7 @@ impl PanelApp {
                     self.settings.leaving = false;
                 }
             });
-            ui.separator();
+            ui.add_space(10.0);
         }
 
         ui.add_space(2.0);
@@ -1525,7 +1529,7 @@ impl PanelApp {
                     }
                 },
             );
-            ui.separator();
+            ui.add_space(10.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.settings.group() {
@@ -1589,66 +1593,69 @@ impl PanelApp {
 
     /// A 组：下载（`[dl]`）。
     fn show_settings_download(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("下载").strong());
-        ui.label(
-            RichText::new(
-                "落盘目录与文件命名；这些值会渲染进 aria2.conf，改完需重启 aria2 才生效。",
-            )
-            .weak(),
-        );
-        ui.add_space(4.0);
-        self.settings_text_row(
-            ui,
-            "dl.dir",
-            "下载目录",
-            "必须是已存在且可写的目录，例如 D:\\Downloads",
-            280.0,
-        );
-        Self::settings_note(
-            ui,
-            "dl.dir",
-            "本批不给「浏览…」按钮：仓库里没有 rfd，不为选目录引新依赖",
-        );
-        ui.add_space(6.0);
+        crate::theme::card(ui).show(ui, |ui| {
+            ui.label(RichText::new("下载").strong());
+            ui.label(
+                RichText::new(
+                    "落盘目录与文件命名；这些值会渲染进 aria2.conf，改完需重启 aria2 才生效。",
+                )
+                .weak(),
+            );
+            ui.add_space(4.0);
+            self.settings_text_row(
+                ui,
+                "dl.dir",
+                "下载目录",
+                "必须是已存在且可写的目录，例如 D:\\Downloads",
+                280.0,
+            );
+            Self::settings_note(
+                ui,
+                "dl.dir",
+                "本批不给「浏览…」按钮：仓库里没有 rfd，不为选目录引新依赖",
+            );
+            ui.add_space(6.0);
 
-        let mut renamed = self.settings.draft().dl.auto_file_renaming;
-        if ui
-            .checkbox(
-                &mut renamed,
-                "重名文件自动改名（auto-file-renaming，默认 true）",
-            )
-            .changed()
-        {
-            self.settings.draft_mut().dl.auto_file_renaming = renamed;
-        }
-        let mut overwrite = self.settings.draft().dl.allow_overwrite;
-        if ui
-            .checkbox(
-                &mut overwrite,
-                "允许覆盖同名文件（allow-overwrite，默认 false）",
-            )
-            .changed()
-        {
-            self.settings.draft_mut().dl.allow_overwrite = overwrite;
-        }
-        let mut continue_dl = self.settings.draft().dl.continue_dl;
-        if ui
-            .checkbox(&mut continue_dl, "断点续传（continue，默认 true）")
-            .changed()
-        {
-            self.settings.draft_mut().dl.continue_dl = continue_dl;
-        }
-        let mut always_resume = self.settings.draft().dl.always_resume;
-        if ui
-            .checkbox(&mut always_resume, "总是续传（always-resume，默认 true）")
-            .changed()
-        {
-            self.settings.draft_mut().dl.always_resume = always_resume;
-        }
+            let mut renamed = self.settings.draft().dl.auto_file_renaming;
+            if ui
+                .checkbox(
+                    &mut renamed,
+                    "重名文件自动改名（auto-file-renaming，默认 true）",
+                )
+                .changed()
+            {
+                self.settings.draft_mut().dl.auto_file_renaming = renamed;
+            }
+            let mut overwrite = self.settings.draft().dl.allow_overwrite;
+            if ui
+                .checkbox(
+                    &mut overwrite,
+                    "允许覆盖同名文件（allow-overwrite，默认 false）",
+                )
+                .changed()
+            {
+                self.settings.draft_mut().dl.allow_overwrite = overwrite;
+            }
+            let mut continue_dl = self.settings.draft().dl.continue_dl;
+            if ui
+                .checkbox(&mut continue_dl, "断点续传（continue，默认 true）")
+                .changed()
+            {
+                self.settings.draft_mut().dl.continue_dl = continue_dl;
+            }
+            let mut always_resume = self.settings.draft().dl.always_resume;
+            if ui
+                .checkbox(&mut always_resume, "总是续传（always-resume，默认 true）")
+                .changed()
+            {
+                self.settings.draft_mut().dl.always_resume = always_resume;
+            }
+        });
     }
 
     /// B 组：网络（`[net]`）。
     fn show_settings_network(&mut self, ui: &mut egui::Ui) {
+        crate::theme::card(ui).show(ui, |ui| {
         ui.label(RichText::new("网络").strong());
         ui.label(
             RichText::new("并发、分片与限速。尺寸要写成「数字+单位」（20M / 512K / 1G）；这条规则是 aria2 的，写成 20MB 会被它拒掉。")
@@ -1706,10 +1713,12 @@ impl PanelApp {
             "16M / 0 = 关",
             120.0,
         );
+        });
     }
 
     /// C 组：界面（`[ui]` / `[lifecycle]`）。
     fn show_settings_interface(&mut self, ui: &mut egui::Ui) {
+        crate::theme::card(ui).show(ui, |ui| {
         ui.label(RichText::new("界面").strong());
         ui.label(
             RichText::new("关闭行为、渲染器与开机自启。标红的项本批只写配置、行为还没接线——不会骗你说已经生效。")
@@ -1837,6 +1846,7 @@ impl PanelApp {
             "lifecycle.quit_default",
             "值域取自架构 §7-R 的三种退出选项；文档没给枚举清单，已上报 Lead",
         );
+        });
     }
 
     /// 启动检测：`session\aria2.session` 非空 → 顶部信息条（不是弹窗）。
@@ -2153,6 +2163,13 @@ impl PanelApp {
     /// 把「服务 / 面板托管 / 端口」三类事实收成 fabric 的输入（M5-a）。
     ///
     /// 端口事实只在这层探一次：`Fabric` 内部带缓存，避免每帧做 socket 探测。
+    /// 「关于」行与信息区共用的核心一句话：**只从 core_fabric 的判定派生**。
+    ///
+    /// 不用 `core_probe`：那是「本机有没有 aria2c 文件」的**局部**事实。服务在跑时
+    /// 核心由服务提供，按局部探针写「未就绪」会与服务页的六态自相矛盾（真机序列 2 抓到）。
+    fn core_about(&mut self) -> String {
+        crate::core_fabric::decide(&self.fabric_facts()).about()
+    }
     fn fabric_facts(&mut self) -> crate::core_fabric::Facts {
         let rpc_port = self.worker_options.port;
         let listening = self.fabric.port_listening(rpc_port);
@@ -2793,47 +2810,49 @@ impl PanelApp {
     }
 
     fn show_new_task(&mut self, ui: &mut egui::Ui) {
-        let mut submit = false;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("新建下载").strong());
-            let width = (ui.available_width() - 88.0).max(200.0);
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.url)
-                    .id_salt("ariahost_url_input")
-                    .hint_text("粘贴下载链接（http/https/ftp/magnet），回车开始")
-                    .desired_width(width),
-            );
-            // 只在第一帧请求一次焦点（用控件自己上报的 id，不手搓 Id——0.37 已弃用 `Id::new`）。
-            // **不要**把它挪进每帧路径（EG-2）。
-            if !self.focus_requested {
-                self.focus_requested = true;
-                let id = response.id;
-                ui.ctx().memory_mut(|memory| memory.request_focus(id));
+        crate::theme::card(ui).show(ui, |ui| {
+            let mut submit = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("新建下载").strong());
+                let width = (ui.available_width() - 88.0).max(200.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.url)
+                        .id_salt("ariahost_url_input")
+                        .hint_text("粘贴下载链接（http/https/ftp/magnet），回车开始")
+                        .desired_width(width),
+                );
+                // 只在第一帧请求一次焦点（用控件自己上报的 id，不手搓 Id——0.37 已弃用 `Id::new`）。
+                // **不要**把它挪进每帧路径（EG-2）。
+                if !self.focus_requested {
+                    self.focus_requested = true;
+                    let id = response.id;
+                    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                }
+                let enter =
+                    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                // M3-h：核心没就绪时「开始」置灰，并把同一句引导挂在悬浮提示上。
+                let core_ok = self.core_usable();
+                let start = ui.add_enabled(core_ok, egui::Button::new("开始"));
+                let hint = if core_ok {
+                    "加入下载队列（aria2.addUri）"
+                } else {
+                    "先准备好下载核心：设置 →「下载核心」"
+                };
+                if start.on_hover_text(hint).clicked() || (core_ok && enter) {
+                    submit = true;
+                }
+            });
+            if submit {
+                self.submit_url();
             }
-            let enter =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            // M3-h：核心没就绪时「开始」置灰，并把同一句引导挂在悬浮提示上。
-            let core_ok = self.core_usable();
-            let start = ui.add_enabled(core_ok, egui::Button::new("开始"));
-            let hint = if core_ok {
-                "加入下载队列（aria2.addUri）"
-            } else {
-                "先准备好下载核心：设置 →「下载核心」"
-            };
-            if start.on_hover_text(hint).clicked() || (core_ok && enter) {
-                submit = true;
+            if let Some(pending) = &self.pending_add {
+                ui.label(
+                    RichText::new(format!("正在提交：{}", short_name(pending)))
+                        .weak()
+                        .small(),
+                );
             }
         });
-        if submit {
-            self.submit_url();
-        }
-        if let Some(pending) = &self.pending_add {
-            ui.label(
-                RichText::new(format!("正在提交：{}", short_name(pending)))
-                    .weak()
-                    .small(),
-            );
-        }
     }
 
     /// 任务表（EG-8：`body().rows()` 只画可见区间）。
@@ -3133,7 +3152,7 @@ impl PanelApp {
             ui.label(RichText::new(format!("v{VERSION}")).small().weak());
             ui.label(RichText::new("·").small().weak());
             ui.label(
-                RichText::new(format!("aria2 核心：{}", core_summary(&self.core_probe)))
+                RichText::new(format!("aria2 核心：{}", self.core_about()))
                     .small()
                     .weak(),
             );
@@ -3142,9 +3161,9 @@ impl PanelApp {
             .id_salt("ariahost_diag")
             .show(ui, |ui| {
                 self.show_facts(ui);
-                ui.separator();
+                ui.add_space(10.0);
                 self.show_probe(ui);
-                ui.separator();
+                ui.add_space(10.0);
                 self.show_log(ui);
             });
     }
@@ -3162,7 +3181,7 @@ impl PanelApp {
 
                 // M3-j（task-54 C-UI）：「核心」区必须能看出内置 / 托管 / 外部 + 版本。
                 ui.label("aria2 核心");
-                ui.label(RichText::new(core_summary(&self.core_probe)).small());
+                ui.label(RichText::new(self.core_about()).small());
                 ui.end_row();
 
                 ui.label("字形图集上限");
@@ -3759,6 +3778,9 @@ fn banner_level(tone: Tone) -> Option<Level> {
 ///
 /// 来源取的是 `resolve_core_in` 的**实际解析结果**（`CoreOrigin`），不是配置里那个
 /// 可能写着 `auto` 的原始值——`auto` 到底落成内置还是托管，只有解析后才知道。
+// 旧「本地探针」口径：**产品路径已统一走 `core_fabric`**，这里只为既有单测保留
+// （断言三种来源的文案拼接规则未漂移）。新增界面文案不要再调它。
+#[cfg(test)]
 fn core_summary(probe: &CoreProbe) -> String {
     if probe.exe.is_none() {
         let why = probe
@@ -3780,6 +3802,8 @@ fn core_summary(probe: &CoreProbe) -> String {
 /// **冒号不当作断句**：task-54 判据 R3 要求 `source = external` 但文件不存在时，
 /// 界面能看出「external_path 指向的文件不存在」——那句话正好在冒号后面。
 /// 只按换行/分号/句号断句（那些后面才是并列的其它原因），再按字符数截断。
+// 与 `core_summary` 同口径：仅 `core_summary`（单测用）会调它，产品路径不经过。
+#[cfg(test)]
 fn short_reason(text: &str) -> String {
     let first = text.split(['\n', '；', '。']).next().unwrap_or(text).trim();
     const MAX_CHARS: usize = 40;
