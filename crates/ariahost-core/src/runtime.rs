@@ -330,41 +330,44 @@ pub fn resolve_core_in_with(
 
 /// 全部来源都显式注入的解析器本体（**单测只测这一层**：不读环境变量）。
 ///
-/// 解析顺序（M5-b-G 起）：
-/// 1. **configured**：按 `aria2.source` 的既有语义解析
-///    （`auto` = 内置 → 托管 → 配了 `external_path` 的外部；`managed`/`external` 只看那一种）；
-/// 2. 失败 → **last_good**：版本库里「最近一次真跑起来过」的版本（`last_good.json`，
-///    由 [`CoreRuntime::with_last_good_root`] 在成功 spawn 后写入）；
-/// 3. `auto` 下仍失败 → **bundled**（第 1 跳已试过，这里只是把原因记全）；
-/// 4. 全失败 → [`RuntimeError::Unavailable`]，带**逐跳**原因。
+/// 解析顺序（M5-c 定版，**按 `aria2.source` 分级**）：
 ///
-/// # 为什么 `managed`/`external` 也走这一整条链（M5-b-G 的语义变更，**可见**）
+/// | `aria2.source` | 允许的跳跃 |
+/// |---|---|
+/// | `auto`（默认） | configured（内置→托管→外部）→ last_good → bundled |
+/// | `managed` | configured（只托管）→ last_good → bundled（**必须带可见 reason**） |
+/// | `external` | **只有 external，失败即拒**（连 last_good 也不退——那也是另一个二进制） |
+/// | `bundled` | **只有 bundled，缺文件即拒**（不退回版本库） |
 ///
-/// 本批按任务书要求把回退链统一到所有 `aria2.source`：
-/// `configured → last_good → bundled → Unavailable`。
-/// 这**改变了** task-54 锁定的不变量「显式来源失败就报错、绝不使用内置核心」
-/// （原测试 `managed_source_never_silently_falls_back_to_bundled`）：
-/// 现在显式来源失败也会退到内置核心，但**必须可见**——`fell_back = true` 且
-/// `reason` 里逐跳写明「为什么退、退到了哪」。理由：对「aria2 服务管理器」而言，
-/// 版本库被清理/移走后直接起不来，比「起内置核心 + 面板明示已回退」更糟；
-/// 而 task-54 真正防的是**静默**替换（用户以为 managed 生效），这一点没被放弃。
+/// # 为什么 `external` / `bundled` 一出场就不许回退
 ///
-/// 如果将来要恢复严格语义：把下面第 3 跳加一个
-/// `if config.aria2.source == Aria2Source::Auto` 判断即可（改动只在这一点）。
+/// 这两个是**契约来源**：用户明确说「就用这个」。静默换成别的二进制，会把
+/// 「路径写错 / 文件被删 / 杀软隔离」伪装成「跑得好好的」——排障时最难查的一类。
+/// 所以它们的失败只给可读原因 + 下一步（改回 `auto` 或修正路径），不做任何回落。
+///
+/// `managed` 的兜底则是我们自己的产物之间互相救：版本库的 `active.json` 坏了还有
+/// `last_good`，版本库整个没了还有安装包自带的 `bundled`；降级**可见**
+/// （`fell_back = true` + `reason` 逐跳写清），不是静默替换。
 pub(crate) fn resolve_core_with(
     config: &Config,
     versions_root: Option<&Path>,
     bundled: Option<&Path>,
 ) -> Result<ResolvedCore, RuntimeError> {
+    use ariahost_common::Aria2Source;
+
+    let source = config.aria2.source;
     let mut attempts: Vec<String> = Vec::new();
 
-    // 跳 1：configured（既有语义）。
+    // 跳 1：configured（按 source 的既有语义）。
     match configured_core(config, versions_root, bundled) {
         Ok(core) => return Ok(core),
-        Err(error) => attempts.push(format!(
-            "configured({})：{error}",
-            config.aria2.source.as_str()
-        )),
+        Err(error) => attempts.push(format!("configured({})：{error}", source.as_str())),
+    }
+
+    // 契约来源：失败即拒，**不进入任何回退跳**。
+    if source.is_contract() {
+        attempts.push(contract_refusal_hint(source));
+        return Err(RuntimeError::Unavailable { attempts });
     }
 
     // 跳 2：last_good（最近一次真跑起来过的版本；仍是版本库来源）。
@@ -394,10 +397,10 @@ pub(crate) fn resolve_core_with(
             reason: Some(format!(
                 "回退到内置核心 {}（{}）：{}",
                 path.display(),
-                if config.aria2.source == ariahost_common::Aria2Source::Auto {
+                if source == Aria2Source::Auto {
                     "auto 第 1 跳已试过，现在仍找不到其它来源"
                 } else {
-                    "显式来源不可用"
+                    "版本库来源不可用"
                 },
                 attempts.join("；")
             )),
@@ -406,6 +409,27 @@ pub(crate) fn resolve_core_with(
     attempts.push(format!("bundled：exe 同目录没有可用的 {BUNDLED_CORE_EXE}"));
 
     Err(RuntimeError::Unavailable { attempts })
+}
+
+/// 契约来源（`external` / `bundled`）失败时的固定拒绝原因（含下一步）。
+fn contract_refusal_hint(source: ariahost_common::Aria2Source) -> String {
+    use ariahost_common::Aria2Source;
+    match source {
+        Aria2Source::External => {
+            "回退已禁用：aria2.source=external 是用户亲手指定的路径（契约），失败即拒——\
+             绝不静默换成别的二进制（那会把「路径写错/文件被删/杀软隔离」伪装成「跑得好好的」）。\
+             下一步：改回 aria2.source=auto 让产品自动找核心，或修正 aria2.external_path"
+                .to_owned()
+        }
+        Aria2Source::Bundled => {
+            "回退已禁用：aria2.source=bundled 只认 exe 同目录的 aria2c.exe，缺文件即失败——\
+             不拿版本库里的另一份顶替（那会让用户以为内置核心正常）。\
+             下一步：重装产品以恢复内置核心，或改回 aria2.source=auto"
+                .to_owned()
+        }
+        // 调用方只会在契约来源上调用；其余分支给一句兜底，保持函数全函数化。
+        Aria2Source::Auto | Aria2Source::Managed => "回退已禁用（契约来源）".to_owned(),
+    }
 }
 
 /// 按 `aria2.source` 的既有语义解析（**成功即返回，不回落**）。
@@ -446,6 +470,18 @@ fn configured_core(
             CoreOrigin::Managed,
         )),
         Aria2Source::External => external_core(config),
+        Aria2Source::Bundled => match bundled.filter(|path| path.is_file()) {
+            Some(path) => Ok(ResolvedCore::direct(
+                path.to_path_buf(),
+                CoreOrigin::Bundled,
+            )),
+            None => Err(RuntimeError::CoreNotFound {
+                detail: format!(
+                    "aria2.source=bundled 但 exe 同目录没有 {}（内置核心缺失：安装包漏带或被删除）",
+                    BUNDLED_CORE_EXE
+                ),
+            }),
+        },
     }
 }
 
@@ -2140,6 +2176,86 @@ mod tests {
         assert!(reason.contains("回退到内置核心"), "{reason}");
         assert!(reason.contains("configured(managed)"), "{reason}");
         assert_eq!(core.path, bundled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M5-c 裁决：`external` 是契约来源——失败即拒，**绝不**被别的二进制顶替。
+    ///
+    /// 这是本批最重要的一条：内置核心在、版本库也有可用版本，一个都不许用。
+    /// 否则「路径写错 / 文件被删 / 杀软隔离」会被伪装成「跑得好好的」。
+    #[test]
+    fn external_source_never_falls_back_even_when_bundled_exists() {
+        let (root, versions, bundled) = resolve_fixture("external-no-fallback");
+        install_fake_bundled(&bundled);
+        install_fake_managed(&versions, "1.37.0");
+
+        let error = resolve_core_with(
+            &config_with(Aria2Source::External, "C:\\nope\\aria2c.exe"),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect_err("external 失败必须报错，绝不换二进制");
+
+        match &error {
+            RuntimeError::Unavailable { attempts } => {
+                assert_eq!(
+                    attempts.len(),
+                    2,
+                    "只应有「configured 失败 + 拒绝回退」两条：{attempts:?}"
+                );
+                assert!(
+                    attempts[0].starts_with("configured(external)"),
+                    "{attempts:?}"
+                );
+                assert!(attempts[1].contains("回退已禁用"), "{attempts:?}");
+                assert!(attempts[1].contains("external_path"), "{attempts:?}");
+            }
+            other => panic!("应是 Unavailable，实际 {other:?}"),
+        }
+        let text = error.to_string();
+        assert!(
+            text.contains("external"),
+            "错误里要能看出是 external 失败：{text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M5-c：`bundled` 也是契约来源——缺文件即拒，不退回版本库。
+    #[test]
+    fn bundled_source_does_not_fall_back_to_managed() {
+        let (root, versions, bundled) = resolve_fixture("bundled-strict");
+        install_fake_managed(&versions, "1.37.0"); // 版本库可用也不许用
+
+        let error = resolve_core_with(
+            &config_with(Aria2Source::Bundled, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect_err("bundled 缺文件必须报错，不许退版本库");
+
+        match &error {
+            RuntimeError::Unavailable { attempts } => {
+                assert!(
+                    attempts[0].starts_with("configured(bundled)"),
+                    "{attempts:?}"
+                );
+                assert!(attempts[1].contains("回退已禁用"), "{attempts:?}");
+            }
+            other => panic!("应是 Unavailable，实际 {other:?}"),
+        }
+
+        // 内置核心存在时正常解析，且**不是**回退（configured 成功）。
+        install_fake_bundled(&bundled);
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Bundled, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("bundled 存在应成功");
+        assert_eq!(core.origin, CoreOrigin::Bundled);
+        assert_eq!(core.path, bundled);
+        assert!(!core.fell_back, "configured 成功不得标记回退");
+        assert_eq!(core.reason, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

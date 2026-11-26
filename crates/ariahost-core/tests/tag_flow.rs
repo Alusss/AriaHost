@@ -252,6 +252,13 @@ fn arch_tag() -> &'static str {
     }
 }
 
+/// 计算字节的 SHA-256（小写十六进制），用于核对 provenance 记录。
+fn sha256_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// 假服务器上的一条资产路径（**代理前缀 + 完整 GitHub URL**）。
 fn asset_path(version: &str, build: u32) -> String {
     format!(
@@ -571,12 +578,9 @@ fn version_mismatch_is_rejected_and_nothing_is_activated() {
 #[test]
 fn fetch_by_tag_installs_and_activates_after_all_steps() {
     // 1.36.0 没有已知哈希 → Unverified（带告警）继续，这是设计要的诚实口径。
-    let server = FakeServer::start(|| {
-        vec![Route::zip(
-            &asset_path("1.36.0", 1),
-            build_core_zip(b"core-bytes"),
-        )]
-    });
+    let zip = build_core_zip(b"core-bytes");
+    let expected_zip_sha256 = sha256_of(&zip);
+    let server = FakeServer::start(move || vec![Route::zip(&asset_path("1.36.0", 1), zip)]);
     let dir = TestDir::new("install-ok");
     let store = VersionStore::new(dir.path());
     let fetcher = fetcher_for(&server);
@@ -639,6 +643,36 @@ fn fetch_by_tag_installs_and_activates_after_all_steps() {
         .filter(|name| name.starts_with(".verify-"))
         .collect();
     assert!(leftovers.is_empty(), "验证目录必须删干净：{leftovers:?}");
+
+    // M5-c：安装证据必须落盘，且字段能对得上这次下载。
+    let provenance = store.provenance("1.36.0").expect("必须写 provenance.json");
+    assert_eq!(
+        provenance.asset_name,
+        format!("aria2-1.36.0-win-{}-build1.zip", arch_tag())
+    );
+    assert_eq!(provenance.line, "proxy");
+    assert_eq!(
+        provenance.zip_sha256, expected_zip_sha256,
+        "zip 哈希要对得上真实下载的字节"
+    );
+    assert_eq!(
+        provenance.exe_sha256,
+        sha256_of(b"core-bytes"),
+        "exe 哈希要对得上解压出的 exe"
+    );
+    assert!(
+        !provenance.known_sha256_verified,
+        "1.36.0 没有已知交叉参考值，不得声称对过官方哈希"
+    );
+    assert!(
+        !provenance.installed_at.trim().is_empty(),
+        "installed_at 必须有值"
+    );
+    // 取证：`--nocapture` 时把落盘的真实 JSON 原样打出来（报告/issue 直接贴这份）。
+    println!(
+        "PROVENANCE {}",
+        serde_json::to_string(&provenance).expect("序列化安装证据")
+    );
 }
 
 #[test]

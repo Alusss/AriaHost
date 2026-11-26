@@ -82,7 +82,8 @@ pub use runtime::{
     CREATE_NO_WINDOW, FILE_ALLOCATION, LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
 };
 pub use store::{
-    ActivePointer, ExeProbe, LastGoodPointer, VersionStore, ACTIVE_FILE, LAST_GOOD_FILE,
+    ActivePointer, ExeProbe, LastGoodPointer, Provenance, VersionStore, ACTIVE_FILE,
+    LAST_GOOD_FILE, PROVENANCE_FILE,
 };
 pub use sync::{
     service_core_status, service_core_status_default, service_core_status_with,

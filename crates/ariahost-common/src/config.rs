@@ -79,7 +79,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Aria2Section {
-    /// `managed`（版本库托管）或 `external`（用户自己的 aria2c）。
+    /// `auto` / `managed` / `external` / `bundled`（M5-c 起第四种：只认内置核心）。
     pub source: Aria2Source,
     /// `source = "external"` 时的 aria2c 路径（支持 `~` 展开）。
     pub external_path: String,
@@ -356,6 +356,19 @@ pub struct LifecycleSection {
 }
 
 /// `aria2.source` 取值。
+///
+/// 四档的差别只在**失败后允不允许换来源**（M5-c 定版）：
+///
+/// | 取值 | 语义 | 失败后 |
+/// |---|---|---|
+/// | `auto`（默认） | 内置 → 托管 → 外部，按顺序找 | 全链回退 |
+/// | `managed` | 版本库托管 | 退 last_good → bundled（可见 reason） |
+/// | `external` | 用户亲手指定的路径（**契约**） | **失败即拒，绝不换二进制** |
+/// | `bundled` | 只认 exe 同目录的内置核心（**契约**） | 缺文件即拒，不退回版本库 |
+///
+/// `external` / `bundled` 是「契约来源」：用户明确说「就用这个」，静默换成别的
+/// 二进制会把「路径写错 / 文件被删 / 杀软隔离」伪装成「跑得好好的」——那是最难排
+/// 的一类故障。所以它们失败时只给可读原因 + 下一步，不做任何回落。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Aria2Source {
@@ -370,6 +383,11 @@ pub enum Aria2Source {
     Managed,
     /// 用户自带 aria2c。
     External,
+    /// 只认内置：`ariahost.exe` 同目录的 `aria2c.exe`（M5-c 新增）。
+    ///
+    /// 与 `external` 同属契约来源：缺文件就报错，**不**拿版本库里的另一份顶替。
+    /// UI 暂未提供该选项（配置文件可手写 `source = "bundled"`）。
+    Bundled,
 }
 
 impl Aria2Source {
@@ -379,7 +397,16 @@ impl Aria2Source {
             Self::Auto => "auto",
             Self::Managed => "managed",
             Self::External => "external",
+            Self::Bundled => "bundled",
         }
+    }
+
+    /// 是不是「契约来源」：用户明确指定了唯一来源，失败后**不许**回退。
+    ///
+    /// `external`（亲手指的路径）与 `bundled`（只认内置）都属此类；
+    /// `auto`/`managed` 允许在自家产物之间兜底。
+    pub const fn is_contract(self) -> bool {
+        matches!(self, Self::External | Self::Bundled)
     }
 }
 
@@ -1395,6 +1422,33 @@ mod tests {
         assert!(error.to_string().contains("解析失败"), "{error}");
         // 关键：原文件一个字节都不许改。
         assert_eq!(fs::read_to_string(&path).expect("读回"), original);
+    }
+
+    /// M5-c：`source` 四档的文本形态与「契约来源」判定必须钉死。
+    ///
+    /// 这两件事都被配置/日志/回退逻辑依赖：`as_str` 变了诊断包就对不上，
+    /// `is_contract` 判错就会把「用户亲手指的路径」静默换成别的二进制。
+    #[test]
+    fn source_enum_covers_four_values_and_contract_flag() {
+        for (source, text) in [
+            (Aria2Source::Auto, "auto"),
+            (Aria2Source::Managed, "managed"),
+            (Aria2Source::External, "external"),
+            (Aria2Source::Bundled, "bundled"),
+        ] {
+            assert_eq!(source.as_str(), text);
+        }
+        assert!(Aria2Source::External.is_contract());
+        assert!(Aria2Source::Bundled.is_contract());
+        assert!(!Aria2Source::Auto.is_contract());
+        assert!(!Aria2Source::Managed.is_contract());
+
+        // 手写 `source = "bundled"` 必须能解析（UI 暂未提供该选项，配置文件可以）。
+        let dir = TestDir::new("source-bundled");
+        let path = dir.config_path();
+        fs::write(&path, "[aria2]\nsource = \"bundled\"\n").expect("写配置");
+        let config = load_from(&path).expect("bundled 应可解析");
+        assert_eq!(config.aria2.source, Aria2Source::Bundled);
     }
 
     #[test]

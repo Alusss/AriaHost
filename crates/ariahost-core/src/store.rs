@@ -64,6 +64,37 @@ pub struct LastGoodPointer {
     pub version: String,
 }
 
+/// 安装证据文件名（`versions/<ver>/provenance.json`）。
+///
+/// 放在**版本目录里**（不是版本库根）：它是「这一份安装」的属性，跟着目录走；
+/// 目录被删，证据自然消失——不会留下指向空气的记录。
+pub const PROVENANCE_FILE: &str = "provenance.json";
+
+/// 一次安装的来源证据。
+///
+/// # 语义边界（**别把它说成上游签名**）
+///
+/// 它证明的是「磁盘上的 exe 与**安装时**逐字节一致」——能发现安装后被替换、被杀软
+/// 改过、磁盘损坏；它**不能**证明「这份 exe 来自官方」。
+/// 「安装时是否用已知交叉参考值硬校验过官方 zip」是另一个事实，由
+/// [`Provenance::known_sha256_verified`] 单独表达（`list_cores` 会把它映射成
+/// `zip_verified`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// 发布包文件名（例如 `aria2-1.37.0-win-64bit-build1.zip`）。
+    pub asset_name: String,
+    /// 下载线路名（`cdn` / `direct` / `proxy` / `github` …）。
+    pub line: String,
+    /// 发布包 SHA-256（小写十六进制）。
+    pub zip_sha256: String,
+    /// 解压出的 `aria2c.exe` 的 SHA-256（`list_cores` 用它做逐字节对账）。
+    pub exe_sha256: String,
+    /// 安装时是否用已知交叉参考值硬校验过（`true` 才代表「对过官方 zip 哈希」）。
+    pub known_sha256_verified: bool,
+    /// 安装完成时刻（RFC3339 UTC）。
+    pub installed_at: String,
+}
+
 /// 取得目标 exe 写权限的探测函数。
 ///
 /// 生产实现是「以写方式打开该文件」：Windows 上正在运行的 exe 会以
@@ -277,6 +308,51 @@ impl VersionStore {
         fs::rename(&temporary, &target).map_err(|error| {
             let _ = fs::remove_file(&temporary);
             store_io(&target, "提交 last_good（rename）", error)
+        })
+    }
+
+    /// 读安装证据；不存在 / 坏 JSON / 非法版本号 → `None`。
+    ///
+    /// 为什么**不报错**：provenance 是「旁证」，不是安装的一部分。文件被杀软截断、
+    /// 被用户手改坏，都不该让「列核心」或「启动」失败——`None` 就是「没有证据」，
+    /// 调用方据此把 `hash_verified` 如实给 `false`。
+    pub fn provenance(&self, version: &str) -> Option<Provenance> {
+        if parse_version_number(version).is_err() {
+            return None;
+        }
+        let path = self.version_dir(version).join(PROVENANCE_FILE);
+        let bytes = fs::read(&path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// 原子写 `versions/<ver>/provenance.json`（tmp → rename，与 `active.json` 同口径）。
+    pub fn write_provenance(
+        &self,
+        version: &str,
+        provenance: &Provenance,
+    ) -> Result<(), CoreError> {
+        if parse_version_number(version).is_err() {
+            return Err(CoreError::BadVersion {
+                value: version.to_owned(),
+            });
+        }
+        let dir = self.version_dir(version);
+        fs::create_dir_all(&dir).map_err(|error| store_io(&dir, "创建版本目录", error))?;
+        let target = dir.join(PROVENANCE_FILE);
+        let temporary = dir.join(format!("{PROVENANCE_FILE}.tmp"));
+        let json = serde_json::to_vec_pretty(provenance)
+            .map_err(|error| CoreError::store_io(format!("安装证据序列化失败：{error}")))?;
+
+        let mut file = fs::File::create(&temporary)
+            .map_err(|error| store_io(&temporary, "创建临时安装证据", error))?;
+        file.write_all(&json)
+            .map_err(|error| store_io(&temporary, "写入临时安装证据", error))?;
+        file.sync_all()
+            .map_err(|error| store_io(&temporary, "落盘临时安装证据", error))?;
+        drop(file);
+        fs::rename(&temporary, &target).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            store_io(&target, "提交安装证据（rename）", error)
         })
     }
 
@@ -551,6 +627,61 @@ mod tests {
         let parsed: ActivePointer =
             serde_json::from_slice(&fs::read(&pointer_path).expect("读指针")).expect("解析");
         assert_eq!(parsed.active, "1.37.0");
+    }
+
+    #[test]
+    fn provenance_round_trips_and_leaves_no_tmp() {
+        let (_dir, store) = store("provenance");
+        store.install_core("1.37.0", &core(b"core")).expect("装");
+        assert!(store.provenance("1.37.0").is_none(), "没写之前应是 None");
+
+        let provenance = Provenance {
+            asset_name: "aria2-1.37.0-win-64bit-build1.zip".to_owned(),
+            line: "direct".to_owned(),
+            zip_sha256: "aa".repeat(32),
+            exe_sha256: "bb".repeat(32),
+            known_sha256_verified: true,
+            installed_at: "2026-11-26T02:00:00Z".to_owned(),
+        };
+        store
+            .write_provenance("1.37.0", &provenance)
+            .expect("写安装证据");
+        assert_eq!(store.provenance("1.37.0"), Some(provenance.clone()));
+        assert!(
+            !store
+                .version_dir("1.37.0")
+                .join(format!("{PROVENANCE_FILE}.tmp"))
+                .exists(),
+            "rename 之后不应留下 .tmp"
+        );
+
+        // 同一版本重装/换线路：允许覆盖（不是 append-only 的日志）。
+        let mut changed = provenance;
+        changed.exe_sha256 = "cc".repeat(32);
+        store
+            .write_provenance("1.37.0", &changed)
+            .expect("覆盖安装证据");
+        assert_eq!(
+            store.provenance("1.37.0").expect("读回").exe_sha256,
+            changed.exe_sha256
+        );
+    }
+
+    #[test]
+    fn broken_provenance_is_treated_as_missing() {
+        let (_dir, store) = store("provenance-broken");
+        store.install_core("1.37.0", &core(b"core")).expect("装");
+        let path = store.version_dir("1.37.0").join(PROVENANCE_FILE);
+
+        fs::write(&path, b"not-json").expect("写坏证据");
+        assert!(store.provenance("1.37.0").is_none(), "坏 JSON 当「没有」");
+
+        // 缺字段也算没有：`Provenance` 没有 serde(default)，少一个字段就不该当成有效证据。
+        fs::write(&path, br#"{"asset_name":"x"}"#).expect("写缺字段证据");
+        assert!(store.provenance("1.37.0").is_none(), "缺字段当「没有」");
+
+        // 非法版本号：不 panic、不做路径穿越读。
+        assert!(store.provenance("../etc/passwd").is_none());
     }
 
     #[test]

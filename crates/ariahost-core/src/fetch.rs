@@ -283,6 +283,21 @@ impl Fetcher {
 
         let extracted = extract_core(&download.bytes)?;
         store.install_core(&version.to_string(), &extracted)?;
+        // 安装证据（M5-c）：与手工 tag 路径同一口径 —— 让 `list_cores` 能回答
+        // 「这份 exe 与安装时是否逐字节一致」。写失败只进告警，不阻断安装。
+        let provenance = crate::store::Provenance {
+            asset_name: asset.name.clone(),
+            line: download.line.clone(),
+            zip_sha256: sha256_hex(&download.bytes),
+            exe_sha256: sha256_hex(&extracted.aria2c),
+            known_sha256_verified: hash.is_verified(),
+            installed_at: ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
+        };
+        if let Err(error) = store.write_provenance(&version.to_string(), &provenance) {
+            warnings.push(format!(
+                "写安装证据失败（hash_verified 会显示 false）：{error}"
+            ));
+        }
         let pointer = store.activate(&version.to_string())?;
 
         Ok(FetchOutcome {

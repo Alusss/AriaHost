@@ -42,6 +42,13 @@
 //! [`crate::fetch::Fetcher::asset_for`] 走 releases API 目录，本批**禁止**用它取 tag
 //! （手工 tag 存在的意义就是不碰 API）。这里自己拼名字，取自同一套白名单规则
 //! （[`crate::release::match_win_asset`] 的构造口径）。
+//!
+//! # 平台说明
+//!
+//! 产品只发 Windows；**Linux 构建仅在开发期用于跑门禁**（fmt / check / clippy / test）。
+//! 所以 G5 第 4 步（跑 `aria2c --version`）在 Linux 上必然失败——下到的是 Windows PE，
+//! 执行会得到 `Permission denied`。那是平台事实，不是本模块的缺陷；对应的失败 hint
+//! **不为 Linux 改口径**（用户只会在 Windows 上遇到）。
 
 use std::fs;
 use std::io::Write as _;
@@ -55,12 +62,12 @@ use ariahost_common::paths::{versions_dir, Plane};
 use serde::Serialize;
 
 use crate::error::CoreError;
-use crate::fetch::{known_sha256, sha256_hex, verify_hash, Fetcher, HashState};
+use crate::fetch::{sha256_hex, verify_hash, Fetcher, HashState};
 use crate::http::ZIP_MAGIC;
 use crate::net::{github_via, HttpProber, ProbeTransport, Prober, PROBE_TIMEOUT};
 use crate::release::host_bits;
 use crate::runtime;
-use crate::store::{ActivePointer, VersionStore};
+use crate::store::{ActivePointer, Provenance, VersionStore};
 use crate::zip_extract::{extract_core, ExtractedCore};
 use crate::CORE_EXE;
 
@@ -738,6 +745,24 @@ pub fn fetch_by_tag_tracked(
         format!("已装到 {}", installed.display()),
     ));
 
+    // 安装证据（provenance）：让 `list_cores` 能回答「这份 exe 与安装时是否逐字节一致」。
+    //
+    // 写失败**不让安装失败**：核心已经装好且验证过，证据文件只是旁证；缺了它的后果是
+    // `hash_verified` 显示 false（可读告警会说出来），不是核心不可用。
+    let provenance = Provenance {
+        asset_name: format!("aria2-{version}-win-{bits}bit-build{}.zip", asset.build),
+        line: asset.line.as_str().to_owned(),
+        zip_sha256: sha256_hex(&bytes),
+        exe_sha256: sha256_hex(&extracted.aria2c),
+        known_sha256_verified: hash.is_verified(),
+        installed_at: ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
+    };
+    if let Err(error) = store.write_provenance(&version, &provenance) {
+        warnings.push(format!(
+            "写安装证据失败（hash_verified 会显示 false）：{error}"
+        ));
+    }
+
     // 步 6：只有 1–5 全过才激活。
     let pointer = store.activate(&version)?;
     steps.push(G5Step::pass(
@@ -851,13 +876,19 @@ pub struct CoreEntry {
     pub bits: u32,
     /// 来源。
     pub origin: CoreEntryOrigin,
-    /// 该 exe 的 SHA-256 是否与已知交叉参考值**实测一致**。
+    /// 磁盘上的 exe 与**安装时**记录的 `exe_sha256` 是否逐字节一致。
     ///
-    /// ⚠️ **当前恒为 `false`**：已知参考值（[`crate::fetch::KNOWN_SHA256`]）是**发布包**
-    /// 的哈希，不是解压后 exe 的哈希（见 `file_hash_matches` 的说明）。字段保留是为了
-    /// 将来补上 exe 级证据时不用改 UI 契约；**UI 不得把 `false` 展示成「校验通过」**，
-    /// 也不该把它当成「这个核心有问题」——它只表示「没有可计算的证据」。
+    /// 语义 = 「与安装时一致，防安装后篡改 / 磁盘损坏」，**不是上游签名**。
+    /// 判据是 `versions/<ver>/provenance.json`：有且哈希一致 → `true`。
+    /// **无 provenance**（bundled / external / 本功能上线前的旧安装）→ `false`。
     pub hash_verified: bool,
+    /// 安装时是否用已知交叉参考值硬校验过**官方发布包**（provenance 的
+    /// `known_sha256_verified`）。
+    ///
+    /// 与 [`CoreEntry::hash_verified`] 是两件事，UI 要分开显示：
+    /// - `zip_verified = true`：安装那一刻对过官方 zip 的 SHA-256（强证据）；
+    /// - 两者都 `false`：既没对过官方哈希，也没安装证据（只能靠版本探测）。
+    pub zip_verified: bool,
     /// `aria2c --version` 实测版本（探测失败时 `None`）。
     pub probed_version: Option<String>,
     /// 可执行文件路径（`known` 未安装时为 `None`）。
@@ -898,19 +929,16 @@ pub fn list_cores_in(
         .ok()
         .map(|core| core.path);
 
-    // 1) bundled：exe 同目录。
+    // 1) bundled：exe 同目录。**不在版本库里 → 没有 provenance**，两个校验字段都如实给 false。
     if let Some(path) = bundled.filter(|candidate| candidate.is_file()) {
         let probed = probe.probe_version(path).ok();
         let version = probed.clone().unwrap_or_else(|| UNKNOWN_VERSION.to_owned());
-        let hash_verified = probed
-            .as_deref()
-            .map(|text| file_hash_matches(path, text, bits))
-            .unwrap_or(false);
         entries.push(CoreEntry {
             version,
             bits,
             origin: CoreEntryOrigin::Bundled,
-            hash_verified,
+            hash_verified: false,
+            zip_verified: false,
             probed_version: probed.clone(),
             path: Some(path.to_path_buf()),
             active: active_path.as_deref() == Some(path),
@@ -924,12 +952,13 @@ pub fn list_cores_in(
         for version in store.list()? {
             let exe = store.exe_path(&version);
             let probed = probe.probe_version(&exe).ok();
-            let hash_verified = file_hash_matches(&exe, &version, bits);
+            let (hash_verified, zip_verified) = provenance_state(&store, &version, &exe);
             entries.push(CoreEntry {
                 version,
                 bits,
                 origin: CoreEntryOrigin::Managed,
                 hash_verified,
+                zip_verified,
                 probed_version: probed.clone(),
                 path: Some(exe.clone()),
                 active: active_path.as_deref() == Some(exe.as_path()),
@@ -957,6 +986,7 @@ pub fn list_cores_in(
             bits,
             origin: CoreEntryOrigin::Known,
             hash_verified: false,
+            zip_verified: false,
             probed_version: None,
             path: None,
             active: false,
@@ -967,31 +997,24 @@ pub fn list_cores_in(
     Ok(entries)
 }
 
-/// 文件字节的 SHA-256 是否等于该版本的已知交叉参考值。
+/// 读安装证据并与磁盘上的 exe 对账：返回 `(hash_verified, zip_verified)`。
 ///
-/// # 为什么当前**恒为 `false`**（这是实测发现，不是偷懒）
+/// - `hash_verified` = 有 provenance **且** 磁盘 exe 的 SHA-256 与 `exe_sha256` 一致；
+/// - `zip_verified` = provenance 里的 `known_sha256_verified`（安装时对过官方 zip 哈希）。
 ///
-/// [`crate::fetch::KNOWN_SHA256`] 是**发布包（zip）**的哈希，而这里拿到的是解压后的
-/// `aria2c.exe`——两者不是同一个哈希（实测：1.37.0 x64 的 zip 是 `67d015…b288`，
-/// 里面解出的 exe 是 5,649,408 字节的另一份内容）。我们**没有** exe 级的参考值，
-/// 也没有在安装时留存「这份 exe 来自那个已验证的包」的证据，所以无法证明，
-/// 只能如实给 `false`（「没法校验」不等于「校验通过」）。
-///
-/// 保留这次比对而不是直接写死 `false`：一旦将来补上 exe 级参考值（或
-/// `versions/<ver>/` 里留安装证据），这段逻辑自动生效，不用重写第二套。
-///
-/// 没有已知值 → `false`；读盘失败 → `false`。
-fn file_hash_matches(path: &Path, version: &str, bits: u32) -> bool {
-    let Ok(version_number) = parse_version_number(version) else {
-        return false;
+/// 无 provenance（bundled / external / 本功能上线前的旧安装 / 坏 JSON）→ `(false, false)`：
+/// 「没有证据」就如实说没有，绝不冒充「校验通过」。
+fn provenance_state(store: &VersionStore, version: &str, exe: &Path) -> (bool, bool) {
+    let Some(provenance) = store.provenance(version) else {
+        return (false, false);
     };
-    let Some(expected) = known_sha256(version_number, bits) else {
-        return false;
-    };
-    match fs::read(path) {
-        Ok(bytes) => sha256_hex(&bytes) == expected,
-        Err(_) => false,
-    }
+    let matches = matches!(sha256_of_file(exe), Some(actual) if actual == provenance.exe_sha256);
+    (matches, provenance.known_sha256_verified)
+}
+
+/// 整文件 SHA-256（小写十六进制）；读盘失败 → `None`。
+fn sha256_of_file(path: &Path) -> Option<String> {
+    fs::read(path).ok().map(|bytes| sha256_hex(&bytes))
 }
 
 #[cfg(test)]
@@ -1325,7 +1348,11 @@ mod tests {
         assert!(bundled_entry.active, "auto 下内置核心就是当前选中的那条");
         assert!(
             !bundled_entry.hash_verified,
-            "内容与已知哈希不符，绝不能声称校验过"
+            "内置核心不在版本库里，没有安装证据 → 必须 false"
+        );
+        assert!(
+            !bundled_entry.zip_verified,
+            "bundled 没有安装时的 zip 校验记录"
         );
 
         let known_entry = &entries[1];
@@ -1420,6 +1447,74 @@ mod tests {
             "同一版本只能出现一条（managed 代表它，known 不重复列）：{entries:?}"
         );
         assert_eq!(entries[0].origin, CoreEntryOrigin::Managed);
+    }
+
+    /// M5-c：`hash_verified` 的证据链——无证据 → false；证据与磁盘一致 → true；
+    /// 安装后 exe 被改 → 立刻掉回 false（这正是这个字段存在的意义）。
+    #[test]
+    fn list_cores_hash_verified_requires_provenance_and_matching_bytes() {
+        let dir = TempDir::new("list-provenance");
+        let versions = dir.path().join("versions");
+        let store = install_managed(&versions, "1.36.0");
+        let exe = store.exe_path("1.36.0");
+        let bytes = fs::read(&exe).expect("读已装的 exe");
+
+        // ① 没有 provenance（本功能上线前的旧安装）：两项都 false。
+        let entries = list_cores_in(
+            &Config::default(),
+            Some(&versions),
+            None,
+            &FixedProbe("1.36.0"),
+        )
+        .expect("列核心");
+        assert_eq!(entries[0].version, "1.36.0");
+        assert!(!entries[0].hash_verified, "没有证据必须如实 false");
+        assert!(!entries[0].zip_verified);
+
+        // ② 写入与磁盘一致的证据 → hash_verified=true；known 标志映射到 zip_verified。
+        let provenance = Provenance {
+            asset_name: "aria2-1.36.0-win-64bit-build1.zip".to_owned(),
+            line: "direct".to_owned(),
+            zip_sha256: "00".repeat(32),
+            exe_sha256: sha256_hex(&bytes),
+            known_sha256_verified: true,
+            installed_at: "2026-11-26T02:00:00Z".to_owned(),
+        };
+        store
+            .write_provenance("1.36.0", &provenance)
+            .expect("写安装证据");
+        let entries = list_cores_in(
+            &Config::default(),
+            Some(&versions),
+            None,
+            &FixedProbe("1.36.0"),
+        )
+        .expect("列核心");
+        assert!(entries[0].hash_verified, "与安装时逐字节一致 → true");
+        assert!(
+            entries[0].zip_verified,
+            "known_sha256_verified 要映射到 zip_verified"
+        );
+
+        // ③ 安装后 exe 被改（长度不变，改首字节）→ hash_verified 立刻 false。
+        let mut tampered = bytes;
+        tampered[0] ^= 0xFF;
+        fs::write(&exe, &tampered).expect("改 exe");
+        let entries = list_cores_in(
+            &Config::default(),
+            Some(&versions),
+            None,
+            &FixedProbe("1.36.0"),
+        )
+        .expect("列核心");
+        assert!(
+            !entries[0].hash_verified,
+            "安装后被改动必须掉回 false（防篡改/磁盘损坏）"
+        );
+        assert!(
+            entries[0].zip_verified,
+            "zip_verified 是安装时的事实，不随当前文件变化"
+        );
     }
 
     // ---- 测试夹具 ----
