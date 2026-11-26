@@ -713,6 +713,9 @@ pub fn config_hint(kind: ConfigErrorKind) -> &'static str {
             "配置版本比本程序新：升级 AriaHost，或先备份再点恢复默认"
         }
         ConfigErrorKind::Secret => "secret 文件损坏：删掉 secret.bin 后重启面板会重新生成",
+        ConfigErrorKind::ForbiddenDownloadDir => {
+            "下载目录不能是系统目录（Windows/Program Files 等）：换一个可写的用户目录"
+        }
     }
 }
 

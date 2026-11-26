@@ -3974,8 +3974,24 @@ fn open_in_file_manager(dir: &Path) -> std::io::Result<()> {
 }
 
 /// 状态徽章：底色按语气区分，文字永远是中文状态词。
+///
+/// 「运行中」这一档额外画一颗指示点（ui-spec-v2 §3.1 / Lead 裁决 3）：点本体
+/// `ok.dot`（`#00C853`）**只做填充**，外面必带 1px `ok.ring`（`#0B6B34`）描边——
+/// 浅色主题下 `#00C853` 对白底只有 2.24:1，达不到图形 3:1 门槛，描边才是那条边界。
 fn badge(ui: &mut egui::Ui, view: &StatusView) {
     let color = tone_color(ui, view.tone);
+    if matches!(view.tone, Tone::Good) {
+        let tokens = crate::theme::tokens(ui);
+        let diameter = 8.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
+        let center = rect.center();
+        let radius = diameter / 2.0;
+        ui.painter().circle_filled(center, radius, tokens.ok_dot);
+        ui.painter()
+            .circle_stroke(center, radius, egui::Stroke::new(1.0, tokens.ok_ring));
+        ui.add_space(2.0);
+    }
     ui.label(
         RichText::new(format!("[{}]", view.badge))
             .color(color)
