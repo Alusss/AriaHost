@@ -227,8 +227,15 @@ pub struct InjectRecord {
 pub struct FontState {
     /// 系统字体解析结果（形如 `system:Microsoft YaHei:400:0`），`None` 表示没找到。
     pub resolved: Option<String>,
-    /// 三类字形的实际供应族。
+    /// 三类字形的实际供应族（**系统 provider 的答案**：不经注入时谁会用）。
     pub supply: Supply,
+    /// 随包拉丁面注入成功时的内部族名。
+    ///
+    /// 为什么单列：`supply.latin` 是系统 provider 问出来的（本机 = `DejaVu Sans`），
+    /// 而注入成功后 `Proportional` 的第一个族是注入进来的 Inter——两者都是事实，
+    /// 但**回答的是不同问题**（「系统会给什么」vs「我们真用上了什么」）。
+    /// 早先把注入成功也报成 `system:…`，等于拿 system 的答案冒充实际落点，属假事实。
+    pub latin_face: Option<String>,
     /// 注入成功的面（按注入顺序）。
     pub injected: Vec<InjectRecord>,
     /// 注入被跳过/失败的原因（`角色:原因`），一条一因，不许吞。
@@ -257,7 +264,9 @@ impl FontState {
     /// `--panel-selftest` 用的机器可读字体事实（判据：`fonts=latin=…|han=…`）。
     ///
     /// 口径——四个「谁给的」必须能分开读，不许混成一个名字：
-    /// - `latin=`：拉丁探测字 `A` 的**实际**供应族（系统 provider 返回的名字）；
+    /// - `latin=`：拉丁字形的**实际落点**。随包 Inter 注入成功时写
+    ///   `injected:<族名>`（`Proportional` 的首族，注入用 `FontPriority::Highest`）；
+    ///   没注入才退回系统 provider 的名字——**不许拿 provider 的答案冒充注入结果**；
     /// - `han=`：汉字探测字 `直` 的**实际**供应族，也就是「中文用的是谁」；
     /// - `mono=`：`Monospace` 泛族的落点（「等宽用的是谁」）；
     /// - `resolved=`：预热查询的整串（`system:` 前缀 = 系统 provider 给的），
@@ -272,6 +281,13 @@ impl FontState {
         let show = |value: &Option<String>| match value {
             Some(name) => name.clone(),
             None => "miss".to_owned(),
+        };
+        // 拉丁落点：注入成功 → `injected:<族名>`；否则系统 provider 的答案。
+        // 这一条不许省：早先注入成功也照抄 `supply.latin`，SELFTEST 报
+        // `lat=system:DejaVu_Sans` 而界面其实已用 Inter——用户按这行排障会被带沟里。
+        let latin = match &self.latin_face {
+            Some(family) => format!("injected:{family}"),
+            None => show(&self.supply.latin),
         };
         let inject = if self.injected.is_empty() {
             "miss".to_owned()
@@ -289,7 +305,7 @@ impl FontState {
         };
         format!(
             "latin={}|han={}|mono={}|resolved={}|bold={}|inject={}|budget={}/{}|inject_skip={}",
-            show(&self.supply.latin),
+            latin,
             show(&self.supply.han),
             show(&self.supply.mono),
             show(&self.resolved),
@@ -301,9 +317,12 @@ impl FontState {
         )
     }
 
-    /// 真正给出拉丁字形的族（系统返回的名字，不是我们请求的名字）。
+    /// 真正给出拉丁字形的族。
+    ///
+    /// **注入成功时给注入的族名**（`Proportional` 的首族），否则退回系统 provider 的名字——
+    /// 这条关系是面板「运行信息」与启动日志共用的唯一判定，不许各判一次。
     pub fn latin_supplier(&self) -> Option<&str> {
-        self.supply.latin.as_deref()
+        self.latin_face.as_deref().or(self.supply.latin.as_deref())
     }
 
     /// 真正给出汉字字形的族（系统返回的名字，不是我们请求的名字）。
@@ -333,7 +352,7 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     // 1) 常规面：拉丁 + 汉字（链上第一个**有文件**的档注入 Highest，真接线）。
     let mut injected: Vec<InjectRecord> = Vec::new();
     let mut inject_skipped: Vec<String> = Vec::new();
-    inject_first(
+    let latin_regular = inject_first(
         ctx,
         log,
         &mut injected,
@@ -351,6 +370,10 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
         &HAN_REGULAR,
         &FontFamily::Proportional,
     );
+
+    // 拉丁落点的**唯一判定**：注入成功 → 注入进去的族名；否则 None（交给系统 provider）。
+    // 日志行与 SELFTEST 的 `latin=` 都读这里，避免两处各判一次而漂移。
+    let latin_face = latin_regular.then(|| LATIN_REGULAR[0].family.to_owned());
 
     // 2) 真粗体：注册进命名族 `AriaBold`，`theme::bold()` 直接用。
     let bold_family = FontFamily::Name(Arc::from(BOLD_FAMILY));
@@ -419,16 +442,22 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     let state = FontState {
         resolved,
         supply,
+        latin_face,
         injected,
         inject_skipped,
         inject_used,
         bold_ready,
     };
     // 落点只经由 `latin_supplier`/`han_supplier` 这两条**同一个判据**输出：日志与面板
-    // 因此不可能各说一套（别在这里再写一遍 `map(...)`）。
+    // 因此不可能各说一套（别在这里再写一遍 `map(...)`）。拉丁前面加 `injected:` 前缀，
+    // 与 `fonts=` 的写法一致：注入命中与「系统 provider 恰好也叫这个名」必须能分开读。
+    let latin_text = match &state.latin_face {
+        Some(family) => format!("injected:{family}"),
+        None => state.latin_supplier().unwrap_or("（未解析）").to_owned(),
+    };
     log.push(format!(
         "字体落点：拉丁→{}；汉字→{}",
-        state.latin_supplier().unwrap_or("（未解析）"),
+        latin_text,
         state.han_supplier().unwrap_or("（未解析）"),
     ));
     // 注入账：字节数与跳过原因都落盘——用户报「粗体没生效 / 中文发虚」时，
@@ -811,6 +840,7 @@ mod tests {
             inject_skipped: vec!["汉字:Word 装的是 .ttc，按设计跳过".to_owned()],
             inject_used: 947_092,
             bold_ready: true,
+            ..FontState::default()
         };
         let line = state.fonts_line();
         // 这里断言的是**未脱敏**的原始行（族名里的空格保留）；
