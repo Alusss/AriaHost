@@ -334,7 +334,7 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 **现象**：`--atlas-probe`（隐藏入口）实测，边界在**字库全集 × 最坏档位**这一组合上，不在 3500：
 
 - **3500 字 × `worst`（四档各 3500）→ 不溢出**：Windows MSVC 产物（2026-11-27）`atlas=2048x2048 fill=0.974 overflow=0`，刚好塞满、余量 2.6%（`docs/dev/build.md` §4.6）。
-- **3755 字 × `worst` → 溢出**：epaint 把光标重置（`d_h=-1024`、`reset=1`、`stopped=overflow`），先前字形被覆盖，用户侧表现为部分汉字变方框/串字。
+- **3755 字 × `worst` → 溢出**：Windows MSVC 产物（2026-11-27，`--atlas-probe --chars 3755 --profile worst`，`exit=0`）实测四档 `fill` = 0.161 / 0.365 / 0.637 / **1.000**，第 4 档（20pt）`overflow=1`，汇总行 `overflow_total=1 stopped=overflow`；该次 `reset=0`，溢出由 epaint `atlas overflowed` 告警捕获（光标重置那条路径在 Linux 那轮出现过：`d_h=-1024`、`reset=1`）。溢出后先前字形被覆盖，用户侧表现为部分汉字变方框或串字。原始 stdout：`.scratch/m5/atlas-probe-windows-msvc.txt` 第 44–49 行。
 - 真实负载（`real`）两处都远未到：3500 字仅 `fill=0.227`、`atlas=2048x512`。
 
 **为什么不现在修**：面板实际文案是数百字量级，常态 `atlas=2048x64`；「整本一级字库 × 三档
@@ -346,7 +346,8 @@ C 依赖「系统吞掉 `ViewportCommand::Close`」，概率低且不可控，�
 会触发）；届时才在三条候选方案（子集化 / 提高 `ATLAS_MAX_SIDE` / 砍档位）里裁决。
 
 **取证命令**：`ariahost.exe --atlas-probe`（看 `ATLAS step=… overflow=… reset=…` 与
-`ATLAS_PROBE … overflow_total=…`）。
+`ATLAS_PROBE … overflow_total=…`）；本条溢出组合要复现须带参
+`--atlas-probe --chars 3755 --profile worst`。
 
 ## L18 汉字图集容量未覆盖等宽档（其余已由 Windows MSVC 实测覆盖）
 
