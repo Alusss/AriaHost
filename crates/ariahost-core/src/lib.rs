@@ -31,6 +31,7 @@ pub mod error;
 pub mod fetch;
 pub mod history;
 pub mod http;
+pub mod net;
 pub mod release;
 pub mod runtime;
 pub mod store;
@@ -59,6 +60,10 @@ pub use history::{
 pub use http::{
     fetch_json, fetch_zip, HttpClient, HttpOptions, HttpReply, DEFAULT_MAX_BODY, DEFAULT_TIMEOUT,
     MAX_JSON_BODY, ZIP_MAGIC,
+};
+pub use net::{
+    fault_of, github_via, hint_of, probe_core_line, probe_core_line_with, HttpProber, LineFault,
+    ProbeErr, ProbeFault, ProbeOk, ProbeTransport, Prober, PROBE_TIMEOUT, PROBE_URL,
 };
 pub use release::{
     check_update, host_bits, match_win_asset, release_version, GitHubRelease, ReleaseAsset,

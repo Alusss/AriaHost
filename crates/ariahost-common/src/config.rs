@@ -142,6 +142,81 @@ pub struct DlSection {
     pub extra: Extra,
 }
 
+/// 默认的通用 GitHub 前缀代理（M5-b）。用户网络下直连 GitHub 常被 RST，
+/// `https://ghproxy.net/` 是公开可用的前缀代理之一；换代理 = 改 `net.core_proxy_url`。
+pub const DEFAULT_CORE_PROXY_URL: &str = "https://ghproxy.net/";
+
+/// `net.core_proxy_mode` 取值（M5-b）：**AriaHost 自己访问 GitHub** 走直连还是前缀代理。
+///
+/// 与 [`NetSection::proxy`] 语义不同：后者是 aria2 下载文件时用的代理，两者互不影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreProxyMode {
+    /// 直连 `github.com`（默认）。
+    #[default]
+    Direct,
+    /// 走 [`NetSection::core_proxy_url`] 的前缀代理。
+    Proxy,
+}
+
+impl CoreProxyMode {
+    /// 稳定文本（配置、诊断包、自检输出共用；不要解析中文）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+        }
+    }
+
+    /// 从稳定文本解析（只认 `direct` / `proxy`，大小写不敏感）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "direct" => Some(Self::Direct),
+            "proxy" => Some(Self::Proxy),
+            _ => None,
+        }
+    }
+}
+
+/// 校验并规范化前缀代理基址：`http(s)://host[/path]`，**末位统一补一个 `/`**（幂等）。
+///
+/// 为什么放在 `common`：保存时的回落（[`NetSection::normalize_core_proxy`]）与运行时的
+/// URL 拼接（`ariahost-core` 的 `net::github_via`）必须用**同一条**规则，
+/// 否则会出现「存得下、拼不出」的裂缝。
+///
+/// 错误只返回一句可读原因（这个值要原样进 reason 给用户看）。
+pub fn normalize_proxy_base(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("空字符串");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("含空白字符");
+    }
+    // 大小写不敏感地认 scheme；`get(..n)` 在非字符边界时返回 None，避免按字节切片 panic。
+    let (scheme, rest) = match (
+        trimmed
+            .get(..8)
+            .filter(|head| head.eq_ignore_ascii_case("https://")),
+        trimmed
+            .get(..7)
+            .filter(|head| head.eq_ignore_ascii_case("http://")),
+    ) {
+        (Some(_), _) => (&trimmed[..5], &trimmed[8..]),
+        (None, Some(_)) => (&trimmed[..4], &trimmed[7..]),
+        _ => return Err("必须以 http:// 或 https:// 开头"),
+    };
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        return Err("host 为空");
+    }
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() || host == ":" || host.ends_with(':') {
+        return Err("host 为空或端口号缺失");
+    }
+    Ok(format!("{}://{rest}/", scheme.to_ascii_lowercase()))
+}
+
 /// `[net]`：连接与限速。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -165,10 +240,55 @@ pub struct NetSection {
     /// 核心获取的线路顺序（M4-0，定版新增键），逗号分隔的 `cdn` / `github`。
     ///
     /// 非法项会被丢弃并回退到默认 `cdn,github`，同时给一条可见告警
-    /// （见 `arihost-core` 的 [`crate::fetch::source_plan`]）。
+    /// （见 `ariahost-core` 的 `fetch::source_plan`）。
     pub source_order: String,
+    /// **AriaHost 自己**获取核心（版本列表 / 资产下载 / 探活）走直连还是前缀代理（M5-b）。
+    ///
+    /// 与 [`Self::proxy`] **语义完全不同**：`proxy` 是 aria2c 自己下载文件时用的代理；
+    /// 与 [`Self::cdn_base`] 的分工：`cdn_base` 是 aria2 二进制的镜像前缀（`{base}{资产名}`），
+    /// 本键是**通用 gh 代理前缀**（`{base}{完整 GitHub URL}`）——两者并存不冲突。
+    pub core_proxy_mode: CoreProxyMode,
+    /// 前缀代理基址，仅 `core_proxy_mode = proxy` 时生效。
+    ///
+    /// 规则见 [`normalize_proxy_base`]：必须 `http(s)://` + host 非空，末位统一补 `/`（幂等）。
+    /// 非法值在**保存时**自动回落成 [`DEFAULT_CORE_PROXY_URL`] 并给一条可读 reason（不阻止保存）。
+    pub core_proxy_url: String,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+impl NetSection {
+    /// 校验并规范化「获取核心」的代理设置；需要改动时返回**一条可读 reason**。
+    ///
+    /// 语义（M5-b 裁定）：
+    /// - 合法 → 只做末位斜杠规范化（幂等，第二次调用不再报）；
+    /// - 非法 → 基址回落成 [`DEFAULT_CORE_PROXY_URL`]（用户原话「不合法的格式默认恢复成默认代理」），
+    ///   `core_proxy_mode` **不动**（用户选的模式是他自己的意图，不该被一次手滑改掉）；
+    /// - 永不 panic、永不阻止保存。
+    pub fn normalize_core_proxy(&mut self) -> Option<String> {
+        let raw = self.core_proxy_url.clone();
+        match normalize_proxy_base(&raw) {
+            Ok(normalized) => {
+                if normalized == raw {
+                    return None;
+                }
+                self.core_proxy_url = normalized;
+                Some(format!(
+                    "net.core_proxy_url 已规范化：{} → {}",
+                    raw.trim(),
+                    self.core_proxy_url
+                ))
+            }
+            Err(reason) => {
+                self.core_proxy_url = DEFAULT_CORE_PROXY_URL.to_owned();
+                Some(format!(
+                    "net.core_proxy_url（{}）非法：{reason}；已恢复成默认代理 {}",
+                    raw.trim(),
+                    DEFAULT_CORE_PROXY_URL
+                ))
+            }
+        }
+    }
 }
 
 /// `[queue]`：队列与结果集。
@@ -413,6 +533,8 @@ impl Default for NetSection {
             disk_cache: "16M".to_owned(),
             cdn_base: "https://ah.335772.xyz/releases/".to_owned(),
             source_order: "cdn,github".to_owned(),
+            core_proxy_mode: CoreProxyMode::Direct,
+            core_proxy_url: DEFAULT_CORE_PROXY_URL.to_owned(),
             extra: Extra::new(),
         }
     }
@@ -687,6 +809,24 @@ pub fn load() -> Result<Config, ConfigError> {
     load_from(&path)
 }
 
+impl Config {
+    /// 把整份配置里「允许回落」的字段统一规范化（当前只有 `net.core_proxy_url`）。
+    ///
+    /// 为什么放在这里而不是解析器里：读盘和写盘共用同一条规则——
+    /// - **写盘**前规范化，磁盘上永远只有合法值；
+    /// - **读盘**后规范化，老版本/手改坏的文件也能继续用（不报错、不 panic）。
+    ///
+    /// 返回每条回落的可读 reason（空 vec = 全部合法），调用方负责上屏/记日志。
+    pub fn normalize(&mut self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if let Some(reason) = self.net.normalize_core_proxy() {
+            crate::logfile::write(crate::logfile::Level::Warn, "config", &reason);
+            reasons.push(reason);
+        }
+        reasons
+    }
+}
+
 /// 读指定路径的配置；文件不存在 → 全默认。
 pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     let text = match fs::read_to_string(path) {
@@ -704,7 +844,7 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     if text.trim().is_empty() {
         return Ok(Config::default());
     }
-    let config: Config = toml::from_str(&text)
+    let mut config: Config = toml::from_str(&text)
         .map_err(|error| ConfigError::new(ConfigErrorKind::Parse, Some(path), error.to_string()))?;
     if config.schema_version > SCHEMA_VERSION {
         return Err(ConfigError::new(
@@ -716,6 +856,8 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
             ),
         ));
     }
+    // 读回也规范化一次：老版本或手改坏的值不让它进入运行期。
+    config.normalize();
     Ok(config)
 }
 
@@ -738,7 +880,10 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
 
 /// 原子写指定路径：临时文件 → 落盘 → 旧文件转 `.bak` → rename。
 pub fn save_to(config: &Config, path: &Path) -> Result<(), ConfigError> {
-    let text = toml::to_string_pretty(config).map_err(|error| {
+    // 保存前统一规范化（不阻止保存、不 panic）：非法代理前缀回落成默认值并记一条 WARN。
+    let mut config = config.clone();
+    config.normalize();
+    let text = toml::to_string_pretty(&config).map_err(|error| {
         ConfigError::new(
             ConfigErrorKind::Io,
             Some(path),
@@ -1116,17 +1261,101 @@ mod tests {
         assert_eq!(config.lifecycle.quit_default, "pause");
     }
 
-    /// 架构 §4.11.1 的「计数断言」：序列化出来的叶子键必须正好 54 个。
+    /// 架构 §4.11.1 的「计数断言」：序列化出来的叶子键必须正好 56 个。
     ///
-    /// 52（定版）+ `net.cdn_base` / `net.source_order`（M4-0 新增，见架构 §4.11.1 注）。
+    /// 52（定版）+ `net.cdn_base` / `net.source_order`（M4-0）
+    /// + `net.core_proxy_mode` / `net.core_proxy_url`（M5-b）。
     #[test]
-    fn serialized_schema_has_exactly_54_leaf_keys() {
+    fn serialized_schema_has_exactly_56_leaf_keys() {
         let text = toml::to_string_pretty(&Config::default()).expect("序列化");
         let value: toml::Value = toml::from_str(&text).expect("回读");
         let mut count = 0usize;
         collect_leaf_keys(&value, &mut count);
         // schema_version 不计入键数。
-        assert_eq!(count - 1, 54, "键数应与架构 §4.11.1 一致：\n{text}");
+        assert_eq!(count - 1, 56, "键数应与架构 §4.11.1 一致：\n{text}");
+    }
+
+    // ---- net.core_proxy_url 的校验/规范化（M5-b，验收第 2 条 6 例）----
+
+    /// 1) https 与 http 都合法。
+    #[test]
+    fn proxy_base_accepts_https_and_http() {
+        assert_eq!(
+            normalize_proxy_base("https://ghproxy.net/").as_deref(),
+            Ok("https://ghproxy.net/")
+        );
+        assert_eq!(
+            normalize_proxy_base("http://127.0.0.1:7897/").as_deref(),
+            Ok("http://127.0.0.1:7897/")
+        );
+    }
+
+    /// 2) 缺尾斜杠自动补上，且**幂等**（第二次不再变）。
+    #[test]
+    fn proxy_base_appends_missing_slash_idempotently() {
+        let once = normalize_proxy_base("https://ghproxy.net").expect("合法");
+        assert_eq!(once, "https://ghproxy.net/");
+        let twice = normalize_proxy_base(&once).expect("合法");
+        assert_eq!(twice, once, "幂等：再规范化一次不应再变");
+    }
+
+    /// 3) 末尾多余斜杠收敛成一个（路径保留）。
+    #[test]
+    fn proxy_base_collapses_extra_trailing_slashes() {
+        assert_eq!(
+            normalize_proxy_base("https://gh.proxy.example.com///").as_deref(),
+            Ok("https://gh.proxy.example.com/")
+        );
+        assert_eq!(
+            normalize_proxy_base("https://ghproxy.net/gh/").as_deref(),
+            Ok("https://ghproxy.net/gh/")
+        );
+    }
+
+    /// 4) scheme 大小写不敏感（输出统一小写），host 大小写原样保留。
+    #[test]
+    fn proxy_base_normalizes_scheme_case_only() {
+        assert_eq!(
+            normalize_proxy_base("  HTTPS://GhProxy.NET  ").as_deref(),
+            Ok("https://GhProxy.NET/")
+        );
+    }
+
+    /// 5) 缺 scheme / 非 http(s) → 拒绝（不得静默当成相对路径）。
+    #[test]
+    fn proxy_base_rejects_missing_or_foreign_scheme() {
+        for raw in ["ghproxy.net", "ftp://ghproxy.net/", "//ghproxy.net/", ""] {
+            assert!(
+                normalize_proxy_base(raw).is_err(),
+                "{raw:?} 应当被拒绝，却被接受了"
+            );
+        }
+    }
+
+    /// 6) host 为空 / 含空白 → 拒绝；非法时保存回落默认值、模式不动、幂等不重复写盘。
+    #[test]
+    fn proxy_base_rejects_empty_host_and_invalid_falls_back_to_default() {
+        for raw in ["https://", "https:///path", "https://gh proxy.net/"] {
+            assert!(normalize_proxy_base(raw).is_err(), "{raw:?} 应被拒绝");
+        }
+
+        let mut section = NetSection {
+            core_proxy_mode: CoreProxyMode::Proxy,
+            core_proxy_url: "not-a-url".to_owned(),
+            ..NetSection::default()
+        };
+        let reason = section.normalize_core_proxy().expect("非法值要给 reason");
+        assert!(reason.contains("非法"), "reason 要可读：{reason}");
+        assert_eq!(section.core_proxy_url, DEFAULT_CORE_PROXY_URL);
+        assert_eq!(
+            section.core_proxy_mode,
+            CoreProxyMode::Proxy,
+            "模式是用户意图，不跟着回落"
+        );
+        assert!(
+            section.normalize_core_proxy().is_none(),
+            "回落后再规范化应无改动（幂等）"
+        );
     }
 
     fn collect_leaf_keys(value: &toml::Value, count: &mut usize) {

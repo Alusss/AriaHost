@@ -24,6 +24,7 @@ use std::time::Duration;
 use ureq::Agent;
 
 use crate::error::CoreError;
+use crate::net::ProbeTransport;
 
 /// 单次请求的总超时（连接 + 收响应 + 收 body）。
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -160,6 +161,27 @@ impl HttpClient {
             body,
         })
     }
+
+    /// 发一次 HEAD，只取状态码（`设置页「测一下」`的可用性探测用）。
+    ///
+    /// 为什么单独一个方法 + 单独的超时：探活要比常规请求短得多——用户按「测一下」
+    /// 不该等 30s；而且探活**绝不能**读 body（镜像站可能返回 HTML 拦截页，
+    /// 但探活只关心「能不能到达」，格式判断交给真正的下载路径）。
+    pub fn head_status(&self, url: &str, timeout: Duration) -> Result<u16, ProbeTransport> {
+        let config = Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .timeout_connect(Some(timeout))
+            .timeout_recv_response(Some(timeout))
+            .https_only(!self.options.allow_plain_http)
+            .max_redirects(self.options.max_redirects)
+            .http_status_as_error(false)
+            .build();
+        let agent = Agent::new_with_config(config);
+        match agent.head(url).call() {
+            Ok(response) => Ok(response.status().as_u16()),
+            Err(error) => Err(map_probe_error(error)),
+        }
+    }
 }
 
 /// GET 一个 JSON 端点（GitHub releases API）。
@@ -271,6 +293,18 @@ fn truncate(text: &str) -> String {
     }
     let head: String = text.chars().take(LIMIT).collect();
     format!("{head}…")
+}
+
+/// `ureq::Error` → 探测传输失败分类。
+///
+/// 超时与「连不上」必须分开：前者多半是代理不可用（建议换地址），
+/// 后者多半是压根没走对线路（建议切换直连/代理）。混成一个会给出错误建议。
+fn map_probe_error(error: ureq::Error) -> ProbeTransport {
+    let text = error.to_string();
+    match error {
+        ureq::Error::Timeout(_) => ProbeTransport::Timeout(text),
+        _ => ProbeTransport::Unreachable(text),
+    }
 }
 
 /// `ureq::Error` → [`CoreError`]。

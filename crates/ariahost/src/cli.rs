@@ -98,6 +98,15 @@ pub enum Command {
         /// 输出目录；`None` = `%LOCALAPPDATA%\AriaHost\diagnose`。
         out: Option<PathBuf>,
     },
+    /// `--core-line-selftest [--out <dir>]`：隐藏自检入口（不进 `--help`），
+    /// 真跑一遍「直连 / 代理前缀」两档可用性探测，把 JSON 报告落盘并打印路径。
+    ///
+    /// 为什么需要它：M5-b 之后「用户网络到底通不通哪一档」必须能一键取证，
+    /// 否则只能靠用户口述（已知：GitHub 直连在部分网络下完全不可用）。
+    NetSelftest {
+        /// 报告输出目录；`None` = `%LOCALAPPDATA%\AriaHost\diagnose`。
+        out: Option<PathBuf>,
+    },
     /// `--version` / `-V`。
     Version,
     /// `--help` / `-h`。
@@ -263,6 +272,7 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "--uninstall-service" => Command::UninstallService,
         "--service-status" => Command::ServiceStatus,
         "--diagnose" => return parse_diagnose(rest),
+        "--core-line-selftest" => return parse_core_line_selftest(rest),
         "--quit" => Command::Quit,
         "--version" | "-V" => Command::Version,
         "--help" | "-h" => Command::Help,
@@ -280,27 +290,39 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
 
 /// 解析 `--diagnose [--out <dir>]`：唯一的可选参数是输出目录（两种写法都收）。
 fn parse_diagnose(rest: &[String]) -> Result<Command, UsageError> {
+    Ok(Command::Diagnose {
+        out: parse_out_only("--diagnose", rest)?,
+    })
+}
+
+/// 解析 `--core-line-selftest [--out <dir>]`：与 `--diagnose` 同一套可选目录语法。
+fn parse_core_line_selftest(rest: &[String]) -> Result<Command, UsageError> {
+    Ok(Command::NetSelftest {
+        out: parse_out_only("--core-line-selftest", rest)?,
+    })
+}
+
+/// `--out <目录>` / `--out=<目录>` 的唯一解析处（诊断包与线路自检共用）。
+///
+/// 两份实现必然漂移（一边收了 `--out=` 一边没收，脚本就会时而有效），所以抽成一处。
+fn parse_out_only(flag: &str, rest: &[String]) -> Result<Option<PathBuf>, UsageError> {
     match rest {
-        [] => Ok(Command::Diagnose { out: None }),
-        [flag, dir] if flag == "--out" => {
+        [] => Ok(None),
+        [name, dir] if name == "--out" => {
             if dir.trim().is_empty() {
                 return Err(UsageError::new("--out 的目录不能为空"));
             }
-            Ok(Command::Diagnose {
-                out: Some(PathBuf::from(dir)),
-            })
+            Ok(Some(PathBuf::from(dir)))
         }
         [single] => match single.strip_prefix("--out=") {
-            Some(dir) if !dir.trim().is_empty() => Ok(Command::Diagnose {
-                out: Some(PathBuf::from(dir)),
-            }),
+            Some(dir) if !dir.trim().is_empty() => Ok(Some(PathBuf::from(dir))),
             Some(_) => Err(UsageError::new("--out= 后面的目录不能为空")),
             None => Err(UsageError::new(format!(
-                "--diagnose 只接受 --out <目录>，收到：{single}"
+                "{flag} 只接受 --out <目录>，收到：{single}"
             ))),
         },
         _ => Err(UsageError::new(format!(
-            "--diagnose 只接受 --out <目录>，收到：{}",
+            "{flag} 只接受 --out <目录>，收到：{}",
             rest.join(" ")
         ))),
     }
@@ -577,6 +599,7 @@ fn execute(command: &Command) -> i32 {
         Command::RuntimeSelftest { seconds } => run_runtime_selftest(*seconds),
         Command::Quit => run_quit(),
         Command::Diagnose { out } => run_diagnose(out.as_deref()),
+        Command::NetSelftest { out } => run_core_line_selftest(out.as_deref()),
         Command::Version => {
             println!("{BINARY_NAME} {VERSION}");
             EXIT_OK
@@ -1106,6 +1129,142 @@ fn run_aria2_fetch(version: Option<&str>) -> i32 {
 /// INFO forced=false
 /// ```
 /// 失败时打印 `ERROR <错误码|none> <可读原因>` 并以非 0 退出。
+/// `--core-line-selftest [--out <dir>]`：真跑「直连 / 代理前缀」两档可用性探测，落一份 JSON 报告。
+///
+/// 为什么要真跑：用户网络下 GitHub 直连是否可用**只能实测**（已有实测反例：
+/// 直连整体超时、issue 里 s3 段被墙）。设置页的「测一下」按钮与这条命令共用
+/// `ariahost_core::net` 的同一份判定，所以这里测出来的结论就是产品结论。
+///
+/// 退出码：`0` = 至少一档可达（有可用的获取路径）；`1` = 两档都不通。
+fn run_core_line_selftest(out: Option<&Path>) -> i32 {
+    let mut notes: Vec<String> = Vec::new();
+    let config = match ariahost_common::config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            notes.push(format!(
+                "读配置失败（按默认值探测，结论只代表默认线路）：{error}"
+            ));
+            ariahost_common::config::Config::default()
+        }
+    };
+
+    let net = &config.net;
+    let timeout = ariahost_core::net::PROBE_TIMEOUT;
+    let modes: &[(ariahost_common::config::CoreProxyMode, &str)] = &[
+        (ariahost_common::config::CoreProxyMode::Direct, ""),
+        (
+            ariahost_common::config::CoreProxyMode::Proxy,
+            net.core_proxy_url.as_str(),
+        ),
+    ];
+
+    let mut lines = Vec::new();
+    let mut any_ok = false;
+    for (mode, proxy_url) in modes {
+        // 代理档在前缀为空时没有可打的地址：如实记一条「未配置」，不假装失败。
+        if *mode == ariahost_common::config::CoreProxyMode::Proxy && proxy_url.trim().is_empty() {
+            lines.push(serde_json::json!({
+                "mode": "proxy",
+                "configured": false,
+                "ok": false,
+                "hint": "没配前缀代理基址（net.core_proxy_url 为空）：要么填一个可用的 GitHub 前缀，要么接受只能直连",
+            }));
+            continue;
+        }
+        let final_url =
+            ariahost_core::net::github_via(*mode, proxy_url, ariahost_core::net::PROBE_URL);
+        match ariahost_core::net::probe_core_line(*mode, proxy_url, timeout) {
+            Ok(ok) => {
+                any_ok = true;
+                lines.push(serde_json::json!({
+                    "mode": mode.as_str(),
+                    "configured": true,
+                    "ok": true,
+                    "http_status": ok.http_status,
+                    "latency_ms": ok.latency_ms,
+                    "url": final_url,
+                }));
+            }
+            Err(error) => {
+                lines.push(serde_json::json!({
+                    "mode": mode.as_str(),
+                    "configured": true,
+                    "ok": false,
+                    "fault": error.fault.as_str(),
+                    "hint": error.hint,
+                    "detail": error.detail,
+                    "url": final_url,
+                }));
+            }
+        }
+    }
+
+    let report = serde_json::json!({
+        "generated_at": ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
+        "probe_url": ariahost_core::net::PROBE_URL,
+        "timeout_ms": timeout.as_millis(),
+        "core_proxy_mode": net.core_proxy_mode.as_str(),
+        "core_proxy_url": net.core_proxy_url,
+        "lines": lines,
+        "notes": notes,
+    });
+
+    let dir = out
+        .map(std::path::Path::to_path_buf)
+        .or_else(default_report_dir);
+    let Some(dir) = dir else {
+        eprintln!("拿不到输出目录（%LOCALAPPDATA% 不可用）：用 --out <目录> 指定一个");
+        return EXIT_ERR;
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "建不了输出目录 {}：{error}；用 --out 换个可写目录再试",
+            dir.display()
+        );
+        return EXIT_ERR;
+    }
+    let stamp =
+        ariahost_common::time::utc_stamp(std::time::SystemTime::now()).replace([':', '.'], "-");
+    let path = dir.join(format!("net-selftest-{stamp}.json"));
+    let body = serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string());
+    if let Err(error) = std::fs::write(&path, body) {
+        eprintln!("写报告失败 {}：{error}", path.display());
+        return EXIT_ERR;
+    }
+
+    println!("线路自检报告：{}", path.display());
+    for line in report["lines"].as_array().into_iter().flatten() {
+        let mode = line["mode"].as_str().unwrap_or("?");
+        if line["ok"].as_bool().unwrap_or(false) {
+            println!(
+                "  {mode}: 可达（HTTP {}，{} ms）",
+                line["http_status"], line["latency_ms"]
+            );
+        } else {
+            println!(
+                "  {mode}: 不可达 → {}",
+                line["hint"].as_str().unwrap_or("（无提示）")
+            );
+        }
+    }
+    for note in &notes {
+        println!("  注意：{note}");
+    }
+
+    if any_ok {
+        EXIT_OK
+    } else {
+        eprintln!("两档线路都不可达：设置页里换前缀代理，或改用「指定本地 aria2c」");
+        EXIT_ERR
+    }
+}
+
+/// 自检报告的默认目录（与诊断包同处，用户找得到）。
+fn default_report_dir() -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    Some(PathBuf::from(local).join("AriaHost").join("diagnose"))
+}
+
 fn run_runtime_selftest(seconds: u64) -> i32 {
     use std::time::Duration;
 
