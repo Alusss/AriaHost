@@ -147,6 +147,15 @@ pub enum RuntimeError {
         /// 可读细节（含查过哪些位置）。
         detail: String,
     },
+    /// 回退链走完仍找不到可用核心（**逐跳原因**，顺序即尝试顺序）。
+    ///
+    /// 与 [`RuntimeError::CoreNotFound`] 的区别：`CoreNotFound` 是**单跳**失败
+    /// （某一来源解释自己为什么没有），`Unavailable` 是**整条链**的结论。
+    /// UI 应把这里每一条都显示出来，否则用户只看到「找不到」却不知道查过哪里。
+    Unavailable {
+        /// 逐跳原因（`configured(...)` / `last_good` / `bundled` …）。
+        attempts: Vec<String>,
+    },
     /// 受控 conf 渲染/落盘失败。
     Prepare(String),
     /// `CreateProcess` 失败。
@@ -171,7 +180,9 @@ impl RuntimeError {
     /// 对应的既有错误码（没有合适码时为 `None`）。
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
-            Self::CoreNotFound { .. } | Self::Launch(_) => Some(ErrorCode::Aria2NotFound),
+            Self::CoreNotFound { .. } | Self::Launch(_) | Self::Unavailable { .. } => {
+                Some(ErrorCode::Aria2NotFound)
+            }
             Self::StartTimeout { .. } => Some(ErrorCode::Aria2StartTimeout),
             Self::AlreadyRunning
             | Self::Prepare(_)
@@ -187,6 +198,16 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::AlreadyRunning => write!(formatter, "aria2 已在运行或正在切换状态，拒绝重复启动"),
             Self::CoreNotFound { detail } => write!(formatter, "找不到 aria2c：{detail}"),
+            Self::Unavailable { attempts } => {
+                write!(formatter, "找不到可用的 aria2c：")?;
+                for (index, attempt) in attempts.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, "；")?;
+                    }
+                    write!(formatter, "{}) {attempt}", index + 1)?;
+                }
+                Ok(())
+            }
             Self::Prepare(detail) => write!(formatter, "渲染 aria2.conf 失败：{detail}"),
             Self::Launch(detail) => write!(formatter, "启动 aria2c 失败：{detail}"),
             Self::StartExited { exit_code } => match exit_code {
@@ -240,13 +261,32 @@ impl CoreOrigin {
     }
 }
 
-/// 解析出来的核心：路径 + 来源。
+/// 解析出来的核心：路径 + 来源 + 是否回退。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCore {
     /// `aria2c.exe` 的实际路径。
     pub path: PathBuf,
     /// 它为什么被选中。
     pub origin: CoreOrigin,
+    /// 是否走了回退链（`false` = 按 `aria2.source` 的语义直接解析成功）。
+    ///
+    /// UI 用它决定要不要显示「已回退到 X，原因 Y」——**降级必须可见**，
+    /// 否则用户会以为配置生效了。
+    pub fell_back: bool,
+    /// 回退原因（`fell_back` 时为 `Some`，含第一跳失败原因；否则 `None`）。
+    pub reason: Option<String>,
+}
+
+impl ResolvedCore {
+    /// 按配置直接解析成功（正常路径，不涉及回退）。
+    fn direct(path: PathBuf, origin: CoreOrigin) -> Self {
+        Self {
+            path,
+            origin,
+            fell_back: false,
+            reason: None,
+        }
+    }
 }
 
 /// 内置核心的候选路径：**当前进程 exe 所在目录**的 `aria2c.exe`。
@@ -289,7 +329,87 @@ pub fn resolve_core_in_with(
 }
 
 /// 全部来源都显式注入的解析器本体（**单测只测这一层**：不读环境变量）。
-fn resolve_core_with(
+///
+/// 解析顺序（M5-b-G 起）：
+/// 1. **configured**：按 `aria2.source` 的既有语义解析
+///    （`auto` = 内置 → 托管 → 配了 `external_path` 的外部；`managed`/`external` 只看那一种）；
+/// 2. 失败 → **last_good**：版本库里「最近一次真跑起来过」的版本（`last_good.json`，
+///    由 [`CoreRuntime::with_last_good_root`] 在成功 spawn 后写入）；
+/// 3. `auto` 下仍失败 → **bundled**（第 1 跳已试过，这里只是把原因记全）；
+/// 4. 全失败 → [`RuntimeError::Unavailable`]，带**逐跳**原因。
+///
+/// # 为什么 `managed`/`external` 也走这一整条链（M5-b-G 的语义变更，**可见**）
+///
+/// 本批按任务书要求把回退链统一到所有 `aria2.source`：
+/// `configured → last_good → bundled → Unavailable`。
+/// 这**改变了** task-54 锁定的不变量「显式来源失败就报错、绝不使用内置核心」
+/// （原测试 `managed_source_never_silently_falls_back_to_bundled`）：
+/// 现在显式来源失败也会退到内置核心，但**必须可见**——`fell_back = true` 且
+/// `reason` 里逐跳写明「为什么退、退到了哪」。理由：对「aria2 服务管理器」而言，
+/// 版本库被清理/移走后直接起不来，比「起内置核心 + 面板明示已回退」更糟；
+/// 而 task-54 真正防的是**静默**替换（用户以为 managed 生效），这一点没被放弃。
+///
+/// 如果将来要恢复严格语义：把下面第 3 跳加一个
+/// `if config.aria2.source == Aria2Source::Auto` 判断即可（改动只在这一点）。
+pub(crate) fn resolve_core_with(
+    config: &Config,
+    versions_root: Option<&Path>,
+    bundled: Option<&Path>,
+) -> Result<ResolvedCore, RuntimeError> {
+    let mut attempts: Vec<String> = Vec::new();
+
+    // 跳 1：configured（既有语义）。
+    match configured_core(config, versions_root, bundled) {
+        Ok(core) => return Ok(core),
+        Err(error) => attempts.push(format!(
+            "configured({})：{error}",
+            config.aria2.source.as_str()
+        )),
+    }
+
+    // 跳 2：last_good（最近一次真跑起来过的版本；仍是版本库来源）。
+    match last_good_core(versions_root) {
+        Ok(Some((version, exe))) => {
+            let first = attempts.first().cloned().unwrap_or_default();
+            return Ok(ResolvedCore {
+                path: exe,
+                // 它本来就在版本库里：来源仍是「托管」，回退信息走 fell_back/reason。
+                origin: CoreOrigin::Managed,
+                fell_back: true,
+                reason: Some(format!(
+                    "按 last_good 回退到 {version}（{first}）；若这个版本能用，请把 aria2.source 改回来"
+                )),
+            });
+        }
+        Ok(None) => attempts.push("last_good：没有记录，或记录的版本目录/exe 已不存在".to_owned()),
+        Err(detail) => attempts.push(format!("last_good：{detail}")),
+    }
+
+    // 跳 3：bundled（exe 同目录）。
+    if let Some(path) = bundled.filter(|path| path.is_file()) {
+        return Ok(ResolvedCore {
+            path: path.to_path_buf(),
+            origin: CoreOrigin::Bundled,
+            fell_back: true,
+            reason: Some(format!(
+                "回退到内置核心 {}（{}）：{}",
+                path.display(),
+                if config.aria2.source == ariahost_common::Aria2Source::Auto {
+                    "auto 第 1 跳已试过，现在仍找不到其它来源"
+                } else {
+                    "显式来源不可用"
+                },
+                attempts.join("；")
+            )),
+        });
+    }
+    attempts.push(format!("bundled：exe 同目录没有可用的 {BUNDLED_CORE_EXE}"));
+
+    Err(RuntimeError::Unavailable { attempts })
+}
+
+/// 按 `aria2.source` 的既有语义解析（**成功即返回，不回落**）。
+fn configured_core(
     config: &Config,
     versions_root: Option<&Path>,
     bundled: Option<&Path>,
@@ -299,16 +419,13 @@ fn resolve_core_with(
     match config.aria2.source {
         Aria2Source::Auto => {
             if let Some(path) = bundled.filter(|path| path.is_file()) {
-                return Ok(ResolvedCore {
-                    path: path.to_path_buf(),
-                    origin: CoreOrigin::Bundled,
-                });
+                return Ok(ResolvedCore::direct(
+                    path.to_path_buf(),
+                    CoreOrigin::Bundled,
+                ));
             }
             match managed_core_in(versions_root) {
-                Ok(path) => Ok(ResolvedCore {
-                    path,
-                    origin: CoreOrigin::Managed,
-                }),
+                Ok(path) => Ok(ResolvedCore::direct(path, CoreOrigin::Managed)),
                 Err(managed_error) => {
                     // 外部路径是用户显式写的：auto 下它是最后一道可用来源。
                     if config.aria2.external_path.trim().is_empty() {
@@ -324,10 +441,10 @@ fn resolve_core_with(
                 }
             }
         }
-        Aria2Source::Managed => Ok(ResolvedCore {
-            path: managed_core_in(versions_root)?,
-            origin: CoreOrigin::Managed,
-        }),
+        Aria2Source::Managed => Ok(ResolvedCore::direct(
+            managed_core_in(versions_root)?,
+            CoreOrigin::Managed,
+        )),
         Aria2Source::External => external_core(config),
     }
 }
@@ -375,15 +492,35 @@ fn external_core(config: &Config) -> Result<ResolvedCore, RuntimeError> {
     }
     let exe = config::expand_user_path(raw);
     if exe.is_file() {
-        Ok(ResolvedCore {
-            path: exe,
-            origin: CoreOrigin::External,
-        })
+        Ok(ResolvedCore::direct(exe, CoreOrigin::External))
     } else {
         Err(RuntimeError::CoreNotFound {
             detail: format!("external_path 指向的文件不存在：{}", exe.display()),
         })
     }
+}
+
+/// 回退跳 2：版本库根里的 `last_good.json` 指向的版本。
+///
+/// 返回 `Ok(None)` = 没有记录（或记录指的目录/exe 已不存在）——那是「等于没有」，
+/// 不是错误；只有「拿不到版本库根目录」才用 `Err(detail)` 说明原因，
+/// 因为那意味着这个平面根本没法记录回退锚点。
+///
+/// 「可执行」的判定：`is_installed`（`versions/<ver>/aria2c.exe` 是文件）。
+/// 静态无法证明一个 exe 真能跑，真正的证明在启动阶段（RPC 就绪）——所以这里不
+/// 拿 `--version` 去探（那会把 `resolve_core` 变成一次进程启动，代价与副作用都不值）。
+fn last_good_core(versions_root: Option<&Path>) -> Result<Option<(String, PathBuf)>, String> {
+    let dir = versions_root
+        .ok_or_else(|| "拿不到核心版本库根目录（LOCALAPPDATA/PROGRAMDATA 缺失）".to_owned())?;
+    let store = VersionStore::new(dir);
+    let Some(version) = store.last_good() else {
+        return Ok(None);
+    };
+    let exe = store.exe_path(&version);
+    if !exe.is_file() {
+        return Ok(None);
+    }
+    Ok(Some((version, exe)))
 }
 
 /// 只要路径的旧入口（服务端 `scm.rs` 等不关心来源的调用方保留）。
@@ -787,6 +924,8 @@ pub struct CoreRuntime {
     timeouts: Timeouts,
     status: CoreStatus,
     child: Option<Box<dyn Child>>,
+    /// 版本库根（可选）：就绪探测成功后在这里写 `last_good.json`（M5-b-G 的回退锚点）。
+    last_good_root: Option<PathBuf>,
 }
 
 impl CoreRuntime {
@@ -798,6 +937,35 @@ impl CoreRuntime {
             timeouts,
             status: CoreStatus::new(CoreState::Idle),
             child: None,
+            last_good_root: None,
+        }
+    }
+
+    /// 让运行时在「核心成功 spawn 且 `aria2c --version`/RPC 探到有效版本」之后
+    /// 把该版本记进 `last_good.json`（与 `active.json` 同在版本库根）。
+    ///
+    /// 为什么**不**放进 [`CoreRuntime::new`]：三个既有调用方（面板/服务/自检）不该为
+    /// 一个新能力集体改签名。但反过来必须说清：**不接这一句就没有回退锚点**。
+    /// 接线点（面板 `core_host` 与服务 `scm`）不在本批写域，见 worklog 的「仍未验证」。
+    ///
+    /// 为什么写入时机是「成功 spawn 之后」而不是「安装成功之后」：安装成功只证明
+    /// 字节被写进目录，**真能跑起来**才算这个版本可用；把装完就跑不起来的版本写成
+    /// last_good，等于把回退锚点钉在一个坏版本上。
+    pub fn with_last_good_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.last_good_root = Some(root.into());
+        self
+    }
+
+    /// 就绪后记录 last_good（失败只发一条 `Warning`，绝不把启动判成失败）。
+    fn record_last_good(&self, version: &str, events: &mut dyn FnMut(RuntimeEvent)) {
+        let Some(root) = self.last_good_root.as_ref() else {
+            return;
+        };
+        let store = VersionStore::new(root);
+        if let Err(error) = store.record_last_good(version) {
+            events(RuntimeEvent::Warning {
+                detail: format!("记录 last_good 失败（不影响运行）：{error}"),
+            });
         }
     }
 
@@ -876,7 +1044,12 @@ impl CoreRuntime {
                     self.status.state = CoreState::Running;
                     self.status.version = Some(version.clone());
                     self.child = Some(child);
-                    events(RuntimeEvent::Running { version, pid });
+                    events(RuntimeEvent::Running {
+                        version: version.clone(),
+                        pid,
+                    });
+                    // 只有走到这里（进程活着 + 探到版本）才写回退锚点。
+                    self.record_last_good(&version, events);
                     return Ok(self.status.clone());
                 }
                 Err(_) => {
@@ -1456,6 +1629,58 @@ mod tests {
     }
 
     #[test]
+    fn last_good_is_written_only_after_readiness_succeeds() {
+        let dir = std::env::temp_dir().join(format!(
+            "ariahost-runtime-lastgood-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建版本库根");
+
+        // 1) 就绪失败：**绝不能**写 last_good（安装成功 ≠ 真能跑，这是本功能的语义核心）。
+        let exit = Arc::new(Mutex::new(None));
+        let spawner = FakeSpawner::new(|_| Box::new(FakeChild::new(7, None, 0)));
+        let probe = FakeProbe::new(u32::MAX, true, true, Arc::clone(&exit));
+        let mut runtime = CoreRuntime::new(Box::new(spawner), Box::new(probe), fast_timeouts())
+            .with_last_good_root(&dir);
+        let (_, mut callback) = recorder();
+        runtime
+            .start(&spec(), &mut callback)
+            .expect_err("永远不就绪");
+        assert_eq!(
+            VersionStore::new(&dir).last_good(),
+            None,
+            "就绪前不得写 last_good"
+        );
+
+        // 2) 就绪成功：写盘；同版本再来一次不重写（幂等）。
+        let exit = Arc::new(Mutex::new(None));
+        let child_exit = Arc::clone(&exit);
+        let spawner = FakeSpawner::new(move |_| {
+            Box::new(FakeChild::shared(4242, Arc::clone(&child_exit), 0))
+        });
+        let probe = FakeProbe::new(1, true, true, Arc::clone(&exit));
+        let mut runtime = CoreRuntime::new(Box::new(spawner), Box::new(probe), fast_timeouts())
+            .with_last_good_root(&dir);
+        let (events, mut callback) = recorder();
+        let status = runtime.start(&spec(), &mut callback).expect("应就绪");
+        assert_eq!(status.state, CoreState::Running);
+        let store = VersionStore::new(&dir);
+        assert_eq!(store.last_good().as_deref(), Some("1.37.0"));
+        assert!(
+            !store.record_last_good("1.37.0").expect("写 last_good"),
+            "同一版本不得重复写盘"
+        );
+        assert!(
+            !names(&events.lock().expect("锁")).contains(&"warning"),
+            "正常路径不该有告警：{:?}",
+            names(&events.lock().expect("锁"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn readiness_timeout_fails_with_e2002_and_kills_child() {
         let exit = Arc::new(Mutex::new(None));
         let spawner = FakeSpawner::new(|_| Box::new(FakeChild::new(7, None, 0)));
@@ -1851,8 +2076,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// 往版本库根写一份 last_good 记录（与生产同一个文件名/形状）。
+    fn write_last_good(versions: &Path, version: &str) {
+        std::fs::create_dir_all(versions).expect("建版本库根");
+        std::fs::write(
+            versions.join(crate::store::LAST_GOOD_FILE),
+            format!("{{\"version\":\"{version}\"}}\n"),
+        )
+        .expect("写 last_good");
+    }
+
     #[test]
-    fn auto_with_nothing_available_is_core_not_found_and_points_at_the_guide() {
+    fn auto_with_nothing_available_reports_unavailable_with_per_jump_reasons() {
         let (root, versions, bundled) = resolve_fixture("auto-none");
         let error = resolve_core_with(
             &config_with(Aria2Source::Auto, ""),
@@ -1862,8 +2097,8 @@ mod tests {
         .expect_err("三处都没有核心时必须报错");
 
         assert!(
-            matches!(error, RuntimeError::CoreNotFound { .. }),
-            "应是 CoreNotFound：{error:?}"
+            matches!(error, RuntimeError::Unavailable { .. }),
+            "应是 Unavailable（逐跳结论）：{error:?}"
         );
         assert_eq!(error.code(), Some(ErrorCode::Aria2NotFound));
         let detail = error.to_string();
@@ -1871,22 +2106,108 @@ mod tests {
             detail.contains("首次运行引导"),
             "错误文案必须给出可执行下一步：{detail}"
         );
+        // 逐跳原因一个都不许吞：configured / last_good / bundled 三条都要在场。
+        let RuntimeError::Unavailable { attempts } = &error else {
+            unreachable!()
+        };
+        assert_eq!(attempts.len(), 3, "三跳都应有原因：{attempts:?}");
+        assert!(attempts[0].starts_with("configured(auto)"), "{attempts:?}");
+        assert!(attempts[1].starts_with("last_good"), "{attempts:?}");
+        assert!(attempts[2].starts_with("bundled"), "{attempts:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// M5-b-G 的**有意语义变更**：显式来源失败也会退到内置核心，但必须**可见**。
+    ///
+    /// 原来的不变量（task-54）是「managed/external 绝不使用内置核心」。本批按任务书
+    /// 要求统一回退链，改成「可以退，但 `fell_back` + `reason` 必须说清」。
+    /// 这条测试锁定的就是「退得可见」，而不是「退得静默」。
     #[test]
-    fn managed_source_never_silently_falls_back_to_bundled() {
-        let (root, versions, bundled) = resolve_fixture("managed-strict");
+    fn managed_source_falls_back_to_bundled_with_a_visible_reason() {
+        let (root, versions, bundled) = resolve_fixture("managed-fallback");
         install_fake_bundled(&bundled);
 
-        let error = resolve_core_with(
+        let core = resolve_core_with(
             &config_with(Aria2Source::Managed, ""),
             Some(&versions),
             Some(&bundled),
         )
-        .expect_err("source=managed 时不得使用内置核心");
+        .expect("显式来源不可用时回退到内置核心");
 
-        assert!(matches!(error, RuntimeError::CoreNotFound { .. }));
+        assert_eq!(core.origin, CoreOrigin::Bundled);
+        assert!(core.fell_back, "回退必须标记");
+        let reason = core.reason.expect("回退必须带原因");
+        assert!(reason.contains("回退到内置核心"), "{reason}");
+        assert!(reason.contains("configured(managed)"), "{reason}");
+        assert_eq!(core.path, bundled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn configured_success_does_not_mark_a_fallback() {
+        let (root, versions, bundled) = resolve_fixture("no-fallback");
+        install_fake_bundled(&bundled);
+        // 有 last_good 也不该用：第 1 跳就成功了。
+        write_last_good(&versions, "1.36.0");
+
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Auto, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("auto 应直接用内置核心");
+
+        assert_eq!(core.origin, CoreOrigin::Bundled);
+        assert!(!core.fell_back, "成功路径不得标记回退");
+        assert_eq!(core.reason, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_active_pointer_falls_back_to_last_good_version() {
+        let (root, versions, bundled) = resolve_fixture("last-good-hit");
+        // 版本装好了，但 active.json 缺失（指针被删/坏）→ managed 第 1 跳失败。
+        let dir = versions.join("1.36.0");
+        std::fs::create_dir_all(&dir).expect("建版本目录");
+        let exe = dir.join(BUNDLED_CORE_EXE);
+        std::fs::write(&exe, b"MZ").expect("写占位核心");
+        write_last_good(&versions, "1.36.0");
+
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Auto, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("应回退到 last_good 版本");
+
+        assert_eq!(core.origin, CoreOrigin::Managed);
+        assert_eq!(core.path, exe);
+        assert!(core.fell_back, "回退必须标记");
+        let reason = core.reason.expect("回退必须带原因");
+        assert!(reason.contains("last_good"), "{reason}");
+        assert!(reason.contains("1.36.0"), "{reason}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_last_good_record_falls_through_to_bundled() {
+        let (root, versions, bundled) = resolve_fixture("last-good-stale");
+        install_fake_bundled(&bundled);
+        // 记录指向的版本目录已不存在 → 当「没有」，继续下一跳。
+        write_last_good(&versions, "1.36.0");
+
+        let core = resolve_core_with(
+            &config_with(Aria2Source::Managed, ""),
+            Some(&versions),
+            Some(&bundled),
+        )
+        .expect("应继续退到内置核心");
+
+        assert_eq!(core.origin, CoreOrigin::Bundled);
+        assert!(core.fell_back);
+        let reason = core.reason.expect("回退必须带原因");
+        assert!(reason.contains("last_good"), "{reason}");
+        assert!(reason.contains("回退到内置核心"), "{reason}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

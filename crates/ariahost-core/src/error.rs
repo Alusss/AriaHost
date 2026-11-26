@@ -19,6 +19,9 @@
 //! | 回滚失败（没有上一代） | [`CoreError::RollbackFailed`] | `AH-E6008` | 「回滚自身失败」 |
 //! | 版本库读写失败 | [`CoreError::StoreIo`] | 无 | 既有码无「本地版本库 IO」 |
 //! | 输入/上游版本号非法 | [`CoreError::BadVersion`] | `AH-E1001` | 命令行入口按用法错误处理 |
+//! | 手工 tag 非法（含路径穿越形态） | [`CoreError::BadTag`] | `AH-E1001` | 用户输入，与 `BadVersion` 同码 |
+//! | 该 tag 下 3 个 build 全 404 | [`CoreError::NoReleaseAsset`] | 无 | 既非网络故障也非包损坏 |
+//! | 下载包 `--version` 与 tag 不符 | [`CoreError::VersionMismatch`] | `AH-E6003` | 「更新包校验失败」 |
 
 use std::fmt;
 
@@ -112,6 +115,27 @@ pub enum CoreError {
         /// 原始取值。
         value: String,
     },
+    /// 手工指定的 tag 非法（tag 会进下载 URL 与版本目录名，**必须严格**）。
+    BadTag {
+        /// 具体原因（来自 [`crate::tag::TagError`]）。
+        reason: String,
+    },
+    /// 该 tag 下没有本机架构的发布包（`build1`–`build3` 全 404）。
+    NoReleaseAsset {
+        /// 归一化后的版本号。
+        tag: String,
+        /// 位宽。
+        bits: u32,
+        /// 试过的 build 数。
+        builds: u32,
+    },
+    /// 下载包的 `aria2c --version` 与 tag 不一致（包被替换 / build 名对不上）。
+    VersionMismatch {
+        /// 期望版本（归一化后的 tag）。
+        expected: String,
+        /// 实测版本。
+        actual: String,
+    },
 }
 
 impl CoreError {
@@ -127,10 +151,12 @@ impl CoreError {
             Self::AllLinesFailed { .. } => Some(ErrorCode::AllSourcesUnavailable),
             Self::ExeInUse { .. } => Some(ErrorCode::ExeInUse),
             Self::RollbackFailed { .. } => Some(ErrorCode::RollbackFailed),
-            Self::BadVersion { .. } => Some(ErrorCode::Usage),
+            Self::BadVersion { .. } | Self::BadTag { .. } => Some(ErrorCode::Usage),
+            Self::VersionMismatch { .. } => Some(ErrorCode::UpdatePackageInvalid),
             Self::VersionNotFound { .. }
             | Self::ReleaseNotFound { .. }
             | Self::NoAssetForArch { .. }
+            | Self::NoReleaseAsset { .. }
             | Self::StoreIo { .. } => None,
         }
     }
@@ -236,6 +262,22 @@ impl fmt::Display for CoreError {
             Self::BadVersion { value } => {
                 write!(formatter, "{} 版本号非法：{value}", ErrorCode::Usage.code())
             }
+            Self::BadTag { reason } => write!(
+                formatter,
+                "{} 手工指定的 aria2 tag 非法：{reason}",
+                ErrorCode::Usage.code()
+            ),
+            Self::NoReleaseAsset { tag, bits, builds } => write!(
+                formatter,
+                "该 tag 下没有 {bits} 位的 aria2 发布包：{tag}（build1–build{builds} 全部 404）——\
+                 请到 {} 核对版本号与本机架构",
+                crate::tag::ARIA2_RELEASES_PAGE
+            ),
+            Self::VersionMismatch { expected, actual } => write!(
+                formatter,
+                "{} 下载包版本与 tag 不一致：期望 {expected}，实测 {actual}（包可能被替换，或 build 名对不上）",
+                ErrorCode::UpdatePackageInvalid.code()
+            ),
         }
     }
 }

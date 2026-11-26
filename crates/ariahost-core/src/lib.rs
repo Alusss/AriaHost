@@ -6,6 +6,8 @@
 //! - [`download`]：下载线路模板与「逐线路失败可见」的聚合（不静默降级）；
 //! - [`zip_extract`]：只取 `aria2c.exe`（含随包 DLL），带 zip slip / 炸弹防护；
 //! - [`store`]：版本库布局、`active.json` 原子写、切换与单代回滚；
+//! - [`tag`]：手工指定 tag 取核心（**不碰 GitHub API**）——tag 严格校验、`build1..3` 探测、
+//!   G5 拒装流水线、给 UI 的 `list_cores`、以及 `last_good` 回退锚点（M5-b-G）；
 //! - [`fetch`]：把上面这些串起来的编排，以及哈希口径（[`KNOWN_SHA256`] / [`HashState`]）；\n//! - [`runtime`]：aria2c 子进程托管（M2-2a）——定位、受控 conf、无窗口启动、RPC 就绪探测、\n//!   三段式优雅停止、Job Object 孤儿守卫。
 //!
 //! ## TLS 依赖决策（本批唯一新增的 HTTP/TLS 栈）
@@ -36,6 +38,7 @@ pub mod release;
 pub mod runtime;
 pub mod store;
 pub mod sync;
+pub mod tag;
 pub mod zip_extract;
 
 pub use clean::{
@@ -78,11 +81,20 @@ pub use runtime::{
     RuntimeError, RuntimeEvent, RuntimePaths, Spawner, Timeouts, BUNDLED_CORE_EXE, CONF_FILE_NAME,
     CREATE_NO_WINDOW, FILE_ALLOCATION, LOG_FILE_NAME, PID_FILE_NAME, SESSION_FILE_NAME,
 };
-pub use store::{ActivePointer, ExeProbe, VersionStore, ACTIVE_FILE};
+pub use store::{
+    ActivePointer, ExeProbe, LastGoodPointer, VersionStore, ACTIVE_FILE, LAST_GOOD_FILE,
+};
 pub use sync::{
     service_core_status, service_core_status_default, service_core_status_with,
     sync_core_to_service, sync_core_to_service_default, sync_core_to_service_with, RealSyncIo,
     ServiceCoreStatus, SyncError, SyncIo, SyncOutcome, SyncReport, TMP_SUFFIX,
+};
+pub use tag::{
+    fetch_by_tag, fetch_by_tag_tracked, list_cores, list_cores_in, normalize_tag, probe_tag_asset,
+    probe_tag_asset_tracked, AssetAttempt, AssetAttemptOutcome, CoreEntry, CoreEntryOrigin,
+    CoreLineKind, CoreVersionProbe, G5Step, ProcessVersionProbe, TagAsset, TagError, TagInstall,
+    ARIA2_RELEASES_PAGE, DOWNLOAD_URL_BASE, MAX_BUILD, MAX_TAG_BYTES, UNKNOWN_VERSION,
+    VERSION_PROBE_TIMEOUT,
 };
 pub use zip_extract::{extract_core, ExtractedCore};
 

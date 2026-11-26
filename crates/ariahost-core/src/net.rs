@@ -205,6 +205,14 @@ impl HttpProber {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// 用既有的客户端构造（单测要指向明文假服务器；生产用 [`HttpProber::new`]）。
+    ///
+    /// 为什么要这一条：`probe_tag_asset` 的 build-N 探测也走 HEAD，测试必须能把它
+    /// 打到 `127.0.0.1` 的假服务器上，才能验证「真实请求路径长什么样」。
+    pub fn with_client(client: crate::http::HttpClient) -> Self {
+        Self { client }
+    }
 }
 
 impl Prober for HttpProber {

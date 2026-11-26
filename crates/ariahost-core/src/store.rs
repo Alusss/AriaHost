@@ -35,6 +35,12 @@ use crate::CORE_EXE;
 /// 激活指针文件名。
 pub const ACTIVE_FILE: &str = "active.json";
 
+/// 「最近一次真跑起来过」的记录文件名（M5-b-G）。
+///
+/// 放在**版本库根**（与 `active.json` 同目录）：用户平面与服务平面天然各一份，
+/// 不会出现「服务账户读到用户目录里的记录」这种跨平面串味。
+pub const LAST_GOOD_FILE: &str = "last_good.json";
+
 /// 安装暂存目录前缀。
 const STAGING_PREFIX: &str = ".staging-";
 
@@ -49,6 +55,13 @@ pub struct ActivePointer {
     /// 上一代版本（单代回滚用）；首次激活时为 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<String>,
+}
+
+/// `last_good.json` 的内容。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastGoodPointer {
+    /// 最近一次「成功 spawn 且 `--version` 探到有效版本」的版本号。
+    pub version: String,
 }
 
 /// 取得目标 exe 写权限的探测函数。
@@ -206,6 +219,65 @@ impl VersionStore {
             ))
         })?;
         Ok(Some(pointer))
+    }
+
+    /// 读「最近一次真跑起来过」的版本；读不到/坏 JSON/非法版本号一律 `None`。
+    ///
+    /// 为什么**不返回 `Result`**：这是给启动回退用的旁证。文件被人手改坏、被杀软截断、
+    /// 权限读不了——这些都不该让「启动 aria2」这件事失败，`None` 就是「没有这条记录」。
+    /// 真正的激活状态仍以 [`VersionStore::active`] 为准（那条路径损坏要如实报错）。
+    pub fn last_good(&self) -> Option<String> {
+        let path = self.root.join(LAST_GOOD_FILE);
+        let bytes = fs::read(&path).ok()?;
+        let pointer: LastGoodPointer = serde_json::from_slice(&bytes).ok()?;
+        let version = pointer.version.trim().to_owned();
+        if version.is_empty() {
+            return None;
+        }
+        // 记录里也可能被塞进 `../x`：只认能解析成三段数字的版本号。
+        parse_version_number(&version).ok()?;
+        Some(version)
+    }
+
+    /// 记录「这个版本真跑起来过」（M5-b-G 的回退锚点）。
+    ///
+    /// 返回 `Ok(true)` = 真的写了盘，`Ok(false)` = 已经是这个版本，**不动盘**
+    /// （幂等：每次启动都重写同一个文件既浪费又制造写放大）。
+    ///
+    /// 写入时机由调用方保证：**核心成功 spawn 且 `--version` 探到有效版本之后**
+    /// （[`crate::runtime::CoreRuntime::with_last_good_root`]），不是「安装成功」。
+    pub fn record_last_good(&self, version: &str) -> Result<bool, CoreError> {
+        parse_version_number(version).map_err(|_| CoreError::BadVersion {
+            value: version.to_owned(),
+        })?;
+        if self.last_good().as_deref() == Some(version) {
+            return Ok(false);
+        }
+        let json = serde_json::to_vec_pretty(&LastGoodPointer {
+            version: version.to_owned(),
+        })
+        .map_err(|error| CoreError::store_io(format!("last_good 序列化失败：{error}")))?;
+        self.write_last_good(&json)?;
+        Ok(true)
+    }
+
+    /// 原子写 `last_good.json`（`last_good.json.tmp` → `rename`，与 `active.json` 同口径）。
+    fn write_last_good(&self, json: &[u8]) -> Result<(), CoreError> {
+        fs::create_dir_all(&self.root)
+            .map_err(|error| store_io(&self.root, "创建版本库目录", error))?;
+        let target = self.root.join(LAST_GOOD_FILE);
+        let temporary = self.root.join(format!("{LAST_GOOD_FILE}.tmp"));
+        let mut file = fs::File::create(&temporary)
+            .map_err(|error| store_io(&temporary, "创建临时 last_good", error))?;
+        file.write_all(json)
+            .map_err(|error| store_io(&temporary, "写入临时 last_good", error))?;
+        file.sync_all()
+            .map_err(|error| store_io(&temporary, "落盘临时 last_good", error))?;
+        drop(file);
+        fs::rename(&temporary, &target).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            store_io(&target, "提交 last_good（rename）", error)
+        })
     }
 
     /// 修掉悬空的 `previous` 指针（指向已被删除的版本目录）。
@@ -479,6 +551,57 @@ mod tests {
         let parsed: ActivePointer =
             serde_json::from_slice(&fs::read(&pointer_path).expect("读指针")).expect("解析");
         assert_eq!(parsed.active, "1.37.0");
+    }
+
+    #[test]
+    fn last_good_round_trips_and_is_idempotent() {
+        let (_dir, store) = store("last-good");
+        assert_eq!(store.last_good(), None, "首次没有记录");
+        assert!(
+            store.record_last_good("1.37.0").expect("写 last_good"),
+            "首次应真写盘"
+        );
+        assert_eq!(store.last_good().as_deref(), Some("1.37.0"));
+        assert!(
+            !store.record_last_good("1.37.0").expect("写 last_good"),
+            "同版本不重写（幂等）"
+        );
+        assert!(
+            !store.root().join(format!("{LAST_GOOD_FILE}.tmp")).exists(),
+            "rename 之后不应留下 .tmp"
+        );
+        assert!(
+            store.record_last_good("1.36.0").expect("换版本"),
+            "换版本应重写"
+        );
+        assert_eq!(store.last_good().as_deref(), Some("1.36.0"));
+        let error = store.record_last_good("v1.37.0").expect_err("非法版本号");
+        assert!(matches!(error, CoreError::BadVersion { .. }), "{error}");
+    }
+
+    #[test]
+    fn last_good_tolerates_broken_json_and_traversal_records() {
+        let (_dir, store) = store("last-good-broken");
+        fs::write(store.root().join(LAST_GOOD_FILE), b"not-json").expect("写坏记录");
+        assert_eq!(store.last_good(), None, "坏 JSON 当「没有」");
+
+        fs::write(
+            store.root().join(LAST_GOOD_FILE),
+            br#"{"version":"1.37.0"}"#,
+        )
+        .expect("写记录");
+        assert_eq!(store.last_good().as_deref(), Some("1.37.0"));
+
+        fs::write(
+            store.root().join(LAST_GOOD_FILE),
+            br#"{"version":"../etc/passwd"}"#,
+        )
+        .expect("写穿越记录");
+        assert_eq!(store.last_good(), None, "穿越记录当「没有」");
+
+        // 坏记录可被一次真实记录修好（不是「永久坏掉」）。
+        assert!(store.record_last_good("1.37.0").expect("修好"));
+        assert_eq!(store.last_good().as_deref(), Some("1.37.0"));
     }
 
     #[test]

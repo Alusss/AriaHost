@@ -107,6 +107,20 @@ pub enum Command {
         /// 报告输出目录；`None` = `%LOCALAPPDATA%\AriaHost\diagnose`。
         out: Option<PathBuf>,
     },
+    /// `--core-tag-selftest <tag> [--dry-run]`：隐藏自检入口（不进 `--help`）。
+    ///
+    /// 按手工 tag 走一遍「归一化 → build-N 探测 → G5 流水线」，**逐行**打印结论
+    /// （tag/线路/每个 build 的状态码/最终 URL/G5 每步的 ok 与 detail），供人工核对。
+    /// `--dry-run` 只做到探测：不下载、不落盘、不激活。
+    CoreTagSelftest {
+        /// 原始 tag 输入（未归一化）。
+        tag: String,
+        /// 只探测，不下载/不落盘/不激活。
+        dry_run: bool,
+    },
+    /// `--core-list-selftest`：隐藏自检入口（不进 `--help`），打印 [`ariahost_core::list_cores`]
+    /// 的 JSON，供 UI 契约核对（字段名/来源/可选择性都是面板要用的）。
+    CoreListSelftest,
     /// `--version` / `-V`。
     Version,
     /// `--help` / `-h`。
@@ -273,6 +287,8 @@ pub fn parse(args: &[String]) -> Result<Command, UsageError> {
         "--service-status" => Command::ServiceStatus,
         "--diagnose" => return parse_diagnose(rest),
         "--core-line-selftest" => return parse_core_line_selftest(rest),
+        "--core-tag-selftest" => return parse_core_tag_selftest(rest),
+        "--core-list-selftest" => Command::CoreListSelftest,
         "--quit" => Command::Quit,
         "--version" | "-V" => Command::Version,
         "--help" | "-h" => Command::Help,
@@ -300,6 +316,34 @@ fn parse_core_line_selftest(rest: &[String]) -> Result<Command, UsageError> {
     Ok(Command::NetSelftest {
         out: parse_out_only("--core-line-selftest", rest)?,
     })
+}
+
+/// 解析 `--core-tag-selftest <tag> [--dry-run]`（`--dry-run` 可前可后）。
+fn parse_core_tag_selftest(rest: &[String]) -> Result<Command, UsageError> {
+    let mut tag: Option<String> = None;
+    let mut dry_run = false;
+    for argument in rest {
+        if argument == "--dry-run" {
+            if dry_run {
+                return Err(UsageError::new("--dry-run 只能写一次"));
+            }
+            dry_run = true;
+            continue;
+        }
+        if tag.is_some() {
+            return Err(UsageError::new(format!(
+                "--core-tag-selftest 只接受一个 <tag> 参数：{}",
+                rest.join(" ")
+            )));
+        }
+        tag = Some(argument.clone());
+    }
+    let Some(tag) = tag else {
+        return Err(UsageError::new(
+            "--core-tag-selftest 缺少 <tag> 参数（如 1.37.0 或 release-1.37.0）",
+        ));
+    };
+    Ok(Command::CoreTagSelftest { tag, dry_run })
 }
 
 /// `--out <目录>` / `--out=<目录>` 的唯一解析处（诊断包与线路自检共用）。
@@ -600,6 +644,8 @@ fn execute(command: &Command) -> i32 {
         Command::Quit => run_quit(),
         Command::Diagnose { out } => run_diagnose(out.as_deref()),
         Command::NetSelftest { out } => run_core_line_selftest(out.as_deref()),
+        Command::CoreTagSelftest { tag, dry_run } => run_core_tag_selftest(tag, *dry_run),
+        Command::CoreListSelftest => run_core_list_selftest(),
         Command::Version => {
             println!("{BINARY_NAME} {VERSION}");
             EXIT_OK
@@ -1259,6 +1305,207 @@ fn run_core_line_selftest(out: Option<&Path>) -> i32 {
     }
 }
 
+/// `--core-tag-selftest <tag> [--dry-run]`：手工 tag 路径的一键取证（M5-b-G）。
+///
+/// 输出**逐行稳定**（`KEY ...`），方便原样贴进 issue/日志；失败时最后一行一定是
+/// `RESULT failed`，成功是 `RESULT ok`，脚本按它判断，不用解析中文。
+///
+/// `--dry-run` 只做到探测（归一化 + build-N HEAD）：**不下载、不落盘、不激活**——
+/// 用来在用户的真实网络下验证「这个 tag 到底能不能拿到」，而不改动任何本地状态。
+fn run_core_tag_selftest(input: &str, dry_run: bool) -> i32 {
+    use ariahost_common::config::{load, Config, CoreProxyMode};
+    use ariahost_core::net::{hint_of, HttpProber};
+    use ariahost_core::tag;
+
+    println!("TAG input={input:?}");
+    let normalized = match tag::normalize_tag(input) {
+        Ok(version) => version,
+        Err(error) => {
+            println!("ERROR {} {error}", error.code().code());
+            println!("RESULT failed");
+            return EXIT_ERR;
+        }
+    };
+    let bits = ariahost_core::host_bits();
+    println!(
+        "TAG normalized={normalized:?} release={:?} bits={bits} page={}",
+        format!("release-{normalized}"),
+        tag::ARIA2_RELEASES_PAGE
+    );
+
+    let mut notes = Vec::new();
+    let config = match load() {
+        Ok(config) => config,
+        Err(error) => {
+            notes.push(format!(
+                "读配置失败，按默认线路探测（结论只代表默认值）：{error}"
+            ));
+            Config::default()
+        }
+    };
+    let mode = config.net.core_proxy_mode;
+    println!(
+        "LINE mode={} base={}",
+        mode.as_str(),
+        if mode == CoreProxyMode::Proxy {
+            config.net.core_proxy_url.as_str()
+        } else {
+            "（直连，忽略代理基址）"
+        }
+    );
+
+    // 探测：逐 build 记录（失败时也打印，这是自检与普通调用的区别）。
+    let mut attempts = Vec::new();
+    let asset = match tag::probe_tag_asset_tracked(
+        &HttpProber::new(),
+        mode,
+        &config.net.core_proxy_url,
+        &normalized,
+        &mut attempts,
+    ) {
+        Ok(asset) => asset,
+        Err(error) => {
+            for attempt in &attempts {
+                print_asset_attempt(attempt);
+            }
+            println!("ERROR {} {error}", code_text(&error));
+            println!("HINT {}", hint_of(&error, mode));
+            for note in &notes {
+                println!("NOTE {note}");
+            }
+            println!("RESULT failed");
+            return EXIT_ERR;
+        }
+    };
+    for attempt in &attempts {
+        print_asset_attempt(attempt);
+    }
+    println!(
+        "ASSET build={} url={} github={} line={}",
+        asset.build,
+        asset.url,
+        asset.github_url,
+        asset.line.describe()
+    );
+
+    if dry_run {
+        println!("DRYRUN 不下载、不落盘、不激活");
+        for note in &notes {
+            println!("NOTE {note}");
+        }
+        println!("RESULT ok");
+        return EXIT_OK;
+    }
+
+    let Some(dir) = ariahost_common::paths::versions_dir(ariahost_common::paths::Plane::User)
+    else {
+        println!("ERROR none 拿不到版本库根目录（%LOCALAPPDATA% 不可用）");
+        println!("RESULT failed");
+        return EXIT_ERR;
+    };
+    let store = ariahost_core::VersionStore::new(&dir);
+    let fetcher = ariahost_core::Fetcher::with_net(&config.net);
+    let mut steps = Vec::new();
+    let outcome = tag::fetch_by_tag_tracked(
+        &fetcher,
+        &store,
+        &normalized,
+        &ariahost_core::ProcessVersionProbe::default(),
+        &mut steps,
+    );
+    for step in &steps {
+        print_g5_step(step);
+    }
+    match outcome {
+        Ok(install) => {
+            println!(
+                "INSTALL version={} build={} exe={} active={}",
+                install.version,
+                install.build,
+                install.exe_path.display(),
+                install.pointer.active
+            );
+            for warning in &install.warnings {
+                println!("WARN {warning}");
+            }
+            for note in &notes {
+                println!("NOTE {note}");
+            }
+            println!("RESULT ok");
+            EXIT_OK
+        }
+        Err(error) => {
+            println!("ERROR {} {error}", code_text(&error));
+            println!("HINT {}", hint_of(&error, mode));
+            for note in &notes {
+                println!("NOTE {note}");
+            }
+            println!("RESULT failed");
+            EXIT_ERR
+        }
+    }
+}
+
+/// `--core-list-selftest`：打印 [`ariahost_core::list_cores`] 的 JSON（stdout 只有 JSON）。
+///
+/// 存在的理由：面板的核心列表要按字段渲染（`origin`/`selectable`/`active`…），
+/// 这份 JSON 就是 UI 契约的**可核对样本**，不必开窗也能看。
+fn run_core_list_selftest() -> i32 {
+    use ariahost_common::paths::Plane;
+
+    let config = match ariahost_common::config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("警告：读配置失败，按默认值列（结论只代表默认配置）：{error}");
+            ariahost_common::config::Config::default()
+        }
+    };
+    match ariahost_core::list_cores(&config, Plane::User) {
+        Ok(entries) => match serde_json::to_string_pretty(&entries) {
+            Ok(json) => {
+                println!("{json}");
+                EXIT_OK
+            }
+            Err(error) => {
+                eprintln!("序列化核心列表失败：{error}");
+                EXIT_ERR
+            }
+        },
+        Err(error) => {
+            eprintln!("{} {error}", code_text(&error));
+            EXIT_ERR
+        }
+    }
+}
+
+/// 打印一个 build 的探测结果（自检专用行）。
+fn print_asset_attempt(attempt: &ariahost_core::AssetAttempt) {
+    println!(
+        "BUILD build={} status={} outcome={} asset={} detail={}",
+        attempt.build,
+        attempt
+            .status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        attempt.outcome.as_str(),
+        attempt.asset_name,
+        attempt.detail
+    );
+}
+
+/// 打印一个 G5 步骤的结论（自检专用行）。
+fn print_g5_step(step: &ariahost_core::G5Step) {
+    println!(
+        "G5 step={} ok={} detail={}",
+        step.name, step.ok, step.detail
+    );
+}
+
+/// 错误码文本：没有语义对应的既有码时输出 `none`（与其它自检输出同一口径）。
+fn code_text(error: &ariahost_core::CoreError) -> &'static str {
+    error.code().map(|code| code.code()).unwrap_or("none")
+}
+
 /// 自检报告的默认目录（与诊断包同处，用户找得到）。
 fn default_report_dir() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
@@ -1443,6 +1690,8 @@ mod tests {
             vec!["--diagnose", "--out", r"C:\d"],
             vec!["--aria2-fetch"],
             vec!["--aria2-runtime-selftest"],
+            vec!["--core-tag-selftest", "1.37.0"],
+            vec!["--core-list-selftest"],
             vec!["--panel-selftest"],
             vec!["--panel-selftest", "--drive", "settings"],
             vec!["--web-selftest"],
@@ -1878,6 +2127,52 @@ mod tests {
             let error = parse_args(&bad).expect_err(&format!("应报用法错误：{bad:?}"));
             assert_eq!(error.code(), "AH-E1001");
         }
+    }
+
+    /// `--core-tag-selftest`：tag 必填，`--dry-run` 位置自由但只许一次。
+    #[test]
+    fn core_tag_selftest_requires_exactly_one_tag() {
+        assert_eq!(
+            parse_args(&["--core-tag-selftest", "1.37.0"]),
+            Ok(Command::CoreTagSelftest {
+                tag: "1.37.0".to_owned(),
+                dry_run: false
+            })
+        );
+        assert_eq!(
+            parse_args(&["--core-tag-selftest", "--dry-run", "release-1.37.0"]),
+            Ok(Command::CoreTagSelftest {
+                tag: "release-1.37.0".to_owned(),
+                dry_run: true
+            })
+        );
+        assert_eq!(
+            parse_args(&["--core-tag-selftest", "1.37.0", "--dry-run"]),
+            Ok(Command::CoreTagSelftest {
+                tag: "1.37.0".to_owned(),
+                dry_run: true
+            })
+        );
+        for bad in [
+            vec!["--core-tag-selftest"],
+            vec!["--core-tag-selftest", "1.37.0", "1.36.0"],
+            vec!["--core-tag-selftest", "1.37.0", "--dry-run", "--dry-run"],
+            vec!["--core-tag-selftest", "1.37.0", "--bogus"],
+        ] {
+            let error = parse_args(&bad).expect_err(&format!("应报用法错误：{bad:?}"));
+            assert_eq!(error.code(), "AH-E1001");
+        }
+    }
+
+    /// `--core-list-selftest` 不接受任何尾参（它就是一份 JSON 输出）。
+    #[test]
+    fn core_list_selftest_takes_no_arguments() {
+        assert_eq!(
+            parse_args(&["--core-list-selftest"]),
+            Ok(Command::CoreListSelftest)
+        );
+        let error = parse_args(&["--core-list-selftest", "extra"]).expect_err("尾参应报错");
+        assert_eq!(error.code(), "AH-E1001");
     }
 
     /// `--quit` 的两条通道分工：stdout 只有一行纯 ASCII 稳定键，中文解释一律 stderr。

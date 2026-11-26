@@ -15,7 +15,7 @@
 //! 所以任何一步失败都不会留下半装版本，也不会改 `active.json`。
 
 use ariahost_aria2::Aria2Version;
-use ariahost_common::config::NetSection;
+use ariahost_common::config::{CoreProxyMode, NetSection, DEFAULT_CORE_PROXY_URL};
 use sha2::{Digest, Sha256};
 
 use crate::download::{download_zip, lines_from, DownloadLine};
@@ -114,6 +114,13 @@ pub struct Fetcher {
     line_warnings: Vec<String>,
     /// releases API 地址（默认 [`crate::release::RELEASES_API`]；测试指向本机假服务器）。
     api_url: String,
+    /// 「AriaHost 自己访问 GitHub」的线路模式（`net.core_proxy_mode`）。
+    ///
+    /// 手工 tag 路径（[`crate::tag`]）不走 `lines`，而是用这一对设置经
+    /// [`crate::net::github_via`] 拼出实际 URL——同一份判定，不另写一套。
+    core_proxy_mode: CoreProxyMode,
+    /// 前缀代理基址（`net.core_proxy_url`），仅 `proxy` 模式生效。
+    core_proxy_url: String,
 }
 
 impl Default for Fetcher {
@@ -141,12 +148,15 @@ impl Fetcher {
             lines,
             line_warnings,
             api_url: crate::release::RELEASES_API.to_owned(),
+            core_proxy_mode: CoreProxyMode::Direct,
+            core_proxy_url: DEFAULT_CORE_PROXY_URL.to_owned(),
         }
     }
 
-    /// 按配置的 `[net]` 段造线路（`net.source_order` + `net.cdn_base`）。
+    /// 按配置的 `[net]` 段造线路（`net.source_order` + `net.cdn_base` + 代理两键）。
     pub fn with_net(net: &NetSection) -> Self {
         Self::with_order(&net.source_order, &net.cdn_base)
+            .with_core_proxy(net.core_proxy_mode, net.core_proxy_url.clone())
     }
 
     /// 注入客户端与线路（测试用：允许明文 HTTP 指向假服务器）。
@@ -156,7 +166,31 @@ impl Fetcher {
             lines,
             line_warnings: Vec::new(),
             api_url: crate::release::RELEASES_API.to_owned(),
+            core_proxy_mode: CoreProxyMode::Direct,
+            core_proxy_url: DEFAULT_CORE_PROXY_URL.to_owned(),
         }
+    }
+
+    /// 覆盖「AriaHost 自己访问 GitHub」的线路（手工 tag 路径用；测试也靠它指向假服务器）。
+    pub fn with_core_proxy(mut self, mode: CoreProxyMode, url: impl Into<String>) -> Self {
+        self.core_proxy_mode = mode;
+        self.core_proxy_url = url.into();
+        self
+    }
+
+    /// 当前代理模式（`net.core_proxy_mode`）。
+    pub fn core_proxy_mode(&self) -> CoreProxyMode {
+        self.core_proxy_mode
+    }
+
+    /// 当前前缀代理基址（`net.core_proxy_url`）。
+    pub fn core_proxy_url(&self) -> &str {
+        &self.core_proxy_url
+    }
+
+    /// 内部客户端（同 crate 的 `tag` 模块要用它发下载请求；**不对外暴露**）。
+    pub(crate) fn client(&self) -> &HttpClient {
+        &self.client
     }
 
     /// 改 releases API 地址（测试用；也可用于企业内镜像）。
@@ -309,7 +343,10 @@ pub fn verify_hash(
 }
 
 /// SHA-256 → 小写十六进制。
-fn sha256_hex(bytes: &[u8]) -> String {
+///
+/// `pub(crate)`：`list_cores` 要实测版本库里的 exe 与已知交叉参考值是否一致，
+/// 不能再写第二份哈希实现。
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut text = String::with_capacity(digest.len() * 2);
     for byte in digest {
