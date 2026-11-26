@@ -1394,9 +1394,7 @@ impl PanelApp {
                     // 用户还能从这里把引导叫回来，不必去找命令行。
                     let core_response = ui.button("重新配置下载核心");
                     if core_response
-                        .on_hover_text(
-                            "重新打开「下载核心未就绪」卡片（在线下载 / 指定已有 aria2c）",
-                        )
+                        .on_hover_text("在本页展开「下载核心」区（在线下载 / 指定已有 aria2c）")
                         .clicked()
                     {
                         self.guide.reopen();
@@ -2559,7 +2557,7 @@ impl PanelApp {
             .push("已按新核心重建运行时：点「启动 aria2」即可开始下载".to_owned());
     }
 
-    /// 首屏引导卡：核心未就绪时才出现。
+    /// 「下载核心」引导卡（M5-a 起挂在设置页）：核心未就绪时才出现。
     ///
     /// 三条硬约束落在这一块上：
     /// - 取消**不假装即时**（文案是「当前步骤完成后停止」）；
@@ -2810,7 +2808,7 @@ impl PanelApp {
             let hint = if core_ok {
                 "加入下载队列（aria2.addUri）"
             } else {
-                "先准备好下载核心：见上方「下载核心未就绪」卡片"
+                "先准备好下载核心：设置 →「下载核心」"
             };
             if start.on_hover_text(hint).clicked() || (core_ok && enter) {
                 submit = true;
@@ -3832,8 +3830,7 @@ fn short_name(uri: &str) -> String {
 fn failure_next_step(code: Option<ErrorCode>) -> String {
     match code {
         Some(ErrorCode::Aria2NotFound) => {
-            "点面板上的「下载核心未就绪」卡片：可以就地在线下载，也可以指定你已有的 aria2c"
-                .to_owned()
+            "打开「设置」→「下载核心」：可以就地在线下载，也可以指定你已有的 aria2c".to_owned()
         }
         Some(ErrorCode::Aria2StartTimeout) => {
             "看 %APPDATA%\\AriaHost\\logs\\aria2.log；端口被占时改 aria2.rpc.port".to_owned()
@@ -4377,7 +4374,7 @@ mod tests {
 
     #[test]
     fn failure_next_steps_are_actionable() {
-        assert!(failure_next_step(Some(ErrorCode::Aria2NotFound)).contains("下载核心未就绪"));
+        assert!(failure_next_step(Some(ErrorCode::Aria2NotFound)).contains("下载核心"));
         assert!(failure_next_step(Some(ErrorCode::Aria2StartTimeout)).contains("aria2.log"));
         assert!(!failure_next_step(None).is_empty());
     }
