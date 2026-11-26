@@ -452,6 +452,8 @@ impl PanelApp {
                 None => "未确认（可能缺字，见上一条日志）".to_owned(),
             }
         ));
+        // 逐字形链的实际命中情况：报障时第一句要能看出「这台机器上到底用了哪个字体」。
+        log.push(format!("中文字体链：{}", font.chain_summary()));
         log.push(format!(
             "图集上限 {atlas_cap} px 将通过 RawInput.max_texture_side 每帧写回（EG-7 解耦）"
         ));
@@ -4280,7 +4282,8 @@ mod tests {
     #[test]
     fn font_state_flags_system_fonts() {
         assert!(crate::fonts::FontState {
-            resolved: Some("system:Microsoft YaHei:1:0".to_owned())
+            resolved: Some("system:Microsoft YaHei:1:0".to_owned()),
+            ..crate::fonts::FontState::default()
         }
         .is_system_font());
     }
