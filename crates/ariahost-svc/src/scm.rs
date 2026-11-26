@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use ariahost_common::config as config_layer;
 use ariahost_common::paths::Plane;
 use ariahost_common::ErrorCode;
-use ariahost_core::resolve_core_exe_in;
+use ariahost_core::resolve_core_in;
 use ariahost_core::runtime::{
     self, CoreRuntime, LaunchSpec, ProcessSpawner, RpcProbe, RuntimePaths, Timeouts,
 };
@@ -40,9 +40,10 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use crate::install::{self, classify_control, classify_install, classify_uninstall};
 use crate::log::ServiceLog;
 use crate::plan::{
-    drive_service, exit_code_for, ControlCommand, ServiceReport, StatusSink, Supervisor,
-    SupervisorFailure,
+    drive_service_with_status, exit_code_for, ControlCommand, ServiceReport, StatusSink,
+    StatusTarget, Supervisor, SupervisorFailure,
 };
+use crate::status_file::CoreSource;
 use crate::{
     InstallOutcome, ServiceError, ServiceState, UninstallOutcome, SERVICE_DISPLAY_NAME,
     SERVICE_NAME,
@@ -124,7 +125,22 @@ fn establish_and_drive(log: &ServiceLog) -> Result<(), ServiceError> {
     let sink = ScmStatusSink {
         handle: status_handle,
     };
-    drive_service(supervisor, &sink, &command_receiver, log)
+    // M5-e：服务形态把生命周期写进 `%ProgramData%\AriaHost\status.json`（单向、不含机密）。
+    //
+    // 目录取不到 → `None`：不写状态文件，面板退回「服务（运行中）」的旧口径。
+    // 这是**观测能力降级**，不阻断服务启动（写不出状态文件绝不能让服务失败）。
+    let status_dir = ariahost_common::paths::service_runtime_dir();
+    if status_dir.is_none() {
+        log.warn(&format!(
+            "拿不到 %ProgramData%（服务平面根目录不可用）：不写 {}，面板将看不到服务侧核心信息",
+            crate::status_file::STATUS_FILE_NAME
+        ));
+    }
+    let target = status_dir.as_deref().map(|dir| StatusTarget {
+        dir,
+        service_version: env!("CARGO_PKG_VERSION"),
+    });
+    drive_service_with_status(supervisor, &sink, &command_receiver, log, target)
 }
 
 /// 送一条命令进工作线程；通道断了（进程正在退出）如实回服务不可用，不 panic。
@@ -214,6 +230,11 @@ fn status_for(
 struct Aria2Supervisor {
     spec: LaunchSpec,
     core: CoreRuntime,
+    /// M5-e：核心来源，**解析时一次定下**（写 `status.json` 用）。
+    ///
+    /// 为什么定在构造期：来源是「这次为什么选了这个核心」的判断结果，启动后再去猜
+    /// （例如按路径反推）可能与真实解析结论不一致；解析器已经给了 `origin`，直接取。
+    source: CoreSource,
 }
 
 impl Aria2Supervisor {
@@ -227,18 +248,23 @@ impl Aria2Supervisor {
         let secret =
             config_layer::resolve_secret(&mut config, &secret_path).map_err(unavailable)?;
         let download_dir = config_layer::download_dir_absolute(&config).map_err(unavailable)?;
-        let exe = resolve_core_exe_in(&config, Plane::Service).map_err(|error| {
+        // 用 `resolve_core_in` 而不是 `resolve_core_exe_in`：前者带 `origin`，
+        // 状态文件要如实写「这个核心是内置/托管/外部来的」，不能事后按路径反推。
+        let resolved = resolve_core_in(&config, Plane::Service).map_err(|error| {
             ServiceError::StartupFailed {
                 code: error.code().unwrap_or(ErrorCode::Aria2NotFound),
                 detail: error.to_string(),
             }
         })?;
+        let source = CoreSource::from_origin(resolved.origin);
+        let exe = resolved.path;
         runtime::prepare_conf(&config, &paths, &secret, &download_dir).map_err(unavailable)?;
 
         let port = config.aria2.rpc.port;
         log.info(&format!(
-            "托管目标：核心 {}、RPC 端口 {port}、服务平面运行目录 {}、下载目录 {}",
+            "托管目标：核心 {}（来源 {}）、RPC 端口 {port}、服务平面运行目录 {}、下载目录 {}",
             exe.display(),
+            source.as_str(),
             paths.runtime.display(),
             download_dir.display()
         ));
@@ -250,6 +276,7 @@ impl Aria2Supervisor {
                 Box::new(probe),
                 Timeouts::default(),
             ),
+            source,
         })
     }
 }
@@ -288,6 +315,16 @@ impl Supervisor for Aria2Supervisor {
                 code: error.code().unwrap_or(ErrorCode::ServiceUnavailable),
                 hint: error.to_string(),
             })
+    }
+
+    /// M5-e：写 `status.json` 用。
+    fn core_source(&self) -> CoreSource {
+        self.source
+    }
+
+    /// M5-e：现读 PID（`CoreStatus.pid` 在停止后是 `None`，所以不会留下已死的 PID）。
+    fn aria2_pid(&self) -> Option<u32> {
+        self.core.status().pid
     }
 }
 

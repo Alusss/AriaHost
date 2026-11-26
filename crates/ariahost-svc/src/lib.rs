@@ -5,6 +5,8 @@
 //! - [`plan`]：控制命令 → 状态上报序列的状态机、[`plan::drive_service`] 驱动骨架、
 //!   超时预算、服务特定退出码。**纯逻辑，Linux 单测全覆盖**。
 //! - [`install`]：`binPath` 引号、失败动作、Win32 错误 → 结果分类。**纯逻辑，单测全覆盖**。
+//! - [`status_file`]：服务侧状态文件 `%ProgramData%\AriaHost\status.json` 的原子写入
+//!   （M5-e）。单向：服务只写、面板与诊断包只读；内容不含机密；写不出去只记 WARN。
 //! - `scm`（仅 Windows）：dispatcher、控制处理器、`CreateServiceW`/`DeleteServiceW`/启停的哑胶水。
 //!
 //! ## 非阻塞纪律（架构 §4.2.4）
@@ -26,6 +28,7 @@ use ariahost_common::ErrorCode;
 pub mod install;
 pub mod log;
 pub mod plan;
+pub mod status_file;
 
 #[cfg(windows)]
 mod scm;

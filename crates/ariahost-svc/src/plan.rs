@@ -9,6 +9,7 @@
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use ariahost_common::time::utc_stamp;
 use ariahost_common::ErrorCode;
 
 use crate::log::{Level, LogSink};
@@ -61,6 +62,21 @@ pub trait Supervisor {
     fn start(&mut self) -> Result<String, SupervisorFailure>;
     /// 优雅停止（超时/强杀由实现决定，调用方只关心「停完没」）。
     fn stop(&mut self) -> Result<(), SupervisorFailure>;
+
+    /// M5-e：写 `status.json` 用的**核心来源**（默认 `None`：「这个实现不报告来源」）。
+    ///
+    /// 为什么给默认实现：这个值只影响观测文件，不参与托管决策。给它默认值后，
+    /// 既有的单测假件与 `scm_stub` 都不用改，也不会因为「没实现」而写错数据。
+    fn core_source(&self) -> crate::status_file::CoreSource {
+        crate::status_file::CoreSource::None
+    }
+
+    /// M5-e：当前 aria2c 子进程 PID（没在跑就是 `None`）。
+    ///
+    /// 每次调用都应**现读**（不是构造时缓存），否则服务停止后文件里会留一个已死的 PID。
+    fn aria2_pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// 托管失败（带既有错误码 + 可读原因）。
@@ -160,6 +176,13 @@ impl<S: Supervisor> ServiceLoop<S> {
         self.state
     }
 
+    /// 借一眼被托管的实现（M5-e：写状态文件时现取核心来源与 PID）。
+    ///
+    /// 只读借用：写状态文件**不改变**托管状态，也不允许借它去 `start`/`stop`。
+    pub fn supervisor(&self) -> &S {
+        &self.supervisor
+    }
+
     /// 处理一条控制命令，返回**按顺序**要上报的状态列表。
     ///
     /// 映射表（架构 §5）：
@@ -255,7 +278,120 @@ pub fn describe_report(report: &ServiceReport) -> String {
     }
 }
 
+/// 状态文件写到哪里（`None` = 本形态不写状态文件，例如单测与前台自检）。
+///
+/// 只有服务形态才写：`%ProgramData%\AriaHost`（服务账户的 `%APPDATA%` 是 systemprofile，
+/// 见 lib.rs 的平面说明）。
+#[derive(Debug, Clone, Copy)]
+pub struct StatusTarget<'a> {
+    /// 目标目录（`%ProgramData%\AriaHost`）。
+    pub dir: &'a std::path::Path,
+    /// 服务二进制版本（写进 `service_version`）。
+    pub service_version: &'a str,
+}
+
+/// 生命周期里写 `status.json` 的那一层（M5-e）。
+///
+/// 四个挂钩点（每个都写**当前时刻的真实值**，不缓存核心三项）：
+///
+/// | 点 | 时机 | 写出的内容 |
+/// |---|---|---|
+/// | 1 | 服务进入主循环、核心尚未拉起 | `core_source=none`、版本与 PID 为 `null` |
+/// | 2 | 核心就绪（`Running` 已上报） | 真实来源 + 探到的版本 + 真实 PID |
+/// | 3 | 核心已停（`Stopped` 已上报） | 回到 `none` |
+/// | 4 | 收到停止命令、**核心还活着** | 仍是「有核心」（面板能看见停服前的最后一眼） |
+///
+/// `started_at` 是这四项里唯一的会话常量：一次服务启动只定一次，面板靠它区分「同一次启动」。
+/// 它不属于「缓存旧值」——核心三项每次都是现取的。
+struct StatusWriter<'a> {
+    dir: &'a std::path::Path,
+    service_version: &'a str,
+    log: &'a dyn LogSink,
+    started_at: String,
+    /// 最近一次探到的核心版本（点 4 要写「仍有核心」时的版本；来源与 PID 仍现取）。
+    core_version: Option<String>,
+}
+
+impl<'a> StatusWriter<'a> {
+    fn new(target: StatusTarget<'a>, log: &'a dyn LogSink) -> Self {
+        Self {
+            dir: target.dir,
+            service_version: target.service_version,
+            log,
+            started_at: utc_stamp(std::time::SystemTime::now()),
+            core_version: None,
+        }
+    }
+
+    /// 落一份快照并盖上「现在」。写失败只留 WARN（[`status_file::write_or_warn`] 内部处理）。
+    fn commit(&mut self, status: crate::status_file::ServiceStatus) {
+        let status = status.stamped_at(utc_stamp(std::time::SystemTime::now()));
+        crate::status_file::write_or_warn(self.dir, &status, self.log);
+    }
+
+    /// 点 1（与启动失败时）：服务在跑或即将退出，但没有核心。
+    fn core_absent(&mut self) {
+        self.core_version = None;
+        let status = crate::status_file::ServiceStatus::starting(
+            self.service_version,
+            self.started_at.clone(),
+        );
+        self.commit(status);
+    }
+
+    /// 点 2：核心就绪。
+    fn core_ready(
+        &mut self,
+        source: crate::status_file::CoreSource,
+        version: String,
+        pid: Option<u32>,
+    ) {
+        self.core_version = Some(version.clone());
+        let status = crate::status_file::ServiceStatus::starting(
+            self.service_version,
+            self.started_at.clone(),
+        )
+        .with_running_core(source, Some(version), pid);
+        self.commit(status);
+    }
+
+    /// 点 4：马上要停核心——仍按「有核心」写，版本来源与 PID 现取。
+    fn before_stop(&mut self, source: crate::status_file::CoreSource, pid: Option<u32>) {
+        let status = crate::status_file::ServiceStatus::starting(
+            self.service_version,
+            self.started_at.clone(),
+        )
+        .with_running_core(source, self.core_version.clone(), pid);
+        self.commit(status);
+    }
+
+    /// 点 3：核心已停。
+    fn core_stopped(&mut self) {
+        self.core_version = None;
+        let status = crate::status_file::ServiceStatus::starting(
+            self.service_version,
+            self.started_at.clone(),
+        );
+        self.commit(status);
+    }
+}
+
 /// 服务主循环的**驱动骨架**：启动一次，然后等停止命令。
+///
+/// 等价于 [`drive_service_with_status`] 且 `status = None`（不写状态文件）。
+///
+/// 为什么分成两个函数：既有的六个单测与 `--panel-selftest` 之类的前台路径不该被迫
+/// 提供状态文件目标；新增能力用可选参数，不破坏既有契约。
+pub fn drive_service<S: Supervisor>(
+    supervisor: S,
+    sink: &dyn StatusSink,
+    commands: &Receiver<ControlCommand>,
+    log: &dyn LogSink,
+) -> Result<(), ServiceError> {
+    drive_service_with_status(supervisor, sink, commands, log, None)
+}
+
+/// 服务主循环的**驱动骨架**，并可选地把生命周期写进 `status.json`（M5-e）。
 ///
 /// 为什么放在这一层（而不是 Windows 胶水里）：这部分逻辑决定了「失败会不会卡住 SCM」，
 /// 必须在 Linux 单测里覆盖。SCM 只负责提供 `commands` 通道与实现 [`StatusSink`]。
@@ -267,23 +403,34 @@ pub fn describe_report(report: &ServiceReport) -> String {
 /// 4. 通道断掉（理论上只会发生在进程要退出时）→ 当作停止处理，绝不悬挂。
 ///
 /// `log` 的写入**永不失败**（[`LogSink`] 的实现自己吞错误），所以它不参与错误传播。
-pub fn drive_service<S: Supervisor>(
+/// 状态文件同理：写不出来只记 WARN，绝不影响服务能否 `RUNNING`。
+pub fn drive_service_with_status<S: Supervisor>(
     supervisor: S,
     sink: &dyn StatusSink,
     commands: &Receiver<ControlCommand>,
     log: &dyn LogSink,
+    status: Option<StatusTarget<'_>>,
 ) -> Result<(), ServiceError> {
     let mut state = ServiceLoop::new(supervisor);
+    let mut writer = status.map(|target| StatusWriter::new(target, log));
 
     log.record(
         Level::Info,
         "服务主循环启动：先自启一次 aria2c（SCM 不为「启动」发控制事件，service_main 被调用本身就是启动）",
     );
+    // 挂钩点 1：服务已进入主循环、核心还没拉起。
+    if let Some(writer) = writer.as_mut() {
+        writer.core_absent();
+    }
     let startup = state.handle(ControlCommand::Start);
     report_all(sink, &startup, log).map_err(|detail| ServiceError::Unavailable {
         detail: format!("上报启动状态失败：{detail}"),
     })?;
     if let Some(ServiceReport::Failed { code, hint }) = startup.last() {
+        // 启动失败也是「没有核心」的一种终态：落一份，面板下次能看到服务曾失败退出。
+        if let Some(writer) = writer.as_mut() {
+            writer.core_absent();
+        }
         log.record(
             Level::Error,
             &format!("aria2c 起不来，服务以 {} 失败退出：{hint}", code.code()),
@@ -292,6 +439,16 @@ pub fn drive_service<S: Supervisor>(
             code: *code,
             detail: hint.clone(),
         });
+    }
+    // 挂钩点 2：核心就绪（来源与 PID 现取，版本用刚上报的那个）。
+    if let (Some(writer), Some(ServiceReport::Running { aria2_version })) =
+        (writer.as_mut(), startup.last())
+    {
+        writer.core_ready(
+            state.supervisor().core_source(),
+            aria2_version.clone(),
+            state.supervisor().aria2_pid(),
+        );
     }
 
     loop {
@@ -307,11 +464,24 @@ pub fn drive_service<S: Supervisor>(
         };
         log.record(Level::Info, &format!("收到控制命令 {}", command.as_str()));
         let stopping = matches!(command, ControlCommand::Stop | ControlCommand::Shutdown);
+        // 挂钩点 4：服务 STOP **前**——核心还活着，按「有核心」写最后一眼。
+        if stopping {
+            if let Some(writer) = writer.as_mut() {
+                writer.before_stop(
+                    state.supervisor().core_source(),
+                    state.supervisor().aria2_pid(),
+                );
+            }
+        }
         let reports = state.handle(command);
         report_all(sink, &reports, log).map_err(|detail| ServiceError::Unavailable {
             detail: format!("上报停止状态失败：{detail}"),
         })?;
         if stopping {
+            // 挂钩点 3：核心已停。
+            if let Some(writer) = writer.as_mut() {
+                writer.core_stopped();
+            }
             log.record(Level::Info, "服务主循环退出（已上报 Stopped）");
             return Ok(());
         }
@@ -353,6 +523,15 @@ mod tests {
         stop_fails: bool,
         starts: u32,
         stops: u32,
+        /// M5-e：写状态文件时报告的来源（默认为 `none`，与 trait 默认实现一致）。
+        source: crate::status_file::CoreSource,
+        /// 当前 PID（`start` 后变为 `Some(4242)`、`stop` 后清空——模拟真实生命周期）。
+        pid: Option<u32>,
+        /// 点 4 的取证钩子：`stop()` 一进来就把 `status.json` 原文抄到这个文件。
+        ///
+        /// 为什么用文件而不是字段：supervisor 被 move 进驱动循环后测试拿不回来，
+        /// 而「STOP 前仍写着有核心」只有在这个瞬间才能观察到（紧接着会被点 3 覆盖）。
+        stop_witness: Option<std::path::PathBuf>,
     }
 
     impl FakeSupervisor {
@@ -372,13 +551,26 @@ mod tests {
         fn start(&mut self) -> Result<String, SupervisorFailure> {
             self.starts += 1;
             match self.start_result {
-                None => Ok("1.37.0".to_owned()),
+                None => {
+                    self.pid = Some(4242);
+                    Ok("1.37.0".to_owned())
+                }
                 Some((code, hint)) => Err(SupervisorFailure::new(code, hint)),
             }
         }
 
         fn stop(&mut self) -> Result<(), SupervisorFailure> {
             self.stops += 1;
+            // 点 4 的取证：此刻 `status.json` 应仍是「有核心」。
+            if let Some(witness) = &self.stop_witness {
+                if let Some(dir) = witness.parent() {
+                    let live = crate::status_file::status_path(dir);
+                    if let Ok(text) = std::fs::read_to_string(&live) {
+                        let _ = std::fs::write(witness, text);
+                    }
+                }
+            }
+            self.pid = None;
             if self.stop_fails {
                 Err(SupervisorFailure::new(
                     ErrorCode::ServiceUnavailable,
@@ -387,6 +579,14 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn core_source(&self) -> crate::status_file::CoreSource {
+            self.source
+        }
+
+        fn aria2_pid(&self) -> Option<u32> {
+            self.pid
         }
     }
 
@@ -767,5 +967,187 @@ mod tests {
             }),
             "Failed（AH-E5001：起不来）"
         );
+    }
+
+    // ---- M5-e：状态文件挂钩（四点）-----------------------------------------
+
+    /// 每个状态文件用例一个独立目录。
+    struct StatusDir(std::path::PathBuf);
+
+    impl StatusDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join("ariahost-svc-plan-status")
+                .join(format!("{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("建临时目录");
+            Self(path)
+        }
+
+        fn dir(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn live(&self) -> std::path::PathBuf {
+            crate::status_file::status_path(&self.0)
+        }
+
+        fn read_json(&self) -> serde_json::Value {
+            let text = std::fs::read_to_string(self.live()).expect("读 status.json");
+            serde_json::from_str(&text).expect("合法 JSON")
+        }
+    }
+
+    impl Drop for StatusDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 四个挂钩点的总装：预置 `Stop` 后一次跑完，按终态 + witness 逐点核对。
+    ///
+    /// - 点 2（核心就绪）与点 4（STOP 前）都写「有核心」，但只有点 4 能凭 witness
+    ///   观察到（它紧接着被点 3 覆盖）。witness 里的 `core_version` 又只能来自点 2 的
+    ///   缓存，所以这一条同时证明两点都跑过。
+    /// - 点 3（核心停止后）是最终文件态。
+    #[test]
+    fn drive_service_writes_status_at_start_ready_before_stop_and_after_stop() {
+        let dir = StatusDir::new("four-hooks");
+        let witness = dir.dir().join("stop-witness.json");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(ControlCommand::Stop).expect("预置停止");
+
+        let supervisor = FakeSupervisor {
+            source: crate::status_file::CoreSource::Managed,
+            stop_witness: Some(witness.clone()),
+            ..FakeSupervisor::ok()
+        };
+        let target = StatusTarget {
+            dir: dir.dir(),
+            service_version: "0.1.3",
+        };
+        drive_service_with_status(
+            supervisor,
+            &FakeSink::new(),
+            &receiver,
+            &crate::log::NOOP,
+            Some(target),
+        )
+        .expect("应正常结束");
+
+        // 点 4 看到的最后一眼：有核心、来源真实、PID 是活的那个。
+        let before = std::fs::read_to_string(&witness).expect("点 4 必须已落盘");
+        let before: serde_json::Value = serde_json::from_str(&before).expect("合法 JSON");
+        assert_eq!(before["core_source"], serde_json::json!("managed"));
+        assert_eq!(before["aria2_pid"], serde_json::json!(4242));
+        assert_eq!(
+            before["core_version"],
+            serde_json::json!("1.37.0"),
+            "版本只能来自点 2（核心就绪时）的记录"
+        );
+
+        // 点 3：最终态是「没有核心」，且 schema/服务版本都在。
+        let after = dir.read_json();
+        assert_eq!(after["core_source"], serde_json::json!("none"));
+        assert!(after["core_version"].is_null(), "{after}");
+        assert!(after["aria2_pid"].is_null(), "停止后不许留已死的 PID");
+        assert_eq!(after["schema_version"], serde_json::json!(1));
+        assert_eq!(after["service_version"], serde_json::json!("0.1.3"));
+
+        // started_at 是会话常量：点 4 与点 3 必须一致（面板靠它认「同一次启动」）。
+        assert_eq!(
+            before["started_at"], after["started_at"],
+            "started_at 跨写入必须不变"
+        );
+        assert_ne!(
+            after["updated_at"],
+            serde_json::json!(""),
+            "updated_at 必须每次现盖"
+        );
+    }
+
+    /// 启动失败：**也要**落一份「没有核心」的终态，且不影响错误传播。
+    #[test]
+    fn drive_service_records_absent_core_when_startup_fails() {
+        let dir = StatusDir::new("startup-failed");
+        let (_sender, receiver) = std::sync::mpsc::channel::<ControlCommand>();
+        let target = StatusTarget {
+            dir: dir.dir(),
+            service_version: "0.1.3",
+        };
+
+        let error = drive_service_with_status(
+            FakeSupervisor::failing(ErrorCode::Aria2NotFound, "没有核心"),
+            &FakeSink::new(),
+            &receiver,
+            &crate::log::NOOP,
+            Some(target),
+        )
+        .expect_err("启动失败必须照旧返回错误");
+        assert!(
+            matches!(error, ServiceError::StartupFailed { .. }),
+            "{error:?}"
+        );
+
+        let status = dir.read_json();
+        assert_eq!(status["core_source"], serde_json::json!("none"));
+        assert!(status["aria2_pid"].is_null());
+    }
+
+    /// 状态文件写不出来（目标目录是个文件）→ 服务照常跑完，只留 WARN。
+    ///
+    /// 这是任务书那条硬约束的接线验证：**写不出绝不能让服务失败**。
+    #[test]
+    fn drive_service_survives_unwritable_status_target() {
+        let dir = StatusDir::new("unwritable");
+        let blocker = dir.dir().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("造占位文件");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(ControlCommand::Stop).expect("预置停止");
+        let log = RecordingLog::new();
+
+        let outcome = drive_service_with_status(
+            FakeSupervisor::ok(),
+            &FakeSink::new(),
+            &receiver,
+            &log,
+            Some(StatusTarget {
+                dir: &blocker,
+                service_version: "0.1.3",
+            }),
+        );
+        assert!(outcome.is_ok(), "写不出状态文件不能拖垮服务：{outcome:?}");
+
+        let warns: Vec<String> = log
+            .lines()
+            .into_iter()
+            .filter(|line| line.starts_with("WARN"))
+            .collect();
+        assert!(
+            warns.iter().any(|line| line.contains("状态文件写不出去")),
+            "必须留 WARN：{warns:?}"
+        );
+        // 服务仍然走完了完整生命周期。
+        assert!(warns.iter().any(|line| line.contains("降级")), "{warns:?}");
+    }
+
+    /// 不传目标时（单测/前台形态）**一个字节都不写**。
+    #[test]
+    fn drive_service_without_target_writes_nothing() {
+        let dir = StatusDir::new("no-target");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(ControlCommand::Stop).expect("预置停止");
+        drive_service(
+            FakeSupervisor::ok(),
+            &FakeSink::new(),
+            &receiver,
+            &crate::log::NOOP,
+        )
+        .expect("应正常结束");
+        let entries: Vec<_> = std::fs::read_dir(dir.dir())
+            .expect("列目录")
+            .map(|entry| entry.expect("项").file_name())
+            .collect();
+        assert!(entries.is_empty(), "不该产生文件：{entries:?}");
     }
 }
