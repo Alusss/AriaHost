@@ -373,138 +373,340 @@ v2 要求：
 **可直接抄的 CSS（替换 `style.css` 的对应段；变量段整段替换）**
 
 ```css
+以下片段 = **`crates/ariahost-web/assets/style.css` 逐字副本**（task-89 起，由脚本维护：改样式先改代码，再整段回填本文，两处不再各写一份）。约束（CSP/零构建）：不引外部字体与框架、页面不含内联 `style=`。
+/* AriaHost 网页管理页样式（视觉对齐 docs/design/ui-spec-v2.md §5.4）。
+ *
+ * 四条硬约束（都由 src/assets.rs 的单测守着）：
+ * 1. **令牌层**：颜色/字号/圆角/字体只在这里定义一次；规则里一律 `var(--x)`，
+ *    除变量定义行外不许出现裸色值、裸字号。改色 / 改字号 = 只改此处。
+ * 2. **唯一色板是面板的 theme.rs**（`crates/ariahost-ui/src/theme.rs` 的 LIGHT / DARK）。
+ *    网页页**不自带第二套值**：令牌逐个等于对应字段，改名只在下面这张表里发生。
+ * 3. **字号五档对齐 `theme.rs::text_styles()`**：20 / 16 / 14 / 13 / 12。
+ * 4. **零外部依赖**：不引框架、字体文件、图标库（CSP 是 default-src 'self'，
+ *    引外站只会被拦成半张裸页）。
+ *
+ * 颜色令牌 ↔ theme.rs 字段（值必须逐字相等，单测 `style_css_palette_matches_the_panel_theme`
+ * 把两套主题的期望值钉死；要改色请改 theme.rs，再同步搬到这里）：
+ *
+ *   --bg          ← bg_base          --border        ← border（只做装饰性分隔）
+ *   --card        ← surface          --border-strong ← border_strong（控件边界，≥3:1）
+ *   --hover       ← surface_hover    --text          ← text
+ *   --muted       ← text2            --link          ← accent_text
+ *   --accent      ← accent           --on-accent     ← on_accent
+ *   --ok          ← success_text     --bad           ← danger_text
+ *   --warn        ← warn_text        --ok-dot        ← ok_dot
+ *   --ok-ring     ← ok_ring
+ *
+ * 注意：令牌行**不要写行尾注释**——单测按行解析 `--name: 值;`，行尾注释会被算进值里。
+ */
+
 :root {
   color-scheme: light dark;
-  /* 与 theme.rs 同名同值 */
+
+  /* ---- 颜色：等于 theme.rs 的 LIGHT ---- */
   --bg: #f6f7f9;
   --card: #ffffff;
   --hover: #eef1f5;
-  --line: #e8ecf1;        /* 仅表头下沿与卡片边框 */
+  /* 装饰性分隔（卡片描边、表头下沿）：不承担对比度门槛，别拿它画控件边界。 */
+  --border: #d6dbe1;
+  /* 控件边界（输入框、按钮描边）：落在 --card 上 3.15:1，满足 WCAG 1.4.11 的 ≥3:1。
+     注意它压在 --card 上才算得出 3.1；压在 --bg 上只有 2.93——所以控件一律放进卡片里。 */
+  --border-strong: #8a929c;
   --text: #1b1f23;
   --muted: #59626b;
   --link: #0a58ca;
   --accent: #1f6feb;
   --on-accent: #ffffff;
-  --ok: #15803d;          /* 文字用深化绿 */
-  --ok-dot: #00c853;      /* 点用正绿 */
-  --ok-ring: #0b6b34;     /* 点描边，承担 3:1 */
-  --warn: #8a5a00;
+  --ok: #15803d;
   --bad: #c42b1c;
-  --radius-card: 10px;
+  /* 以下两个在 theme.rs 里深浅两套取值完全相同，故只在 :root 定义一次。 */
+  --ok-dot: #00c853;
+  --ok-ring: #0b6b34;
+  /* 当前页面还没有警示文案（.notice 用的是 --bad）；保留以对齐 theme.rs 的 warn_text。 */
+  --warn: #8a5a00;
+
+  /* ---- 字号：五档，值等于 theme.rs::text_styles() ---- */
+  --fs-heading: 20px; /* Heading */
+  --fs-subtitle: 16px; /* AriaSubtitle：卡片/区块标题这一层 */
+  --fs-body: 14px; /* Body / Button */
+  --fs-mono: 13px; /* Monospace：只给数字列，别拿去当正文字号 */
+  --fs-small: 12px; /* Small：表头、状态字、说明行 */
+
+  /* ---- 圆角（与 theme.rs 同值：卡片 8、控件 6）---- */
+  --radius-card: 8px;
   --radius-ctl: 6px;
+
+  /* ---- 字体链（中文系统必须有 YaHei UI 变体，见规格 §2.1）---- */
   --font-ui: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: "Consolas", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
+    /* ---- 颜色：等于 theme.rs 的 DARK ---- */
     --bg: #15181b;
     --card: #1c2024;
     --hover: #242a2f;
-    --line: #2b3138;
+    --border: #353c43;
+    /* 压在 --card 上 3.49:1 */
+    --border-strong: #6b757e;
     --text: #e6e9ec;
     --muted: #a7b0b8;
     --link: #86b4ff;
     --accent: #4c8df6;
     --on-accent: #0b121c;
     --ok: #00c853;
-    --warn: #e0a93b;
     --bad: #f0616d;
+    --warn: #e0a93b;
   }
 }
 
+/* 内容列的**宽度上限与水平居中在 body**：顶部标题（h1）与卡片同处一个流里，
+   两边留白用 auto，所以 360~1920 之间都是「内容列居中 + 左右各 24px 内边距」。
+   为什么不放 main：main 只管内容区，header 在它外面，放 main 会只居中卡片、标题仍在左边。 */
+html {
+  /* body 收窄后页面两侧露出的画布仍要是页面底色（否则 1920 下出现白条）。 */
+  background: var(--bg);
+}
+
 body {
-  margin: 0;
+  max-width: 1080px;
+  margin: 0 auto;
   padding: 16px 24px 48px;
   background: var(--bg);
   color: var(--text);
-  font: 14px/20px var(--font-ui);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: 20px;
   -webkit-font-smoothing: antialiased;
 }
 
-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; padding: 8px 0 16px; }
-h1 { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; }
-.status { margin: 0; color: var(--muted); font-size: 12px; line-height: 17px; }
+/* ---- 顶栏 ---- */
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0 16px;
+}
+h1 {
+  margin: 0;
+  font-size: var(--fs-heading);
+  line-height: 28px;
+  font-weight: 600;
+}
+/* 区块标题：16px 这一档必须真的被用上，否则网页页没有「次级标题」层。 */
+h2 {
+  margin: 0 0 12px;
+  font-size: var(--fs-subtitle);
+  line-height: 24px;
+  font-weight: 600;
+}
+.status {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-small);
+  line-height: 17px;
+}
+.status.bad {
+  color: var(--bad);
+}
 
-main { max-width: 1080px; }
+/* main 不再自带 max-width：宽度上限与居中统一由 body 负责（见上）。 */
 
-/* 居中留白的**出现阈值**（task-102 实测）：内容列的 max-width 是 content-box，
-   加上左右各 24px 内边距后 border-box = 1080 + 48 = **1128 CSS px**。
-   视口 ≥1128 CSS px 才有居中留白；＜1128（包括浏览器 200% 缩放时 CSS 视口缩到 960）
-   走「撑满 + 左右各 24px 内边距」分支——这是阈值行为，不是缺陷。
-   实测（真实浏览器 iframe 360 / 768 / 1280 / 1920）：居中误差 0 px、标题与卡片左沿同线、
-   scrollWidth == clientWidth 无页面横向溢出。 */
-
-/* 卡片：替代所有页面级分割线 */
+/* ---- 卡片：替代页面级分割线（规格 §4.1）---- */
+/* 控件必须放进卡片：--border-strong 只保证在 --card 上过 3:1。 */
 .card {
   background: var(--card);
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: var(--radius-card);
   padding: 16px;
   margin-bottom: 16px;
 }
 
-.add { display: flex; gap: 8px; margin: 0; }
+/* ---- 添加行 ---- */
+/* 不写 margin：外距统一由 `.card` 提供（表单同时挂了 `.add card`） */
+.add {
+  display: flex;
+  gap: 8px;
+}
 .add input {
-  flex: 1; min-width: 240px;
+  flex: 1;
+  min-width: 240px;
   padding: 8px 10px;
   color: var(--text);
   background: var(--card);
-  border: 1px solid #8a929c;              /* line.control */
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-ctl);
-  font: 14px/20px var(--font-ui);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: 20px;
 }
-.add input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+.add input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
 
 button {
   padding: 8px 14px;
   color: var(--text);
   background: var(--hover);
-  border: 1px solid transparent;
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-ctl);
-  font: 14px/20px var(--font-ui);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  line-height: 20px;
   cursor: pointer;
 }
-button:hover { background: var(--card); border-color: var(--accent); }
-.add button { background: var(--accent); color: var(--on-accent); font-weight: 600; }
-.add button:hover { filter: brightness(1.08); }
+button:hover {
+  background: var(--card);
+  border-color: var(--accent);
+}
+.add button {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.add button:hover {
+  filter: brightness(1.08);
+}
 
-/* 表格：无行线，用 hover + 等宽数字 */
-table { width: 100%; border-collapse: collapse; }
+a {
+  color: var(--link);
+}
+
+/* ---- 表格：无行线，只留表头下沿 1px；行 hover ---- */
+/* 窄屏（375px 手机）时五列表必然放不下：滚动**发生在卡片内部**（这层容器），
+   而不是让整个页面横向溢出——`documentElement.scrollWidth <= clientWidth` 必须成立。
+   `table` 的 `min-width` 保证列不被压扁成两行文字：小于它就在容器里横向滚。 */
+.table-wrap {
+  overflow-x: auto;
+}
+table {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+}
 thead th {
   padding: 8px 10px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--fs-small);
   line-height: 17px;
   font-weight: 500;
   text-align: left;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
-tbody td { padding: 10px; vertical-align: middle; font: 14px/20px var(--font-ui); }
-tbody tr:hover { background: var(--hover); }
-td.num { font-family: var(--font-mono); font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
-
-/* 状态：正绿点 + 深绿字 */
-.state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; line-height: 17px; color: var(--muted); }
-.state.active { color: var(--ok); }
-.state.active::before {
-  content: ""; width: 8px; height: 8px; border-radius: 50%;
-  background: var(--ok-dot); box-shadow: 0 0 0 1px var(--ok-ring);
+tbody td {
+  padding: 10px;
+  vertical-align: middle;
+  font-size: var(--fs-body);
+  line-height: 20px;
 }
-.state.error { color: var(--bad); }
+tbody tr:hover {
+  background: var(--hover);
+}
+td.num {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 
-/* 进度条：实色，不用半透明 */
-.bar { width: 160px; height: 8px; margin-bottom: 4px; background: var(--hover); border-radius: 4px; overflow: hidden; }
-.fill { height: 100%; width: 0; background: var(--accent); }
-.percent { color: var(--muted); font-family: var(--font-mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+/* 任务名与它下面那行说明 */
+.name {
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.meta {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: var(--fs-small);
+  line-height: 17px;
+}
+.actions {
+  white-space: nowrap;
+}
+.actions button {
+  margin-right: 6px;
+  padding: 4px 10px;
+  font-size: var(--fs-small);
+}
+.actions button:last-child {
+  margin-right: 0;
+}
 
-.notice { margin: 0 0 16px; padding: 10px 12px; border-radius: var(--radius-ctl); border-left: 3px solid var(--bad); background: var(--card); color: var(--text); }
-.empty { color: var(--muted); padding: 24px 4px; }
+/* ---- 状态：正绿点 + 深绿字（#00c853 只作填充，边界靠 --ok-ring 描边）---- */
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-small);
+  line-height: 17px;
+  color: var(--muted);
+}
+.state.active {
+  color: var(--ok);
+}
+.state.active::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok-dot);
+  box-shadow: 0 0 0 1px var(--ok-ring);
+}
+.state.error {
+  color: var(--bad);
+}
+
+/* ---- 进度条：实色，不用半透明 ---- */
+.bar {
+  width: 160px;
+  height: 8px;
+  margin-bottom: 4px;
+  background: var(--hover);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+}
+.percent {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 通告与空态 ---- */
+.notice {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius-ctl);
+  border-left: 3px solid var(--bad);
+  background: var(--card);
+  color: var(--text);
+}
+.empty {
+  color: var(--muted);
+  padding: 24px 4px;
+}
 
 @media (max-width: 760px) {
-  .bar { width: 96px; }
-  .name { max-width: 180px; }
+  .bar {
+    width: 96px;
+  }
+  .name {
+    max-width: 180px;
+  }
 }
 ```
 
