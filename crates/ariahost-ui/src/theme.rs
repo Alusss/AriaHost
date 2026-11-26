@@ -266,6 +266,51 @@ pub fn text_styles() -> Vec<(TextStyle, FontId)> {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// 字号与字重的唯一入口（UI-5 §2）
+// ---------------------------------------------------------------------------
+
+/// 语义字号 → `FontId`：**取样式表里的那一档**（随界面缩放走），不是字面量重算。
+///
+/// UI-5 判据：`FontId::new(<字面量>, …)` 只许出现在本文件；界面层要字号就调这里。
+/// 否则同一段文字在两处会写出两个字号，缩放一开就各差一档。
+pub fn caption(ui: &egui::Ui) -> FontId {
+    TextStyle::Small.resolve(ui.style())
+}
+
+/// 正文（14pt，§2.1）。
+pub fn body(ui: &egui::Ui) -> FontId {
+    TextStyle::Body.resolve(ui.style())
+}
+
+/// 副标题（16pt）。
+pub fn subtitle(ui: &egui::Ui) -> FontId {
+    TextStyle::Name("AriaSubtitle".into()).resolve(ui.style())
+}
+
+/// 标题（20pt）。
+pub fn heading(ui: &egui::Ui) -> FontId {
+    TextStyle::Heading.resolve(ui.style())
+}
+
+/// 真粗体：`fonts::BOLD_FAMILY` 里注入的是**真实粗体字形**，不是 `.strong()` 的假象。
+///
+/// 字号跟正文档走，只换族。粗体面没注进来时该族为空 → 渲染退回系统回退链，
+/// 并且 `--panel-selftest` 的 `FONTS … |bold=no` 会如实报出来（界面不假装加粗）。
+pub fn bold(ui: &egui::Ui) -> FontId {
+    bold_sized(body(ui).size)
+}
+
+/// 指定字号的粗体（标题级强调用；字号必须来自上面那几档，别写新字面量）。
+pub fn bold_sized(size: f32) -> FontId {
+    FontId::new(size, bold_family())
+}
+
+/// 粗体族名（唯一构造点：改名只改 `fonts::BOLD_FAMILY`）。
+fn bold_family() -> FontFamily {
+    FontFamily::Name(std::sync::Arc::from(crate::fonts::BOLD_FAMILY))
+}
+
 /// 装两套主题（跟随系统）。**必须在 `PanelApp::build` 最前面调用一次**：
 /// 晚于首帧就会看到一帧黑底，早于字体注册则会和 `fonts::install` 抢 `text_styles`。
 pub fn install(ctx: &egui::Context) {

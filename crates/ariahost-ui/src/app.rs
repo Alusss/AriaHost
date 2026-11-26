@@ -133,6 +133,11 @@ pub struct RuntimeFacts {
     /// 当 `zh=miss` 时，这里就是 fontique 的兜底选择——两条信息一起才说明
     /// 「是链命中还是兜底命中」。
     pub font_fallback: String,
+    /// `FONTS` 行：三条链的实际供应族 + 真粗体是否可用 + 注入面数（UI-5 判据 2）。
+    ///
+    /// 与 `font_lat`/`font_zh` 的区别：那两个是「谁给出的字形」，这一行是
+    /// 「链的每个档位到底有没有真的接上」，含 `mono` 与 `bold` 两项。
+    pub fonts: String,
 }
 
 /// 内联错误条（面板内的一条，不弹窗）。
@@ -478,6 +483,7 @@ impl PanelApp {
             font_lat: font.latin_supplier().unwrap_or_default().to_owned(),
             font_zh: font.han_supplier().unwrap_or_default().to_owned(),
             font_fallback: font.resolved.clone().unwrap_or_default(),
+            fonts: font.fonts_line(),
             atlas_side: atlas_cap,
             ..RuntimeFacts::default()
         };
@@ -2233,7 +2239,12 @@ impl PanelApp {
                 self.main_buttons(ui, running, busy, ready);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     badge(ui, &view);
-                    ui.add(egui::Label::new(RichText::new(&view.headline)).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&view.headline).font(crate::theme::bold_sized(20.0)),
+                        )
+                        .wrap(),
+                    );
                     if busy {
                         ui.add(egui::Spinner::new());
                     }
@@ -2509,7 +2520,11 @@ impl PanelApp {
                     if let Some(code) = banner.code {
                         ui.label(RichText::new(code).monospace().color(color).strong());
                     }
-                    ui.label(RichText::new(&banner.headline).color(color));
+                    ui.label(
+                        RichText::new(&banner.headline)
+                            .color(color)
+                            .font(crate::theme::bold(ui)),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("知道了").clicked() {
                             dismiss = true;

@@ -1,30 +1,45 @@
-//! 中文字体接入（EG-5 / EG-6）。
+//! 字体接入（EG-5 / EG-6 / UI-5）：三条独立链 + **真粗体**。
 //!
-//! 两条硬约束：
-//! 1. 中文一律走**系统字体**，不内嵌 CJK（内嵌 = +5–10MB，直接吃掉 <100MB 的余量）；
-//! 2. 必须显式 `.with_locale(Some("zh-CN"))`——`fontique` 对汉字（Han）的默认 locale
-//!    经常落到日文字形，简体字会缺字或字形错（EG-5 原文）。
+//! ## 一、为什么「按族名选字体」必须靠注入，而不是靠提问
 //!
-//! eframe 0.37 的 `system_fonts` feature 会自动挂一个 `SystemFontProvider::new()`
-//! （不带 locale），所以面板把 `system_font_fallback` 关掉、改在这里自己注册（见 lib.rs）。
+//! `egui_system_font_provider` 的 `font_for` 把 `FontFamily::Name(_)` 直接映射成
+//! `GenericFamily::SansSerif`，再叠加脚本回退（`egui_system_font_provider-0.37.0/src/lib.rs:115`），
+//! **命名族本身不参与选择**。所以「按 Inter / 思源黑体的族名去问」拿到的一定是同一个答案——
+//! 名字是我们自己传进去的，属于**回声式假证据**（2026-11-26 实测纠正）。
 //!
-//! ## 逐字形：谁在供应字形（2026-11-26 实测纠正）
+//! 想让某一族真的赢，只有一条路：**自己把字体文件读进来**，用
+//! [`egui::FontInsert`] + [`egui::FontPriority::Highest`] 注册到目标族上。
+//! 本文件就是干这件事的：
 //!
-//! 原本这里按 [`CJK_CHAIN`] 逐族提问，得到「每族给不给汉字」，再据此报「汉字用的是
-//! 微软雅黑 UI」。**那是错的**：`egui_system_font_provider` 的 `font_for` 把
-//! `FontFamily::Name(_)` 直接映射成 `GenericFamily::SansSerif`，再叠加脚本回退
-//! （`egui_system_font_provider-0.37.0/src/lib.rs:115`），**命名族本身不参与选择**。
-//! 于是逐族提问得到的答案必然相同——名字是我们自己传进去的，属于**回声式假证据**。
+//! - [`LATIN_CHAIN`] / [`HAN_CHAIN`] / [`MONO_CHAIN`] 是**声明顺序**（设计意图 + 排障依据）；
+//! - 链上第一档有**可读字体文件**时走注入（真接线）；
+//! - 没有文件时退回系统 provider（脚本回退），此时日志/info 区如实写「系统」，不冒充注入成功。
 //!
-//! 由此还有一条更硬的结论：在本 provider 上，`CJK_CHAIN` **接不了线**，它只影响
-//! 「我们问谁」，不影响渲染。真正决定字形的是 `locale=zh-CN` + fontique 的默认选择。
-//! （要按族名接线只能另走 `FontInsert`/`FontPriority` 显式注入字体数据，那是另一批活，
-//! 不在本文件假装已实现。）
+//! ## 二、三条链互不干扰（UI-5 §2.1）
 //!
-//! 所以现在只报**系统真正给出的族名**（`insert.name`，形如 `system:Microsoft YaHei:400:0`）；
-//! 拿不到就是 `None`，展示层写 `miss`，**绝不回填我们请求的名字**。
+//! 拉丁、汉字、等宽各自一条链：拉丁走 Inter（无则 Segoe UI），汉字走思源黑体
+//! （无则微软雅黑 UI），等宽走 Consolas。混成一条链的旧写法会让「拉丁字形变了」
+//! 和「汉字字形变了」两件事互相掩盖。
+//!
+//! ## 三、真粗体
+//!
+//! 粗体不是把字号调大、也不是 `strong()`（那只是加粗**假象**）。本文件把真实的粗体面
+//! （拉丁粗 + 汉字粗）注册进命名族 [`BOLD_FAMILY`]，`theme::bold()` 直接用这一族。
+//! 注入失败时该族为空，渲染退回系统回退链——`--panel-selftest` 的 `FONTS ... |bold=no`
+//! 会把这件事如实报出来。
+//!
+//! ## 四、内存红线（EG-4）
+//!
+//! 所有注入都过 [`INJECT_BUDGET`] 单文件预算：汉字面动辄 10–17MB，两个大面同时注入就会
+//! 吃掉 <100MB 的余量。超预算的面**不注入**并记一条日志，退回系统 provider。
 
-use egui::{FallbackRequest, FontFamily, FontProvider as _};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use egui::{
+    FallbackRequest, FontData, FontFamily, FontInsert, FontPriority, FontProvider as _,
+    InsertFontFamily,
+};
 use egui_system_font_provider::SystemFontProvider;
 
 use crate::logbuf::LogBuffer;
@@ -32,27 +47,139 @@ use crate::logbuf::LogBuffer;
 /// 字体回退 locale：简体中文（EG-5 指定值）。
 pub const LOCALE: &str = "zh-CN";
 
+/// 真粗体用的命名族名（`theme::bold` 是唯一消费者）。
+pub const BOLD_FAMILY: &str = "AriaBold";
+
 /// 汉字探测字：会触发 Han 脚本的系统字体回退查询。
 const HAN_CLUSTER: &str = "直";
 
 /// 拉丁探测字：用来分辨「这一次给的是拉丁字形还是汉字字形」。
 const LATIN_CLUSTER: &str = "A";
 
-/// 字体偏好的声明顺序（ui-spec-v2 §2.1，Lead 裁决 1）。
+/// 单个字体文件的注入预算。
 ///
-/// **注意**：这只是一份「我们希望的顺序」，在本 provider 上**不产生选择效果**
-/// （见模块文档：命名族被忽略）。它留着有两个用途：一是记录设计意图与排除理由，
-/// 二是一旦将来换成能按族名接线的方案（`FontInsert`），顺序就是现成的输入。
-///
-/// 排除 `Noto Sans SC`（用户级安装，换机就没有）与 `Segoe UI Variable`
-/// （Win10 没有，变量字体光学尺寸会让 Win10/11 字宽不一致）的理由不变。
-pub const CJK_CHAIN: [&str; 3] = ["Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"];
+/// 为什么是 17MB：实测汉字粗体面（`msyhbd.ttc` 15.7MB / 思源黑体 Bold≈10MB）都在这个量级，
+/// 而稳态余量只有约 21MB。超预算的面不注入——宁可少一层优先级，也不破 EG-4 闸门。
+pub const INJECT_BUDGET: u64 = 17 * 1024 * 1024;
 
-/// 等宽链（Lead 裁决 2）：`Consolas` 打头。
+/// 拉丁链（声明顺序，UI-5 §2.1）：`Inter` 打头，系统 `Segoe UI` 兜底。
+pub const LATIN_CHAIN: [&str; 2] = ["Inter", "Segoe UI"];
+
+/// 汉字链（声明顺序）：`Source Han Sans SC`（思源黑体）打头，`Microsoft YaHei UI` 兜底。
+///
+/// 为什么不写 `Noto Sans CJK SC`：思源黑体与 Noto Sans CJK 是同一套字形的两个发行名，
+/// 但 Noto 常是用户级安装、换机就没了；写成同一档会让「到底用的哪套」说不清。
+pub const HAN_CHAIN: [&str; 2] = ["Source Han Sans SC", "Microsoft YaHei UI"];
+
+/// 等宽链（Lead 裁决）：`Consolas` 打头。
 ///
 /// `Cascadia Mono` 不进链：本机注册表 0 项、字体目录无文件，装了 Windows Terminal
 /// 也不带它——写进必需链等于在多数机器上白探测一次。
 pub const MONO_CHAIN: [&str; 2] = ["Consolas", "Courier New"];
+
+/// 一个「可能有文件」的字体面。
+#[derive(Debug, Clone, Copy)]
+pub struct Face {
+    /// 所属族（写进日志用的声明名）。
+    pub family: &'static str,
+    /// 文件名（在字体目录里找）。
+    pub file: &'static str,
+    /// TTC 内的 face 下标（非 TTC 一律 0）。
+    pub index: u32,
+}
+
+/// 拉丁常规面候选（链上第一档 `Inter` 的现实文件名）。
+const LATIN_REGULAR: [Face; 3] = [
+    Face {
+        family: "Inter",
+        file: "Inter-Regular.ttf",
+        index: 0,
+    },
+    Face {
+        family: "Inter",
+        file: "Inter.ttf",
+        index: 0,
+    },
+    Face {
+        family: "Inter",
+        file: "InterVariable.ttf",
+        index: 0,
+    },
+];
+
+/// 拉丁粗体面候选。
+///
+/// `segoeuib.ttf`（Segoe UI Bold）放在最后：它**几乎总在** `C:\Windows\Fonts`，
+/// 于是「拉丁真粗体」在裸 Windows 上也成立，不依赖用户装 Inter。
+const LATIN_BOLD: [Face; 3] = [
+    Face {
+        family: "Inter",
+        file: "Inter-Bold.ttf",
+        index: 0,
+    },
+    Face {
+        family: "Inter",
+        file: "Inter-SemiBold.ttf",
+        index: 0,
+    },
+    Face {
+        family: "Segoe UI",
+        file: "segoeuib.ttf",
+        index: 0,
+    },
+];
+
+/// 汉字常规面候选（思源黑体的常见发行名）。
+const HAN_REGULAR: [Face; 4] = [
+    Face {
+        family: "Source Han Sans SC",
+        file: "SourceHanSansSC-Regular.otf",
+        index: 0,
+    },
+    Face {
+        family: "Source Han Sans SC",
+        file: "SourceHanSansSC-Normal.otf",
+        index: 0,
+    },
+    Face {
+        family: "Source Han Sans SC",
+        file: "NotoSansSC-Regular.otf",
+        index: 0,
+    },
+    Face {
+        family: "Source Han Sans SC",
+        file: "NotoSansCJKsc-Regular.otf",
+        index: 0,
+    },
+];
+
+/// 汉字粗体面候选。
+///
+/// `msyhbd.ttc` 里两个 face 都是**粗体**（雅黑 Bold / 雅黑 UI Bold），索引 0 取第一个，
+/// 视觉上都是粗体，取错也不会退化成常规字重——这是本表唯一允许「索引不确定」的项。
+/// `Dengb.ttf`（等线 Bold）是单面文件，作第二档。
+const HAN_BOLD: [Face; 4] = [
+    Face {
+        family: "Microsoft YaHei",
+        file: "msyhbd.ttc",
+        index: 0,
+    },
+    Face {
+        family: "DengXian",
+        file: "Dengb.ttf",
+        index: 0,
+    },
+    Face {
+        family: "Source Han Sans SC",
+        file: "SourceHanSansSC-Bold.otf",
+        index: 0,
+    },
+    Face {
+        family: "Source Han Sans SC",
+        file: "NotoSansSC-Bold.otf",
+        index: 0,
+    },
+];
 
 /// 系统**实际**用哪一族供应这三类字形。
 ///
@@ -68,13 +195,17 @@ pub struct Supply {
     pub mono: Option<String>,
 }
 
-/// 字体注册结果，面板信息区显示「字体是否来自系统」与「实际供应族」。
+/// 字体注册结果，面板信息区显示「字体是否来自系统」「实际供应族」「注入成功哪些面」。
 #[derive(Debug, Clone, Default)]
 pub struct FontState {
     /// 系统字体解析结果（形如 `system:Microsoft YaHei:400:0`），`None` 表示没找到。
     pub resolved: Option<String>,
     /// 三类字形的实际供应族。
     pub supply: Supply,
+    /// 注入成功的面：`角色=族名←文件名`（按注入顺序，供排障逐条核对）。
+    pub injected: Vec<String>,
+    /// 真粗体族是否真的可用（拉丁粗或汉字粗至少一面注入成功）。
+    pub bold_ready: bool,
 }
 
 impl FontState {
@@ -85,15 +216,29 @@ impl FontState {
         if self.supply == Supply::default() {
             return "（未探测：本目标没有系统字体枚举）".to_owned();
         }
+        format!(
+            "实际供应 {}{}",
+            supply_line(&self.supply).trim_start_matches("："),
+            ""
+        )
+    }
+
+    /// `--panel-selftest` 用的机器可读字体事实（判据：`FONTS latin=<名>|han=<名>|mono=<名>`）。
+    ///
+    /// 值是**系统给的族名**（`None` 写 `miss`），绝不回填我们请求的声明名；
+    /// `bold` 是「真粗体族是否可用」，`inject` 是注入成功的面数。
+    pub fn fonts_line(&self) -> String {
         let show = |value: &Option<String>| match value {
             Some(name) => name.clone(),
             None => "miss".to_owned(),
         };
         format!(
-            "实际供应 拉丁={} · 汉字={} · 等宽={}",
+            "latin={}|han={}|mono={}|bold={}|inject={}",
             show(&self.supply.latin),
             show(&self.supply.han),
-            show(&self.supply.mono)
+            show(&self.supply.mono),
+            if self.bold_ready { "yes" } else { "no" },
+            self.injected.len()
         )
     }
 
@@ -115,27 +260,59 @@ impl FontState {
     }
 }
 
-/// 首帧前注册系统字体 provider，并做一次预热查询。
+/// 首帧前注册字体：注入链上有文件的面、注册系统 provider、并做一次预热查询。
 ///
 /// 为什么预热（EG-6）：`SystemFontProvider::new()` 在后台线程枚举系统字体（可能数百毫秒），
-/// 未完成时的查询会**阻塞**。提前查一次能让枚举在首帧前结束，避免第一帧卡顿；
-/// 同时也顺手拿到「系统字体是否可用」这个事实给面板显示。
+/// 未完成时的查询会**阻塞**。提前查一次能让枚举在首帧前结束，避免第一帧卡顿。
 pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     // 必须包 `Arc`：`Context::add_font_provider` 收的是 `Arc<dyn FontProvider>`，
-    // 而探测要在注册前对**同一个实例**做完（预热，EG-6），否则会二次枚举系统字体。
-    let provider = std::sync::Arc::new(SystemFontProvider::new().with_locale(Some(LOCALE)));
-    // 1) 三类字形各问一次：问到的是系统**实际**给我们的族名。
+    // 而探测要在注册前对**同一个实例**做完（预热），否则会二次枚举系统字体。
+    let provider = Arc::new(SystemFontProvider::new().with_locale(Some(LOCALE)));
     let supply = probe_supply(&provider);
-    log.push(format!("字体{}", supply_line(&supply)));
-    // 同时把「声明顺序」写进日志：它不影响选择（见模块文档），但用户报「中文显示怪」
-    // 时需要知道我们**希望**用哪几族，以及等宽链打头的是谁。写进日志也让这两个常量
-    // 在非测试构建里真的被用到，不至于变成只能靠注释解释的死代码。
+    log.push(format!("字体实际供应{}", supply_line(&supply)));
+
+    // 1) 常规面：拉丁 + 汉字（链上第一个**有文件**的档注入 Highest，真接线）。
+    let mut injected: Vec<String> = Vec::new();
+    inject_first(
+        ctx,
+        log,
+        &mut injected,
+        "拉丁",
+        &LATIN_REGULAR,
+        &FontFamily::Proportional,
+    );
+    inject_first(
+        ctx,
+        log,
+        &mut injected,
+        "汉字",
+        &HAN_REGULAR,
+        &FontFamily::Proportional,
+    );
+
+    // 2) 真粗体：注册进命名族 `AriaBold`，`theme::bold()` 直接用。
+    let bold_family = FontFamily::Name(Arc::from(BOLD_FAMILY));
+    let latin_bold = inject_first(ctx, log, &mut injected, "拉丁粗", &LATIN_BOLD, &bold_family);
+    let han_bold = inject_first(ctx, log, &mut injected, "汉字粗", &HAN_BOLD, &bold_family);
+    let bold_ready = latin_bold || han_bold;
+
+    // 3) 链的落点：注入命中就写「注入」，没文件就写「系统 provider」——两件事不许混为一谈。
     log.push(format!(
-        "字体声明顺序（仅记录意图，本 provider 不按族名选择）：汉字 {}；等宽 {}",
-        CJK_CHAIN.join(" → "),
-        MONO_CHAIN.join(" → "),
+        "字体链落点：拉丁 {}（{}）；汉字 {}（{}）；等宽 {}（系统 provider）",
+        LATIN_CHAIN[0],
+        hit_word(latin_bold),
+        HAN_CHAIN[0],
+        hit_word(han_bold),
+        MONO_CHAIN[0],
     ));
-    // 2) 兜底：连汉字都没问到，也要给面板一个「默认族」的答案（与 eframe 常规路径一致）。
+    if !bold_ready {
+        log.push(
+            "真粗体不可用：链上的粗体面都没读到；主题的 bold 会退回正文族（界面不会假装加粗）"
+                .to_owned(),
+        );
+    }
+
+    // 4) 兜底：连汉字都没问到，也要给面板一个「默认族」的答案（与 eframe 常规路径一致）。
     let request = FallbackRequest {
         cluster: HAN_CLUSTER,
         family: &FontFamily::Proportional,
@@ -154,9 +331,12 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     }
     // 注册的 provider 必须是同一个实例：预热已经让它把字体枚举跑完，避免二次枚举。
     ctx.add_font_provider(provider);
+
     let state = FontState {
         resolved,
-        supply: supply.clone(),
+        supply,
+        injected,
+        bold_ready,
     };
     // 落点只经由 `latin_supplier`/`han_supplier` 这两条**同一个判据**输出：日志与面板
     // 因此不可能各说一套（别在这里再写一遍 `map(...)`）。
@@ -168,6 +348,111 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     state
 }
 
+/// 注入词：命中了就说注入，没命中就说系统 provider。
+const fn hit_word(injected: bool) -> &'static str {
+    if injected {
+        "文件注入"
+    } else {
+        "系统 provider"
+    }
+}
+
+/// 按表逐个找文件，**第一个存在的**读进来注入目标族；返回是否注入成功。
+///
+/// 失败不是错误：没有文件就交给系统 provider（脚本回退），但要在日志里说清是哪一档。
+fn inject_first(
+    ctx: &egui::Context,
+    log: &LogBuffer,
+    injected: &mut Vec<String>,
+    role: &str,
+    faces: &[Face],
+    into: &FontFamily,
+) -> bool {
+    for face in faces {
+        let Some(path) = find_font_file(face.file) else {
+            continue;
+        };
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > INJECT_BUDGET => {
+                log.push(format!(
+                    "{role}面超预算不注入：{} 有 {} MB，超过单文件预算 {} MB（EG-4）",
+                    face.file,
+                    meta.len() / (1024 * 1024),
+                    INJECT_BUDGET / (1024 * 1024),
+                ));
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log.push(format!("{role}面读取失败：{}（{error}）", path.display()));
+                continue;
+            }
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log.push(format!("{role}面读取失败：{}（{error}）", path.display()));
+                continue;
+            }
+        };
+        let mut data = FontData::from_owned(bytes);
+        data.index = face.index;
+        // 名字只在本进程内当索引用（egui 会把字体按名字登记），带上字重角色便于日志辨认。
+        let insert_name = format!("{role}-{}", face.family);
+        ctx.add_font(FontInsert::new(
+            &insert_name,
+            data,
+            vec![InsertFontFamily {
+                family: into.clone(),
+                priority: FontPriority::Highest,
+            }],
+        ));
+        injected.push(format!("{role}={}←{}", face.family, face.file));
+        log.push(format!(
+            "{role}面已注入（真接线）：{} ← {}（face {}）",
+            face.file, face.family, face.index
+        ));
+        return true;
+    }
+    log.push(format!(
+        "{role}面未注入：链上候选 {} 在本机字体目录都不存在",
+        faces
+            .iter()
+            .map(|face| face.file)
+            .collect::<Vec<_>>()
+            .join(" / ")
+    ));
+    false
+}
+
+/// 在「用户级字体目录」与「系统字体目录」里找文件（Windows 两处都可能有）。
+fn find_font_file(file: &str) -> Option<PathBuf> {
+    for dir in font_dirs() {
+        let candidate = dir.join(file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// 字体目录候选（用户安装的字体在 `%LOCALAPPDATA%`，系统字体在 `%WINDIR%\Fonts`）。
+fn font_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(
+            PathBuf::from(local)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Fonts"),
+        );
+    }
+    if let Some(windir) = std::env::var_os("WINDIR") {
+        dirs.push(PathBuf::from(windir).join("Fonts"));
+    }
+    dirs
+}
+
 /// 日志用的单行摘要（拉丁 / 汉字 / 等宽，未命中写 `miss`）。
 fn supply_line(supply: &Supply) -> String {
     let show = |value: &Option<String>| match value {
@@ -175,7 +460,7 @@ fn supply_line(supply: &Supply) -> String {
         None => "miss".to_owned(),
     };
     format!(
-        "实际供应：拉丁={} 汉字={} 等宽={}",
+        "：拉丁={} 汉字={} 等宽={}",
         show(&supply.latin),
         show(&supply.han),
         show(&supply.mono)
@@ -197,6 +482,14 @@ fn probe_supply(provider: &SystemFontProvider) -> Supply {
         han: ask(HAN_CLUSTER, &FontFamily::Proportional),
         mono: ask(LATIN_CLUSTER, &FontFamily::Monospace),
     }
+}
+
+/// 探测辅助：给定字体目录（测试用，避免依赖真实系统目录）。
+#[cfg(test)]
+fn find_in(dirs: &[PathBuf], file: &str) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(file))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -224,32 +517,73 @@ mod tests {
     }
 
     #[test]
-    fn cjk_chain_is_the_three_name_glyph_chain() {
-        // Lead 裁决 1：声明顺序必须是这三段，且按此序。
-        assert_eq!(
-            CJK_CHAIN,
-            ["Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei"]
-        );
-        // 不进必需链的两个候选，写死断言防止有人「顺手加回来」。
-        assert!(!CJK_CHAIN.contains(&"Noto Sans CJK SC"));
-        assert!(!CJK_CHAIN.iter().any(|name| name.contains("Variable")));
-        let mut seen: Vec<&str> = CJK_CHAIN.to_vec();
-        seen.sort_unstable();
-        let before = seen.len();
-        seen.dedup();
-        assert_eq!(seen.len(), before, "CJK_CHAIN 有重复候选");
+    fn three_chains_are_declared_separately() {
+        // UI-5 §2.1：三条链各自成立，不许混成一条。
+        assert_eq!(LATIN_CHAIN[0], "Inter");
+        assert_eq!(HAN_CHAIN[0], "Source Han Sans SC");
+        assert_eq!(MONO_CHAIN[0], "Consolas");
+        // 思源黑体与 Noto CJK 是同一套字形的两个发行名，不进同一条链的两档。
+        assert!(!HAN_CHAIN.contains(&"Noto Sans CJK SC"));
+        // 进链的每一档都必须有文件候选表，否则那一档永远只能靠 provider（等于白写）。
+        for family in LATIN_CHAIN {
+            assert!(
+                LATIN_REGULAR.iter().any(|face| face.family == family)
+                    || LATIN_BOLD.iter().any(|face| face.family == family)
+                    || family == "Segoe UI",
+                "拉丁链的 {family} 既无注入表、也不是系统兜底档"
+            );
+        }
+        for family in HAN_CHAIN {
+            assert!(
+                HAN_REGULAR.iter().any(|face| face.family == family)
+                    || HAN_BOLD.iter().any(|face| face.family == family)
+                    || family == "Microsoft YaHei UI",
+                "汉字链的 {family} 既无注入表、也不是系统兜底档"
+            );
+        }
     }
 
     #[test]
-    fn mono_chain_starts_with_consolas() {
-        // Lead 裁决 2：Consolas 打头，Cascadia Mono 不在链上。
-        assert_eq!(MONO_CHAIN[0], "Consolas");
-        assert!(!MONO_CHAIN.contains(&"Cascadia Mono"));
+    fn bold_faces_exist_for_both_scripts() {
+        // 真粗体要两个脚本都能落地：拉丁粗（裸 Windows 也有 segoeuib.ttf）、汉字粗。
+        assert!(LATIN_BOLD.iter().any(|face| face.file == "segoeuib.ttf"));
+        assert!(HAN_BOLD.iter().any(|face| face.file == "msyhbd.ttc"));
+        // 汉字粗体的候选必须有**单面**文件兜底，不能全靠 TTC 索引猜测。
+        assert!(HAN_BOLD.iter().any(|face| face.file.ends_with(".ttf")));
+        assert!(BOLD_FAMILY == "AriaBold");
+    }
+
+    #[test]
+    fn inject_budget_stays_under_the_memory_headroom() {
+        // 稳态余量约 21MB（实测 81MB / 闸门 100MB），单文件预算必须留出余地。
+        // 写成 `const` 块：这两条是编译期常量，clippy 的 `assertions_on_constants`
+        // 会把运行时 `assert!` 判为死断言（`-D warnings` 下会挂 CI）。
+        const _: () = assert!(INJECT_BUDGET <= 18 * 1024 * 1024);
+        const _: () = assert!(INJECT_BUDGET >= 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn find_in_prefers_the_first_directory_that_has_the_file() {
+        let root = std::env::temp_dir().join("ah-fonts-probe");
+        let user = root.join("user");
+        let system = root.join("system");
+        std::fs::create_dir_all(&user).expect("建临时目录");
+        std::fs::create_dir_all(&system).expect("建临时目录");
+        std::fs::write(user.join("a.ttf"), b"x").expect("写临时字体");
+        std::fs::write(system.join("b.ttf"), b"y").expect("写临时字体");
+        let dirs = vec![user.clone(), system.clone()];
+        assert_eq!(find_in(&dirs, "a.ttf"), Some(user.join("a.ttf")));
+        assert_eq!(find_in(&dirs, "b.ttf"), Some(system.join("b.ttf")));
+        assert_eq!(find_in(&dirs, "missing.ttf"), None);
+        // 第一个目录有同名文件时不被第二个目录抢走（顺序即优先级）。
+        std::fs::write(system.join("a.ttf"), b"z").expect("写临时字体");
+        assert_eq!(find_in(&dirs, "a.ttf"), Some(user.join("a.ttf")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn summary_never_echoes_the_requested_family() {
-        // 这是本文件最重要的一条回归：曾经 `zh` 显示成「Segoe UI」，
+        // 这是本文件最重要的一条回归：曾经 `han` 显示成「Segoe UI」，
         // 而 Segoe UI 根本不含汉字——名字来自我们自己的提问，不是系统事实。
         let state = FontState {
             resolved: Some("system:Microsoft YaHei:400:0".to_owned()),
@@ -258,6 +592,8 @@ mod tests {
                 han: Some("system:Microsoft YaHei:400:0".to_owned()),
                 mono: None,
             },
+            injected: Vec::new(),
+            bold_ready: false,
         };
         let text = state.supply_summary();
         assert!(text.contains("汉字=system:Microsoft YaHei:400:0"), "{text}");
@@ -270,8 +606,56 @@ mod tests {
     }
 
     #[test]
+    fn fonts_line_is_parseable_and_reports_bold_honestly() {
+        let state = FontState {
+            resolved: None,
+            supply: Supply {
+                latin: Some("system:Segoe UI:400:0".to_owned()),
+                han: Some("system:Microsoft YaHei:400:0".to_owned()),
+                mono: None,
+            },
+            injected: vec!["拉丁粗=Segoe UI←segoeuib.ttf".to_owned()],
+            bold_ready: true,
+        };
+        let line = state.fonts_line();
+        // 这里断言的是**未脱敏**的原始行（族名里的空格保留）；
+        // `--panel-selftest` 打印前还会过一次 `sanitize`（空白→下划线），
+        // 所以判据里看到的是 `system:Segoe_UI:400:0`，两者不要混。
+        assert!(line.starts_with("latin=system:Segoe UI"), "{line}");
+        assert!(line.contains("|han=system:Microsoft YaHei"), "{line}");
+        assert!(line.contains("|mono=miss"), "{line}");
+        assert!(line.contains("|bold=yes"), "{line}");
+        assert!(line.contains("|inject=1"), "{line}");
+        // 无粗体时必须写 no，不许省略这个字段（省略会让判据没法读）。
+        assert!(FontState::default().fonts_line().contains("|bold=no"));
+    }
+
+    #[test]
     fn empty_supply_says_not_probed() {
         assert!(FontState::default().supply_summary().contains("未探测"));
         assert_eq!(FontState::default().han_supplier(), None);
+    }
+
+    #[test]
+    fn injected_path_is_only_used_when_the_file_exists() {
+        // 注入表的每一项都必须长得像文件名（防止有人把整条路径写进表里，
+        // 那样 `font_dirs()` 拼接会永远找不到）。
+        for face in LATIN_REGULAR
+            .iter()
+            .chain(LATIN_BOLD.iter())
+            .chain(HAN_REGULAR.iter())
+            .chain(HAN_BOLD.iter())
+        {
+            assert!(
+                !face.file.contains('\\') && !face.file.contains('/'),
+                "{} 不是纯文件名",
+                face.file
+            );
+            assert!(
+                std::path::Path::new(face.file).extension().is_some(),
+                "{}",
+                face.file
+            );
+        }
     }
 }

@@ -489,7 +489,7 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace
         .clone();
     println!(
         "SELFTEST adapter={} atlas={}x{} atlas_cap={} surface={}x{} window={}x{} backend={} \
-         frames={} rows={} ok={} wgpu_errors={} private_kb={} lat={} zh={} fb={}",
+         frames={} rows={} ok={} wgpu_errors={} private_kb={} lat={} zh={} fb={} fonts={}",
         sanitize(&facts.adapter),
         facts.atlas_size[0],
         facts.atlas_size[1],
@@ -507,6 +507,7 @@ fn report(selftest_frames: Option<u32>, facts: &Mutex<RuntimeFacts>, probe_trace
         or_miss(&facts.font_lat),
         or_miss(&facts.font_zh),
         or_miss(&facts.font_fallback),
+        sanitize(&facts.fonts),
     );
     // 后端选择轨迹：`vulkan:no_adapter>dx12:ready` 这类。现场说「内存高」时，
     // 第一件事就是要知道到底落在哪个后端、以及为什么不是首选的那个。
