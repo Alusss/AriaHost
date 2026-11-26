@@ -38,7 +38,40 @@ rustup target add i686-pc-windows-msvc
 cargo build --release --locked --target i686-pc-windows-msvc
 ```
 
-x86 包在 M4 之前**不进 CI**：`release.yml` 里整段 `build-x86` job 被注释掉，**不留 `continue-on-error`**——失败 job 一样烧 2× Windows 分钟，而且失败被静默吞掉后没人会发现 x86 其实一直没出包，比「不跑」更坏（Q3/Q15）。M4 转正；验收以实机运行为准，不以「能编译」为准。恢复步骤见 `release.yml` 注释块与 [ci.md](ci.md) §3。
+x86 包自 `v0.1.3`（M4-1）起已在 `release.yml` 的发布矩阵里，与 x64 同 tag 出包、缺腿不发 Release（`fail-fast: false`）；全机变体（`-machine-` 段）仍在 M4 之后。判据以**实机运行**为准，不以「能编译」为准。矩阵与门禁见 [ci.md](ci.md) §3、[release.md](release.md) §2。
+
+### 3.1 本地出包的两条路径（2026-11-27 实测）
+
+**先给判据：能不能链接，只看一条。**
+
+```powershell
+# 有任何命中 → 本地 msvc 目标可能能链接；一个都没有 → 必然失败在链接
+Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Lib' -Recurse -Filter kernel32.lib -ErrorAction SilentlyContinue |
+  Select-Object -First 1 -ExpandProperty FullName
+```
+
+**本机实测结论（`hp zhan66pro`，2026-11-27）**：
+
+| 项 | 事实 |
+|---|---|
+| VS Build Tools | 在 `F:\BuildTools\VS2022`（17.14.379），**MSVC 14.44.35207 齐全**，`link.exe`、`vcvars64.bat` 都在 |
+| Windows SDK | **缺失**：`Windows Kits\10` 下 `Include`/`Lib` 为空，**全盘搜不到 `kernel32.lib`** |
+| 结果 | `cargo build --target x86_64-pc-windows-msvc` / `--release` **必定失败在链接**（cargo/rustc 能在，clippy、fmt、`cargo check` 不受影响） |
+
+所以本机**出不了 MSVC 的 exe**——这不是代码问题，是环境缺 SDK。补装 SDK 需要 UAC 提权，而**本会话被策略拒绝提权**（无交互桌面时 UAC 直接返回「操作已被取消」），必须由用户手工双击执行一次安装，装完再用上面的命令复核。
+
+**可用路径：WSL 里的 GNU 交叉（已实测出 x64 包）**。
+
+```bash
+# 在 WSL 内（不是 PowerShell）。首次需装 mingw 链接器与目标
+sudo apt-get install -y gcc-mingw-w64-x86-64
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --locked --target x86_64-pc-windows-gnu
+```
+
+产物是对应 target 目录下的 `ariahost.exe`（PE），能用于「本地确认真的是个能跑链接结果的 Windows 二进制」；但它**不是**发布口径——发布包一律由 CI 的 msvc 腿产出（含 `+crt-static`，见 §7）。
+
+**口诀**：只改 Rust 逻辑 → 本地跑 GNU 交叉 + `cargo test` 够用；涉及 PE 版本资源、静态 CRT、NSIS 打包、真机安装/卸载 → **只能等 Windows CI**，本地给不出结论。
 
 ## 4. 四种运行方式
 

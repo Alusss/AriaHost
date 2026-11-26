@@ -8,6 +8,8 @@
 
 ## 1. 配额前提与省分钟机制
 
+> **本节部分口径已过时（2026-11-27 加注）**：仓库已迁到 **`Alusss/AriaHost`（public）**，Windows runner 不再按 2× 计费；且 `ci.yml` 现在**同时编 x64 与 x86**、`release.yml` 是 **x64 + x86 双腿**（自 `v0.1.3` 起）。下表里「单 arch 单包」「Windows 只留 1 个 job」「x86 job 整段注释」是 private 时代的历史取舍，**读作「当年的省法」，不是现状**。现状以两个 workflow 文件与 [release.md](release.md) §2 为准。
+
 仓库是 **private**：Windows runner 按 **2× 分钟**计费，GitHub Free 的 2000 分钟/月 ≈ **1000 分钟**实际 Windows 构建时间。首版是单 arch、无可选特性的小项目，一分钟都不该浪费在重复编译上。
 
 | 机制 | 落点 | 省什么 |

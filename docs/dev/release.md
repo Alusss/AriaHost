@@ -44,6 +44,18 @@ AriaHost-<ver>-<arch>-manifest.json  版本清单（product/version/arch/target/
 SHA256SUMS.txt                       校验和；build 与 publish 各生成一次，覆盖范围不同（见下）
 ```
 
+**v0.1.5 的实测产物（run 45853691576 四个 job 全 success；tag `v0.1.5` 为 annotated，tag object `aa3b60fb` → commit `192c9c25`；版本一致性门禁通过——workspace `0.1.5` = tag `0.1.5`）**：
+
+| 附件 | 字节 | SHA-256 |
+|---|---|---|
+| `AriaHost-0.1.5-x64-setup.exe` | 8358362 | `e0166b999b1aa5c5e582f5d23a869fedcc0d04e2bef1a2453df6899ff3e233de` |
+| `AriaHost-0.1.5-x86-setup.exe` | 8146175 | `cba31333a9232e245c86465bc924477f8dd3d0edabd2571b52ee2efae5f0f80f` |
+| `AriaHost-0.1.5-x64-manifest.json` | 568 | —（GitHub API digest `fd814b63…`，此处只记前缀） |
+| `AriaHost-0.1.5-x86-manifest.json` | 566 | —（GitHub API digest `3bd9c7cd…`，此处只记前缀） |
+| `SHA256SUMS.txt` | 190 | —（`publish` 版：**两行，只有两个 `setup.exe`**，manifest 不在内） |
+
+下载回读后，两个 setup 的 SHA-256 与 `SHA256SUMS.txt`、与 GitHub API 报的 digest **逐字一致**；`SHA256SUMS.txt` 恰好 190 B 也印证了「只覆盖安装包」的口径（见下）。
+
 **v0.1.3 的实测产物（run 45695433791 全绿，双架构首个正式版；tag → commit `520ce9875079d8abbc3fb37907b27c4ad4427e6c`）**：
 
 | 附件 | 字节 | SHA-256（下载回来独立重算，与 `SHA256SUMS.txt` 逐字一致） |
@@ -66,6 +78,8 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 
 - `build` job（进 artifact）：覆盖 **setup + `ariahost.exe`** 两行。
 - `publish` job（挂到 Release 附件）：在 `out/` 里只有安装包（`find` 只捞 `*-x64-setup.exe` 与 `*manifest.json`），`sha256sum ./*.exe` **只覆盖安装包**。要让 exe 的校验和也对外可见，看同目录的 `manifest.json` —— 它的 `files` 字段里带着 build 时算的两行。
+
+`v0.1.5` 的两个版本号各一个 `SHA256SUMS.txt` 都落在这一口径上：**190 B = 两行 = 两个 `setup.exe`**，`manifest.json` 不在里面。看到「SUMS 里没有 manifest」不是漏写，别去改 `release.yml` 补它。
 
 **v0.1.0 只出 x64 一个包**（run 45454312274）；**v0.1.3 起 x86 进发布矩阵**，同一 tag 出 `x64` 与 `x86` 两个 per-user 包。全机变体（`-machine-` 段）仍在 M4 后，见 [ci.md](ci.md) §3。
 
