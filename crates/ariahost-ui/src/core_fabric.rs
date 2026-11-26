@@ -184,7 +184,28 @@ impl Decision {
     /// 「服务：运行中」，底部「关于」行却仍按**本地探针**说「未就绪（找不到 aria2c）」，
     /// 同一屏上两个结论互相打脸。凡是从这份 Decision 派生，就不会再分叉。
     pub fn about(&self) -> String {
-        format!("{}（{}）", self.origin.label_zh(), self.view.badge)
+        dedupe_same_label(format!("{}（{}）", self.origin.label_zh(), self.view.badge))
+    }
+}
+
+/// `来源（原因）` 里两段同词时，去掉括号那段。
+///
+/// 真机「关于」行曾显示 `aria2 核心：未运行（未运行）`：`origin` 与 `view.badge`
+/// 各自都叫「未运行」，拼起来等于什么都没说，还让人以为有两个不同的状态。
+/// 写成纯函数 + 单测，避免以后改文案时再次漂移。
+fn dedupe_same_label(text: String) -> String {
+    let Some(open) = text.find('（') else {
+        return text;
+    };
+    if !text.ends_with('）') {
+        return text;
+    }
+    let head = text[..open].trim();
+    let inner = text[open + '（'.len_utf8()..text.len() - '）'.len_utf8()].trim();
+    if head == inner {
+        head.to_owned()
+    } else {
+        text
     }
 }
 
@@ -491,6 +512,19 @@ impl Fabric {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_drops_the_duplicated_label() {
+        // 真机「关于」行曾显示 `未运行（未运行）`（origin 与 badge 同词）。
+        assert_eq!(dedupe_same_label("未运行（未运行）".to_owned()), "未运行");
+        // 不同的两段必须原样保留：这条是「不要过度清洗」的反向钉。
+        assert_eq!(
+            dedupe_same_label("服务（运行中）".to_owned()),
+            "服务（运行中）"
+        );
+        // 没有括号的原文不动。
+        assert_eq!(dedupe_same_label("未运行".to_owned()), "未运行");
+    }
 
     fn facts(service: ServicePhase, local: LocalPhase, port: PortOwner, listening: bool) -> Facts {
         Facts {

@@ -367,12 +367,16 @@ pub fn install(ctx: &egui::Context, log: &LogBuffer) -> FontState {
     let inject_used: u64 = injected.iter().map(|record| record.bytes).sum();
 
     // 3) 链的落点：注入命中就写「注入」，没文件就写「系统 provider」——两件事不许混为一谈。
+    // 只报**真的做过的事**。正文面从不做文件注入（走系统 provider），所以这里
+    // 不能写链上的目标族名：真机实测这行曾写「拉丁 Inter（文件注入）」，而同一份
+    // 日志的上一行是「拉丁面未注入：链上候选 Inter-Regular.ttf / Inter.ttf 都不存在」，
+    // 两行结论互相矛盾，属于假事实。实际命中的族由 SELFTEST 的 `fonts=` 字段给出。
     log.push(format!(
-        "字体链落点：拉丁 {}（{}）；汉字 {}（{}）；等宽 {}（系统 provider）",
-        LATIN_CHAIN[0],
+        "字体注入结果：拉丁粗 {}；汉字粗 {}；等宽与正文面均走系统 provider（目标链：拉丁={} / 汉字={} / 等宽={}；实际命中的族见 SELFTEST 的 fonts=）",
         hit_word(latin_bold),
-        HAN_CHAIN[0],
         hit_word(han_bold),
+        LATIN_CHAIN[0],
+        HAN_CHAIN[0],
         MONO_CHAIN[0],
     ));
     if !bold_ready {
