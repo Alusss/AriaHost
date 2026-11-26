@@ -137,6 +137,7 @@ SHA256SUMS.txt                       校验和；build 与 publish 各生成一�
 | 17 | **A7 产物名**：per-user `AriaHost-<ver>-<arch>-setup.exe`、全机 `AriaHost-<ver>-<arch>-machine-setup.exe`，两变体不得同名 | 同 x64 两包同名，发布时互相覆盖 |
 | 18 | 动态命令的可用性：`${AtLeastBuild} 17763`（`WinVer.nsh`，见 #19）、`${FileExists}` 用于目录、`${LoopWhile}` 循环、`SectionSetText` 在 Section 之后的函数里调用 | 首次编译报 `Invalid command` / 隐藏失效 |
 | 19 | **系统基线**：`${IfNot} ${AtLeastBuild} 17763` 拒装并给 `AH-E1001`。**不能用 `${AtLeastWin10}`**——它只比 major/minor（10.0.10240），会放过 Windows Server 2016（10.0.14393）与 Win10 1803 及更早，与需求 N6/Q16、架构 §4.10/§13 的「安装器卡 10.0.17763」冲突 | Server 2016 装上去了；或编译报 `unknown variable/constant "AtLeastBuild"`（老版 `WinVer.nsh`） |
+| 20 | **`AH_CONFIG_PATH` 必须带引号**：安装器两处（`ariahost.nsi` L627 per-user / L924 per-machine，即真正 `set "AH_CONFIG_PATH=…"` 的两行；L622/L921 是注释）写成 `set "AH_CONFIG_PATH=<路径>"&&…`，**引号包住整个 `VAR=值`**。profile 含空格（`C:\Users\Zhang San`）时，不加引号会把后面的 `&&` 吞进值里 | 服务拿到带 `&&` 的脏路径 → 读配置失败（`AH-E5003` 类），而安装器看起来"成功"。**证据等级：仅编译级**（便携 makensis 3.13 四象限编译通过），**运行级【未验证】**——安装器会改注册表与 SCM，Agent 会话禁止实跑，真机首装时补验 |
 
 ### 5.1 安装脚本编译门禁（Windows，真实载荷）
 
