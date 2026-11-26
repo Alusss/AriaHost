@@ -18,3 +18,10 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true
+# M5-f：把 `Parameters\ConfigPath` 写进 HKLM（安装/卸载链路）。
+# feature 只在**本 crate**追加（与 ariahost-common 同一做法）：不改根 Cargo.toml、
+# 不新增依赖、Cargo.lock 版本零变化。
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }

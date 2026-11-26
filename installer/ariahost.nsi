@@ -548,6 +548,43 @@ FunctionEnd
   ${EndIf}
 !macroend
 
+; ---- M5-f：确保「安装用户」的 config.toml 存在，并算出它的绝对路径 --------
+; 为什么必须做（这是 P0 的直接成因）：服务以 SYSTEM 身份读配置，自己的 `%APPDATA%` 是
+;   systemprofile —— 它读不到用户那份 config.toml 时会**静默退回内置默认值**，于是用户设的
+;   下载目录/限速/并发全部失效（`dir=` 落进 `C:\WINDOWS\system32\config\systemprofile`）。
+; 两件事：
+;   1) 文件不存在就先落一份最小合法 TOML（其余键由程序按默认值补齐）；
+;   2) 把绝对路径交给 `--install-service` 助手（经 `AH_CONFIG_PATH`），由它写进
+;      `HKLM\...\Services\AriaHost\Parameters\ConfigPath`。
+; 为什么默认下载目录用 `$PROFILE\Downloads` 而不是 `~/Downloads`：`~` 由**服务进程**
+;   展开会落到 SYSTEM 的 profile（同样的坑）；`$PROFILE` 在这里已是一个绝对路径。
+; 为什么用单引号写 TOML：TOML 基本字符串里 `\U` 是非法转义，Windows 路径必须用字面量字符串。
+; 返回值：$R2 = config.toml 的绝对路径（调用方**立即**使用，中间不要再动 $R2）。
+Function EnsureUserConfig
+  StrCpy $R2 "$APPDATA\AriaHost\config.toml"
+  ${If} ${FileExists} "$R2"
+    DetailPrint "用户配置已存在：$R2（服务将用它）"
+    Return
+  ${EndIf}
+
+  CreateDirectory "$APPDATA\AriaHost"
+  ClearErrors
+  FileOpen $R3 "$R2" w
+  ${If} ${Errors}
+    DetailPrint "警告：无法创建 $R2（服务将退回机器级或内置默认配置）"
+    StrCpy $R2 ""
+    Return
+  ${EndIf}
+  FileWrite $R3 "schema_version = 1$\r$\n"
+  FileWrite $R3 "$\r$\n"
+  FileWrite $R3 "# 由安装程序生成：服务模式（SYSTEM）要读这份配置。$\r$\n"
+  FileWrite $R3 "# 下载目录必须是**绝对路径**：服务身份下 `~` 会展开到系统账户目录。$\r$\n"
+  FileWrite $R3 "[dl]$\r$\n"
+  FileWrite $R3 "dir = '$PROFILE\Downloads'$\r$\n"
+  FileClose $R3
+  DetailPrint "已生成默认配置：$R2（下载目录 $PROFILE\Downloads）"
+FunctionEnd
+
 ; ---- A：可选的服务注册（per-user 包，单次 UAC，等真实退出码）--------------
 ; 为什么不能直接 nsExec：nsExec 无法提权，非管理员下 CreateService 必失败。
 ; 为什么不能只 ExecShell 了事：ExecShell "runas" 是**异步**的，$0 只表示
@@ -571,9 +608,19 @@ FunctionEnd
 Function RegisterServiceIfRequested
   StrCpy $R4 "$TEMP\ariahost-svc-install.rc"
   Delete "$R4"
+  ; M5-f：先确保用户配置存在，再把**安装用户**算好的字面路径传给提权助手。
+  ; 为什么由安装器算：提权后 `%APPDATA%` 可能属于另一个管理员账户（UAC 换账号），
+  ; 助手自己展开会指到别人家里去。这里用 cmd 的 `set` 传，路径已是字面量。
+  Call EnsureUserConfig
+  StrCpy $R1 $R2
   DetailPrint "请求提权注册 Windows 服务：$INSTDIR\${APP_EXE} --install-service（可能出现一次 UAC 确认）"
   ; 单行调用：NSIS 没有反斜杠续行（`\` 只在字符串里作字面量），长行必须保持一行。
-  ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
+  ; `set AH_CONFIG_PATH=... &&` 只影响这一次提权进程的环境（不落盘、不影响别的程序）。
+  ${If} $R1 == ""
+    ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
+  ${Else}
+    ExecShell "runas" "$SYSDIR\cmd.exe" "/v:on /S /c $\"set AH_CONFIG_PATH=$R1&& $\"$\"$INSTDIR\${APP_EXE}$\" --install-service & (echo !errorlevel!)>$\"$R4$\"$\"" SW_HIDE
+  ${EndIf}
 
   StrCpy $R5 0     ; 轮次
   StrCpy $R7 ""    ; 回执内容（空 = 没读到）
@@ -855,9 +902,18 @@ SectionEnd
 ; 两种是同一份脚手架：per-user 的隐藏逻辑（A6）已在 M3 移除。
 Section /o "同时注册为 Windows 服务（Aria2 随系统服务运行）" SEC_SERVICE
 !ifdef PER_MACHINE
-  ; 全机变体：安装器本身已是管理员上下文，直接调用提权助手，不再额外弹 UAC
+  ; 全机变体：安装器本身已是管理员上下文，直接调用提权助手，不再额外弹 UAC。
+  ; M5-f：同样先确保配置存在；全机变体下 `$APPDATA` 是**安装时那个管理员账户**的
+  ; 配置目录（服务账户下无法枚举「所有用户各自的偏好」，这是刻意的取舍：
+  ; 至少是一个真实可见的用户目录，而不是 systemprofile）。
+  Call EnsureUserConfig
+  StrCpy $R1 $R2
   DetailPrint "注册 Windows 服务（当前已是管理员上下文）：$INSTDIR\${APP_EXE} --install-service"
-  nsExec::ExecToLog '"$INSTDIR\${APP_EXE}" --install-service'
+  ${If} $R1 == ""
+    nsExec::ExecToLog '"$INSTDIR\${APP_EXE}" --install-service'
+  ${Else}
+    nsExec::ExecToLog '"$SYSDIR\cmd.exe" /v:on /S /c "set AH_CONFIG_PATH=$R1&& "$INSTDIR\${APP_EXE}" --install-service"'
+  ${EndIf}
   Pop $0
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONEXCLAMATION "服务注册失败（--install-service 返回 $0，参见 AH-E5003）。$\r$\n$\r$\n${APP_NAME} 已安装，仍可用 headless 形态运行；可在面板设置页重试「一键装服务」。" /SD IDOK

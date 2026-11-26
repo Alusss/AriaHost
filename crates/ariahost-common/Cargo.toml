@@ -18,7 +18,12 @@ toml = { workspace = true }
 # 控制管道名按用户 SID 隔离（paths.rs）：OpenProcessToken 在 Threading（workspace 已启用），
 # GetTokenInformation / TOKEN_USER 在 Win32_Security，ConvertSidToStringSidW 在
 # Win32_Security_Authorization —— 后两个 feature 只在这里追加，不动 workspace 根清单。
+#
+# service_config（M5-f）：读 `HKLM\...\Services\AriaHost\Parameters\ConfigPath` 需要
+# RegOpenKeyExW / RegQueryValueExW / RegCloseKey —— 整组在 Win32_System_Registry。
+# 同样只在这里追加 feature：不改根 Cargo.toml、不新增依赖、不动 Cargo.lock 版本。
 windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_Registry",
 ] }

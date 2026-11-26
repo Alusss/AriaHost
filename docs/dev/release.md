@@ -339,4 +339,39 @@ URL 形态只有两种，不要混：
 | 再执行一次 `--quit` | `quit: no-instance`、退出码 **0**（§11 口径） |
 | 面板日志 | `INFO panel: 控制管道已就绪：\\.\pipe\ariahost-ctl-S-1-…-1001` + `DACL 已应用（拒绝网络登录；允许 SYSTEM/管理员/所有者）` |
 
+## 13. 服务读取配置的注册表键 `Parameters\ConfigPath`（M5-f）
+
+**新增的服务注册表键**（安装 `--install-service` 时写入，卸载时删除）：
+
+| 项 | 值 |
+|---|---|
+| 键 | `HKLM\SYSTEM\CurrentControlSet\Services\AriaHost\Parameters` |
+| 值名 | `ConfigPath` |
+| 类型 | `REG_SZ`（值已是展开后的绝对路径；读取端也接受 `REG_EXPAND_SZ` 并自行展开 `%VAR%`） |
+| 典型值 | `C:\Users\<安装用户>\AppData\Roaming\AriaHost\config.toml` |
+| 写入者 | `--install-service` 助手（管理员上下文）。路径由安装器经环境变量 `AH_CONFIG_PATH` 传入——**必须**是安装用户算好的字面路径，助手不能自己展开 `%APPDATA%`（UAC 换账户时会指到另一个用户） |
+| 卸载 | `--uninstall-service` 删除该子键；删不掉不阻断卸载 |
+
+**服务读配置的三级顺序**（`config::load_for_service`，每级都写 `service.log`）：
+
+1. 上面那个 `ConfigPath` → 展开 `%VAR%` → 必须是绝对路径 → 文件必须存在；
+2. `%ProgramData%\AriaHost\config.toml`（机器级）；
+3. 内置默认（`Config::default()`）——**记 WARN**，文案带出已查过的两个路径。
+
+**为什么加这个键**：服务以 SYSTEM 运行，自己的 `%APPDATA%` 是 `…\systemprofile\AppData\Roaming`。没有这个键时它读不到用户那份 `config.toml`，`config::load()` 对 NotFound **静默返回默认值**，于是 `dir=` 被按 SYSTEM 的 `%USERPROFILE%` 展开成 `C:\WINDOWS\system32\config\systemprofile\Downloads` —— 用户设的下载目录/限速/并发在服务模式全部无效，文件落进系统目录（M5-f 的 P0）。
+
+**配套护栏**（`config::download_dir_for_service`，fail-closed）：服务下发的下载目录若落在 `%SystemRoot%` 子树、任何含 `systemprofile` 组件的路径、或 `%ProgramData%` 根，则**拒绝启动 aria2c**，报 `AH-E1001` 并把原因写 `service.log` + `status.json`（`download_dir=null`）。判据是组件级 + 大小写不敏感（`C:\WINDOWS2` 不算 `C:\Windows` 子树）。
+
+**`status.json`（schema_version = 2）新增两字段**：`config_path`（命中的那一级；内置默认时 `null`）、`download_dir`（实际下发给 aria2c 的目录；被护栏拒绝时 `null`）。面板据此提示「你的设置没生效」。
+
+**取证口径（真机，由 Lead/用户执行）**：
+
+```powershell
+sc qc AriaHost
+reg query "HKLM\SYSTEM\CurrentControlSet\Services\AriaHost\Parameters" /v ConfigPath
+Get-Content C:\ProgramData\AriaHost\aria2.conf | Select-String '^dir='
+Get-Content C:\ProgramData\AriaHost\status.json
+```
+
+
 「另一个 Windows 账户」这一路**没有**在真机上构造（本机只有一个可交互账户，另开账户需改系统设置，超出这批范围）：由 `paths::` 单测（两个不同 SID → 两个不同名、且都不等于旧固定名）与上面「旧固定名 0 个」共同保证，不在报告里冒充已验证。

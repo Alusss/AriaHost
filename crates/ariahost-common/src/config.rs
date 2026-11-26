@@ -652,6 +652,12 @@ pub enum ConfigErrorKind {
     UnsupportedSchemaVersion,
     /// secret 生成/加解密失败 → `AH-E1004`。
     Secret,
+    /// 下载目录落在系统保留范围（M5-f 的服务侧护栏，fail-closed）→ `AH-E1001`。
+    ///
+    /// 为什么不申请新码：这是「用户填的值不能这么用」，E1 段已有的 `Usage` 承载这一类；
+    /// 新码需要同步码表文档与 UI 文案，本轮（P0 修复）不动码表。若将来要给面板一个
+    /// 独立的「改目录」主按钮，建议在 E1 段追加一个专用码。
+    ForbiddenDownloadDir,
 }
 
 /// 配置读写错误（可读中文信息 + 可选既有错误码）。
@@ -693,6 +699,7 @@ impl ConfigError {
             ConfigErrorKind::Io => Some(ErrorCode::ConfigIoFailed),
             ConfigErrorKind::Secret => Some(ErrorCode::CredentialCryptoFailed),
             ConfigErrorKind::UnsupportedSchemaVersion => Some(ErrorCode::ConfigSchemaTooNew),
+            ConfigErrorKind::ForbiddenDownloadDir => Some(ErrorCode::Usage),
         }
     }
 }
@@ -705,6 +712,7 @@ impl fmt::Display for ConfigError {
             ConfigErrorKind::Parse => "配置文件解析失败（原文件未改动）",
             ConfigErrorKind::UnsupportedSchemaVersion => "配置 schema 版本过新，拒绝改写",
             ConfigErrorKind::Secret => "RPC secret 处理失败",
+            ConfigErrorKind::ForbiddenDownloadDir => "下载目录不可用（落在系统保留范围）",
         };
         match &self.path {
             Some(path) => write!(formatter, "{head}：{}：{}", path.display(), self.detail),
@@ -886,6 +894,480 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
     // 读回也规范化一次：老版本或手改坏的值不让它进入运行期。
     config.normalize();
     Ok(config)
+}
+
+// ---------------------------------------------------------------------------
+// 服务平面配置（M5-f）：三级来源 + 下载目录护栏
+// ---------------------------------------------------------------------------
+
+/// 服务读配置命中的是**哪一级**（顺序固定，见 [`load_for_service_from`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceConfigSource {
+    /// 第 1 级：`HKLM\SYSTEM\CurrentControlSet\Services\AriaHost\Parameters\ConfigPath`。
+    ///
+    /// 安装器在注册服务时写入「安装用户的 `%APPDATA%\AriaHost\config.toml` 绝对路径」，
+    /// 所以它代表**用户在面板里真正编辑的那份**。
+    ServiceParameter(PathBuf),
+    /// 第 2 级：`%ProgramData%\AriaHost\config.toml`（机器级，给「不要用户配置」的场景）。
+    MachineWide(PathBuf),
+    /// 第 3 级：内置默认（`Config::default()`）——**必须记 WARN**。
+    BuiltIn,
+}
+
+impl ServiceConfigSource {
+    /// 命中文件的绝对路径（`BuiltIn` 时为 `None`）。
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::ServiceParameter(path) | Self::MachineWide(path) => Some(path),
+            Self::BuiltIn => None,
+        }
+    }
+
+    /// 供日志/状态文件显示的稳定文本。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ServiceParameter(_) => "service-parameter",
+            Self::MachineWide(_) => "machine-wide",
+            Self::BuiltIn => "built-in-default",
+        }
+    }
+}
+
+/// 记录级别（与服务日志的 Info/Warn/Error 一一对应，但这一层不依赖日志实现）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigNoteLevel {
+    /// 正常信息（命中了哪一级）。
+    Info,
+    /// 降级（某级不可用，继续下一级）。
+    Warn,
+    /// 真失败（读到了但读不动/语法坏）——**不允许静默吞掉**。
+    Error,
+}
+
+/// 一条要写进 `service.log` 的记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigNote {
+    /// 级别。
+    pub level: ConfigNoteLevel,
+    /// 可读原因（含绝对路径）。
+    pub text: String,
+}
+
+impl ConfigNote {
+    fn new(level: ConfigNoteLevel, text: impl Into<String>) -> Self {
+        Self {
+            level,
+            text: text.into(),
+        }
+    }
+}
+
+/// 服务读配置的**三级候选**（生产由注册表与 `%ProgramData%` 算；单测直接注入，避免改进程环境）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceConfigCandidates {
+    /// 第 1 级：`Parameters\ConfigPath` 的原始值（可能含 `%VAR%`，**未展开**）。
+    pub service_parameter: Option<String>,
+    /// 第 2 级：`%ProgramData%\AriaHost\config.toml`。
+    pub machine_wide: Option<PathBuf>,
+}
+
+/// 读 `Parameters\ConfigPath` 的能力（生产走注册表；单测注入假件）。
+///
+/// 为什么要抽这一层：注册表 API 只在 `cfg(windows)` 下存在，而三级顺序的**逻辑**
+/// 必须在 Linux 门禁里也测到。注入后顺序规则与平台无关。
+pub trait ConfigPathProbe {
+    /// 原始值（`REG_SZ`/`REG_EXPAND_SZ` 的文本，未展开）；读不到 → `None`。
+    fn raw_service_config_path(&self) -> Option<String>;
+}
+
+/// 生产探针：Windows 读注册表，其它平台恒 `None`。
+pub struct SystemConfigPathProbe;
+
+impl ConfigPathProbe for SystemConfigPathProbe {
+    fn raw_service_config_path(&self) -> Option<String> {
+        registry_config_path()
+    }
+}
+
+/// 服务配置的读取结果。
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// 读到的配置（三级全不可用时是 `Config::default()`）。
+    pub config: Config,
+    /// 命中的来源。
+    pub source: ServiceConfigSource,
+    /// 逐级结论（调用方原样写 `service.log`，一条都不许丢）。
+    pub notes: Vec<ConfigNote>,
+}
+
+impl ServiceConfig {
+    /// 命中的配置文件绝对路径（`BuiltIn` 时为 `None`——状态文件里就是 `null`）。
+    pub fn config_path(&self) -> Option<&Path> {
+        self.source.path()
+    }
+}
+
+/// 生产入口：按「注册表 → 机器级 → 内置默认」读服务配置。
+pub fn load_for_service() -> ServiceConfig {
+    load_for_service_from(&service_candidates(&SystemConfigPathProbe))
+}
+
+/// 算出三级候选（第 1 级取注册表原值，第 2 级取 `%ProgramData%\AriaHost\config.toml`）。
+pub fn service_candidates(probe: &dyn ConfigPathProbe) -> ServiceConfigCandidates {
+    ServiceConfigCandidates {
+        service_parameter: probe.raw_service_config_path(),
+        machine_wide: crate::paths::service_runtime_dir().map(|dir| dir.join(CONFIG_FILE_NAME)),
+    }
+}
+
+/// 按固定三级顺序读配置；**每一级都留一条 [`ConfigNote`]**。
+///
+/// 顺序与判据：
+/// 1. `Parameters\ConfigPath`：展开 `%VAR%` → 必须是绝对路径 → 文件必须存在 → [`load_from`]；
+/// 2. `%ProgramData%\AriaHost\config.toml`：同上（路径本身已是绝对）；
+/// 3. 内置默认：记 **WARN**，文案里带出已查过的两个路径。
+///
+/// 为什么「读失败」不等于「不存在」：文件不存在是**正常降级**（用户没配置过），
+/// 但「文件在、读不动 / TOML 坏」是**真失败**——静默吞掉会让用户以为自己的设置在生效。
+/// 后者记 `Error` 并继续下一级，且最终由调用方写进 `status.json`（`config_path=null`）。
+pub fn load_for_service_from(candidates: &ServiceConfigCandidates) -> ServiceConfig {
+    let mut notes = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+
+    // ---- 第 1 级：注册表 ConfigPath ----
+    match candidates.service_parameter.as_deref() {
+        Some(raw) => {
+            let expanded = expand_env_vars(raw);
+            let path = PathBuf::from(&expanded);
+            tried.push(expanded.clone());
+            if !is_absolute_str(&expanded) {
+                notes.push(ConfigNote::new(
+                    ConfigNoteLevel::Warn,
+                    format!(
+                        "第 1 级 ConfigPath 展开后不是绝对路径（原始 {raw:?} → {expanded:?}）：\
+                         多半是环境变量未定义或写成了相对路径，跳过"
+                    ),
+                ));
+            } else if !path.is_file() {
+                notes.push(ConfigNote::new(
+                    ConfigNoteLevel::Warn,
+                    format!("第 1 级 ConfigPath 指向的文件不存在：{expanded}，继续下一级"),
+                ));
+            } else {
+                match load_from(&path) {
+                    Ok(config) => {
+                        notes.push(ConfigNote::new(
+                            ConfigNoteLevel::Info,
+                            format!("配置来源：第 1 级（服务参数 ConfigPath）{expanded}"),
+                        ));
+                        return ServiceConfig {
+                            config,
+                            source: ServiceConfigSource::ServiceParameter(path),
+                            notes,
+                        };
+                    }
+                    Err(error) => notes.push(ConfigNote::new(
+                        ConfigNoteLevel::Error,
+                        format!("第 1 级配置读取失败（不静默吞掉）：{error}；继续下一级"),
+                    )),
+                }
+            }
+        }
+        None => notes.push(ConfigNote::new(
+            ConfigNoteLevel::Warn,
+            "第 1 级不可用：注册表 HKLM\\SYSTEM\\CurrentControlSet\\Services\\AriaHost\\\
+             Parameters\\ConfigPath 没有值（安装器应写入它的绝对路径）"
+                .to_owned(),
+        )),
+    }
+
+    // ---- 第 2 级：机器级 ----
+    match candidates.machine_wide.as_deref() {
+        Some(path) => {
+            tried.push(path.display().to_string());
+            if !path.is_file() {
+                notes.push(ConfigNote::new(
+                    ConfigNoteLevel::Warn,
+                    format!("第 2 级配置文件不存在：{}，继续下一级", path.display()),
+                ));
+            } else {
+                match load_from(path) {
+                    Ok(config) => {
+                        notes.push(ConfigNote::new(
+                            ConfigNoteLevel::Info,
+                            format!("配置来源：第 2 级（机器级）{}", path.display()),
+                        ));
+                        return ServiceConfig {
+                            config,
+                            source: ServiceConfigSource::MachineWide(path.to_path_buf()),
+                            notes,
+                        };
+                    }
+                    Err(error) => notes.push(ConfigNote::new(
+                        ConfigNoteLevel::Error,
+                        format!("第 2 级配置读取失败（不静默吞掉）：{error}；继续下一级"),
+                    )),
+                }
+            }
+        }
+        None => notes.push(ConfigNote::new(
+            ConfigNoteLevel::Warn,
+            "第 2 级不可用：拿不到 %ProgramData%（服务平面根目录）".to_owned(),
+        )),
+    }
+
+    // ---- 第 3 级：内置默认（必记 WARN）----
+    notes.push(ConfigNote::new(
+        ConfigNoteLevel::Warn,
+        format!(
+            "配置未找到（已查 {}），服务使用内置默认值——面板里设置的下载目录/限速/并发\
+             都不会生效",
+            if tried.is_empty() {
+                "（无可用候选路径）".to_owned()
+            } else {
+                tried.join("、")
+            }
+        ),
+    ));
+    ServiceConfig {
+        config: Config::default(),
+        source: ServiceConfigSource::BuiltIn,
+        notes,
+    }
+}
+
+/// 展开 `%NAME%` 形式的环境变量（**自己实现，不调 `ExpandEnvironmentStringsW`**）。
+///
+/// 为什么不用 Win32 的展开函数：Linux 门禁要测同一份规则（注册表值里带 `%VAR%` 是
+/// 常见写法），而 Win32 调用在 Linux 上不存在——那样这条逻辑就只能靠人读代码。
+/// 未定义的变量**原样保留**（于是结果多半不是绝对路径 → 自然走到下一级并留 WARN）。
+pub fn expand_env_vars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                if name.is_empty() {
+                    // `%%` 不是变量分隔符对：原样吐出并继续（避免吃掉用户文本）。
+                    out.push_str("%%");
+                } else {
+                    match std::env::var(name) {
+                        Ok(value) => out.push_str(&value),
+                        Err(_) => {
+                            out.push('%');
+                            out.push_str(name);
+                            out.push('%');
+                        }
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                // 落单的 `%`：原样保留。
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 服务平面受保护的目录（拒绝把下载目录配到这些地方）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceDirGuards {
+    /// `%SystemRoot%`（`C:\WINDOWS`）——其整棵子树都不许当下载目录。
+    pub system_root: Option<PathBuf>,
+    /// `%ProgramData%`——**只禁根本身**（下载到 `C:\ProgramData` 根会与产品数据混在一起）。
+    pub program_data: Option<PathBuf>,
+}
+
+/// 从环境读受保护目录（生产入口）。
+pub fn service_dir_guards() -> ServiceDirGuards {
+    ServiceDirGuards {
+        system_root: non_empty_env_path("SystemRoot"),
+        program_data: non_empty_env_path("ProgramData"),
+    }
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// 服务下发给 aria2c 的下载目录（生产入口：用环境里的受保护目录）。
+///
+/// 与 [`download_dir_absolute`] 的分工：后者只回答「这个值能不能变成绝对路径」，
+/// 是**全平面共用**的语义（面板也要用）；这里额外回答「服务身份跑它安不安全」——
+/// 服务是 SYSTEM，落到系统保留范围会把用户的下载目录变成提权写入点，所以 **fail-closed**：
+/// 宁可让服务起不来并报错，也不能悄悄把文件塞进 `system32`。
+pub fn download_dir_for_service(config: &Config) -> Result<PathBuf, ConfigError> {
+    download_dir_for_service_with(config, &service_dir_guards())
+}
+
+/// 同 [`download_dir_for_service`]，但显式注入受保护目录（单测用）。
+pub fn download_dir_for_service_with(
+    config: &Config,
+    guards: &ServiceDirGuards,
+) -> Result<PathBuf, ConfigError> {
+    let dir = download_dir_absolute(config)?;
+    if let Some(reason) = forbidden_service_dir(&dir, guards) {
+        return Err(ConfigError::new(
+            ConfigErrorKind::ForbiddenDownloadDir,
+            Some(&dir),
+            reason,
+        ));
+    }
+    Ok(dir)
+}
+
+/// 判定下载目录是否落在系统保留范围；命中返回可读原因。
+fn forbidden_service_dir(dir: &Path, guards: &ServiceDirGuards) -> Option<String> {
+    // ① 任何层级的 `systemprofile` 组件：那是 SYSTEM 账户的「用户目录」，
+    //    用户既看不见也基本动不了（M5-f 的那个 P0 就是这么来的）。
+    if has_component_ignore_case(dir, "systemprofile") {
+        return Some(format!(
+            "下载目录 {} 落在 SYSTEM 账户的 profile（systemprofile）里：普通用户看不见也改不动；\
+             请在面板里把下载目录改成自己的目录",
+            dir.display()
+        ));
+    }
+    // ② `%SystemRoot%` 整棵子树（`C:\WINDOWS\...`）。
+    if let Some(root) = guards.system_root.as_deref() {
+        if starts_with_ignore_case(dir, root) {
+            return Some(format!(
+                "下载目录 {} 落在系统目录 {} 及其子树里：这是提权写入点，服务拒绝使用",
+                dir.display(),
+                root.display()
+            ));
+        }
+    }
+    // ③ `%ProgramData%` **根**（子目录放行）。
+    if let Some(root) = guards.program_data.as_deref() {
+        if eq_ignore_case(dir, root) {
+            return Some(format!(
+                "下载目录 {} 就是 %ProgramData% 根目录：会与产品数据（config/logs/aria2）混在一起，\
+                 请改用子目录",
+                dir.display()
+            ));
+        }
+    }
+    None
+}
+
+/// 把路径切成小写组件（**同时认 `\` 与 `/`**）。
+///
+/// 为什么不用 `Path::components`：产品的路径是 Windows 形式（`C:\WINDOWS\...`），
+/// 而 Linux 门禁上 `Path::new("C:\\WINDOWS")` 只有一个组件——那样这条判据在单测里
+/// 就变成了「永远不命中」，等于没测。自己按两种分隔符切，规则与平台无关。
+fn path_segments(path: &Path) -> Vec<String> {
+    path.to_string_lossy()
+        .split(['\\', '/'])
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_ascii_lowercase())
+        .collect()
+}
+
+/// 组件级、大小写不敏感的前缀判断（不用字符串前缀：`C:\WINDOWS2` 不算落在 `C:\WINDOWS` 里）。
+fn starts_with_ignore_case(path: &Path, prefix: &Path) -> bool {
+    let parts = path_segments(path);
+    let wanted = path_segments(prefix);
+    if wanted.is_empty() || wanted.len() > parts.len() {
+        return false;
+    }
+    parts[..wanted.len()] == wanted[..]
+}
+
+fn eq_ignore_case(path: &Path, other: &Path) -> bool {
+    let parts = path_segments(path);
+    !parts.is_empty() && parts == path_segments(other)
+}
+
+/// 路径里是否含某个组件（大小写不敏感）。
+fn has_component_ignore_case(path: &Path, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    path_segments(path).contains(&name)
+}
+
+/// 读 `HKLM\SYSTEM\CurrentControlSet\Services\AriaHost\Parameters` 的 `ConfigPath`。
+#[cfg(not(windows))]
+fn registry_config_path() -> Option<String> {
+    // 服务只在 Windows 上跑；Linux 门禁用注入的假探针覆盖三级顺序。
+    None
+}
+
+#[cfg(windows)]
+fn registry_config_path() -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+        REG_EXPAND_SZ, REG_SZ,
+    };
+
+    /// 服务键下的参数子键（安装器把 ConfigPath 写在这里）。
+    const PARAMETERS_KEY: &str = "SYSTEM\\CurrentControlSet\\Services\\AriaHost\\Parameters";
+    const VALUE_NAME: &str = "ConfigPath";
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let subkey = wide(PARAMETERS_KEY);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: subkey 是以 NUL 结尾的宽字符串；key 指向本地变量，调用后由我们关闭。
+    let opened =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut key) };
+    if opened != ERROR_SUCCESS {
+        return None;
+    }
+    let name = wide(VALUE_NAME);
+    let mut kind = 0u32;
+    let mut size = 0u32;
+    // 第一次只探长度（数据指针为空）。
+    // SAFETY: 与上面同；数据指针为 null 时该调用只返回所需字节数。
+    let probed = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut kind,
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if probed != ERROR_SUCCESS || (kind != REG_SZ && kind != REG_EXPAND_SZ) || size == 0 {
+        // SAFETY: key 由上面的成功打开取得。
+        unsafe { RegCloseKey(key) };
+        return None;
+    }
+    // 值以 UTF-16 存、`size` 含结尾 NUL（字节数）→ 长度向上取整再加一格余量。
+    let mut buffer = vec![0u16; (size as usize / 2) + 1];
+    let mut read = size;
+    // SAFETY: buffer 的容量 >= 需要的字节数；read 是实际写入的字节数。
+    let queried = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut kind,
+            buffer.as_mut_ptr().cast::<u8>(),
+            &mut read,
+        )
+    };
+    // SAFETY: key 由上面的成功打开取得，且只关闭一次。
+    unsafe { RegCloseKey(key) };
+    if queried != ERROR_SUCCESS {
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    if length == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buffer[..length]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1640,5 +2122,273 @@ beta = "two"
         assert_eq!(RpcListen::Localhost.listen_all(), Some(false));
         assert_eq!(RpcListen::Lan.listen_all(), Some(true));
         assert_eq!(RpcListen::Off.listen_all(), None);
+    }
+
+    // ---- M5-f：服务配置三级来源 ------------------------------------------
+
+    /// 假探针：回一个固定原值（`None` = 注册表没这个值）。
+    struct FakeProbe(Option<&'static str>);
+
+    impl ConfigPathProbe for FakeProbe {
+        fn raw_service_config_path(&self) -> Option<String> {
+            self.0.map(str::to_owned)
+        }
+    }
+
+    fn note_texts(loaded: &ServiceConfig) -> String {
+        loaded
+            .notes
+            .iter()
+            .map(|note| format!("{:?} {}", note.level, note.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 探针 → 候选：第 1 级原样带出注册表值，第 2 级是 `%ProgramData%` 下的 config.toml。
+    #[test]
+    fn service_candidates_carry_registry_value_and_machine_wide_path() {
+        let candidates = service_candidates(&FakeProbe(Some(r"D:\AriaHost\config.toml")));
+        assert_eq!(
+            candidates.service_parameter.as_deref(),
+            Some(r"D:\AriaHost\config.toml"),
+            "注册表值必须原样带出（展开留给 load_for_service_from）"
+        );
+        if let Some(path) = candidates.machine_wide.as_deref() {
+            assert!(
+                path.ends_with(CONFIG_FILE_NAME),
+                "第 2 级必须是 <ProgramData>\\AriaHost\\config.toml：{}",
+                path.display()
+            );
+        }
+
+        // 注册表没值时第 1 级就是 None（不是空串）。
+        assert!(service_candidates(&FakeProbe(None))
+            .service_parameter
+            .is_none());
+    }
+
+    /// 第 1 级命中：注册表值 → 展开 → 绝对 → 存在 → 用它的 `dl.dir`。
+    #[test]
+    fn service_config_prefers_the_registry_path() {
+        let dir = TestDir::new("svc-l1");
+        fs::write(
+            dir.config_path(),
+            "schema_version = 1\n[dl]\ndir = 'D:/user-pick'\n",
+        )
+        .expect("写第 1 级配置");
+
+        let candidates = ServiceConfigCandidates {
+            service_parameter: Some(dir.config_path().display().to_string()),
+            machine_wide: None,
+        };
+        let loaded = load_for_service_from(&candidates);
+
+        assert_eq!(loaded.config.dl.dir, "D:/user-pick");
+        assert_eq!(loaded.source.as_str(), "service-parameter");
+        assert_eq!(loaded.config_path(), Some(dir.config_path().as_path()));
+        let notes = note_texts(&loaded);
+        assert!(notes.contains("第 1 级"), "{notes}");
+    }
+
+    /// 第 1 级文件不存在 → 第 2 级接手（这是 P0 里那条「静默降级」要显示出来的路径）。
+    #[test]
+    fn service_config_falls_through_to_machine_wide_when_registry_file_is_missing() {
+        let dir = TestDir::new("svc-l2");
+        let machine = dir.0.join("machine.toml");
+        fs::write(
+            &machine,
+            "schema_version = 1\n[dl]\ndir = 'E:/machine-wide'\n",
+        )
+        .expect("写机器级配置");
+        let absent = dir.0.join("absent.toml");
+
+        let candidates = ServiceConfigCandidates {
+            service_parameter: Some(absent.display().to_string()),
+            machine_wide: Some(machine.clone()),
+        };
+        let loaded = load_for_service_from(&candidates);
+
+        assert_eq!(loaded.config.dl.dir, "E:/machine-wide");
+        assert_eq!(loaded.source.as_str(), "machine-wide");
+        assert_eq!(loaded.config_path(), Some(machine.as_path()));
+        let notes = note_texts(&loaded);
+        assert!(
+            notes.contains("第 1 级 ConfigPath 指向的文件不存在"),
+            "{notes}"
+        );
+    }
+
+    /// 三级全落空 → 内置默认 + **WARN 里带出已查过的两个路径**。
+    #[test]
+    fn service_config_falls_back_to_builtin_with_a_loud_warning() {
+        let dir = TestDir::new("svc-l3");
+        let absent = dir.0.join("absent.toml");
+        let machine = dir.0.join("machine-absent.toml");
+
+        let candidates = ServiceConfigCandidates {
+            service_parameter: Some(absent.display().to_string()),
+            machine_wide: Some(machine.clone()),
+        };
+        let loaded = load_for_service_from(&candidates);
+
+        assert_eq!(loaded.source, ServiceConfigSource::BuiltIn);
+        assert_eq!(loaded.config_path(), None, "默认值时状态文件里必须是 null");
+        assert_eq!(loaded.config.dl.dir, Config::default().dl.dir);
+
+        let warn = loaded
+            .notes
+            .iter()
+            .find(|note| note.text.contains("使用内置默认值"))
+            .expect("必须有「使用内置默认值」的 WARN");
+        assert_eq!(
+            warn.level,
+            ConfigNoteLevel::Warn,
+            "这条必须是 WARN 不能是 Info"
+        );
+        assert!(
+            warn.text.contains("absent.toml"),
+            "文案要带出第 1 级：{}",
+            warn.text
+        );
+        assert!(
+            warn.text.contains("machine-absent.toml"),
+            "文案要带出第 2 级：{}",
+            warn.text
+        );
+    }
+
+    /// 第 1 级「文件在但 TOML 坏」→ 记 **Error**（不许静默吞），并继续第 2 级。
+    #[test]
+    fn service_config_reports_parse_failure_as_error_and_continues() {
+        let dir = TestDir::new("svc-bad");
+        let broken = dir.0.join("broken.toml");
+        fs::write(&broken, "schema_version = = 1\n[[[").expect("写坏配置");
+        let machine = dir.0.join("machine.toml");
+        fs::write(
+            &machine,
+            "schema_version = 1\n[dl]\ndir = 'F:/from-machine'\n",
+        )
+        .expect("写机器级配置");
+
+        let candidates = ServiceConfigCandidates {
+            service_parameter: Some(broken.display().to_string()),
+            machine_wide: Some(machine),
+        };
+        let loaded = load_for_service_from(&candidates);
+
+        assert_eq!(loaded.config.dl.dir, "F:/from-machine");
+        let error = loaded
+            .notes
+            .iter()
+            .find(|note| note.level == ConfigNoteLevel::Error)
+            .expect("读失败必须记 Error");
+        assert!(error.text.contains("第 1 级"), "{}", error.text);
+    }
+
+    /// `ConfigPath` 里的 `%VAR%` 要展开；展开后必须是绝对路径。
+    #[test]
+    fn service_config_expands_environment_variables_in_config_path() {
+        // 取一个当前进程真实存在的环境变量（不改环境：并行测试共享进程环境，改了会互相污染）。
+        let (name, value) = std::env::vars()
+            .find(|(name, value)| !name.contains('%') && !value.contains('%') && !value.is_empty())
+            .expect("至少要有一个环境变量");
+
+        let raw = format!("%{name}%\\AriaHost\\config.toml");
+        let expanded = expand_env_vars(&raw);
+        assert_eq!(expanded, format!("{value}\\AriaHost\\config.toml"));
+
+        // 未定义的变量原样保留 → 结果不绝对 → 走下一级（并留 WARN）。
+        let unresolved = expand_env_vars("%NOPE_M5F_NOT_DEFINED%\\config.toml");
+        assert_eq!(unresolved, "%NOPE_M5F_NOT_DEFINED%\\config.toml");
+        assert!(!is_absolute_str(&unresolved), "未展开的变量不该算绝对路径");
+
+        let candidates = ServiceConfigCandidates {
+            service_parameter: Some(unresolved),
+            machine_wide: None,
+        };
+        let loaded = load_for_service_from(&candidates);
+        let notes = note_texts(&loaded);
+        assert!(notes.contains("不是绝对路径"), "{notes}");
+        assert_eq!(loaded.source, ServiceConfigSource::BuiltIn);
+    }
+
+    // ---- M5-f：下载目录护栏（fail-closed）--------------------------------
+
+    fn guards() -> ServiceDirGuards {
+        ServiceDirGuards {
+            system_root: Some(PathBuf::from("C:\\Windows")),
+            program_data: Some(PathBuf::from("C:\\ProgramData")),
+        }
+    }
+
+    /// ① SYSTEM 账户 profile（就是 P0 里那个真实路径）→ 拒绝。
+    #[test]
+    fn service_download_dir_rejects_systemprofile_subtree() {
+        let config = with_dl_dir("C:\\WINDOWS\\system32\\config\\systemprofile\\Downloads");
+        let error =
+            download_dir_for_service_with(&config, &guards()).expect_err("systemprofile 必须拒绝");
+        assert_eq!(error.kind(), ConfigErrorKind::ForbiddenDownloadDir);
+        assert_eq!(error.code(), Some(ErrorCode::Usage), "保留 E1 段既有码");
+        assert!(error.to_string().contains("systemprofile"), "{error}");
+    }
+
+    /// ② `%SystemRoot%` 子树（不在 systemprofile 里也一样拒）。
+    #[test]
+    fn service_download_dir_rejects_system_root_subtree() {
+        let config = with_dl_dir("C:\\Windows\\Temp\\dl");
+        let error =
+            download_dir_for_service_with(&config, &guards()).expect_err("系统目录子树必须拒绝");
+        assert!(error.to_string().contains("系统目录"), "{error}");
+    }
+
+    /// ③ `%ProgramData%` **根**（子目录放行）。
+    #[test]
+    fn service_download_dir_rejects_program_data_root_but_allows_children() {
+        let root = with_dl_dir("C:\\ProgramData");
+        let error =
+            download_dir_for_service_with(&root, &guards()).expect_err("ProgramData 根必须拒绝");
+        assert!(error.to_string().contains("根目录"), "{error}");
+
+        let child = with_dl_dir("C:\\ProgramData\\AriaHost\\Downloads");
+        let resolved = download_dir_for_service_with(&child, &guards()).expect("子目录放行");
+        assert_eq!(
+            resolved,
+            PathBuf::from("C:\\ProgramData\\AriaHost\\Downloads")
+        );
+    }
+
+    /// ④ 正常用户目录放行；大小写不敏感（`c:\windows` 与 `C:\Windows` 同判）。
+    #[test]
+    fn service_download_dir_allows_normal_dirs_and_ignores_case() {
+        let ok = with_dl_dir("D:\\Downloads\\aria2");
+        assert_eq!(
+            download_dir_for_service_with(&ok, &guards()).expect("普通目录放行"),
+            PathBuf::from("D:\\Downloads\\aria2")
+        );
+
+        let lower = with_dl_dir("c:\\windows\\system32\\config\\SYSTEMPROFILE\\Downloads");
+        assert!(
+            download_dir_for_service_with(&lower, &guards()).is_err(),
+            "大小写不能绕过护栏"
+        );
+
+        // 组件级比较：`C:\WINDOWS2` 不是 `C:\Windows` 的子树。
+        let lookalike = with_dl_dir("C:\\Windows2\\dl");
+        assert!(
+            download_dir_for_service_with(&lookalike, &guards()).is_ok(),
+            "字符串前缀会误伤 WINDOWS2，组件级比较不会"
+        );
+        // `C:\Windows\..` 这种写法也按组件判：落在子树里照样拒。
+        let dotdot = with_dl_dir("C:\\Windows\\Temp\\..\\Temp\\dl");
+        assert!(download_dir_for_service_with(&dotdot, &guards()).is_err());
+    }
+
+    /// 相对路径 / 空目录仍走原有 `download_dir_absolute` 的判据（护栏不越权）。
+    #[test]
+    fn service_download_dir_keeps_the_original_relative_path_error() {
+        let relative = with_dl_dir("dl/inbox");
+        let error = download_dir_for_service_with(&relative, &guards())
+            .expect_err("相对路径必须还是原来的错");
+        assert_eq!(error.kind(), ConfigErrorKind::PathUnavailable);
     }
 }

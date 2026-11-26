@@ -10,11 +10,15 @@
 //!
 //! # 内容边界（这是本模块唯一的安全约束）
 //!
-//! 文件里**只有**七个字段：`schema_version` / `service_version` / `core_source` /
-//! `core_version` / `aria2_pid` / `started_at` / `updated_at`。**绝不含** RPC secret、token、
-//! 密码、下载目录或任何路径——少一个字段就少一条泄漏链。新增字段前先问：这条信息公开给
-//! 本机任何用户看，会不会缩小攻击面？不会就别加（单测 `serialized_form_carries_no_secrets`
-//! 钉住三类子串）。
+//! 文件里**只有**九个字段：`schema_version` / `service_version` / `core_source` /
+//! `core_version` / `aria2_pid` / `started_at` / `updated_at`（M5-e）+ `config_path` /
+//! `download_dir`（M5-f）。**绝不含** RPC secret、token、密码——少一个字段就少一条泄漏链。
+//! 新增字段前先问：这条信息公开给本机任何用户看，会不会缩小攻击面？不会就别加
+//! （单测 `serialized_form_carries_no_secrets` 钉住机密形态的子串）。
+//!
+//! M5-f 追加的两个字段是**路径**而非机密：`config_path` 回答「服务用的是哪份配置」（`null`
+//! = 用的是内置默认值，面板据此提示「你的设置不生效」），`download_dir` 回答「下载到哪」。
+//! 它们是排障必需的信息，且同一台机器上的用户本来就能从 `aria2.conf` 读到同样的值。
 //!
 //! # 机密为什么可以放宽读权限
 //!
@@ -48,7 +52,10 @@ use serde::Serialize;
 pub const STATUS_FILE_NAME: &str = "status.json";
 
 /// 契约版本。**改字段必升这个数**——面板与诊断包按它决定怎么解析。
-pub const STATUS_SCHEMA_VERSION: u32 = 1;
+///
+/// - 1：M5-e 初版（七字段）。
+/// - 2：M5-f 追加 `config_path` / `download_dir`（服务模式「用的是哪份配置、下载到哪」）。
+pub const STATUS_SCHEMA_VERSION: u32 = 2;
 
 /// 核心来源（写进文件的 `core_source`）。
 ///
@@ -108,6 +115,15 @@ pub struct ServiceStatus {
     pub started_at: String,
     /// 本次写入的时刻（RFC3339 UTC）。
     pub updated_at: String,
+    /// 服务实际读到的那份配置的绝对路径（M5-f）。
+    ///
+    /// - `null` = 三级都没命中，服务用的是**内置默认值**（这时面板应提示用户「设置不生效」，
+    ///   这正是 M5-f 那个 P0 要暴露的情形）。
+    pub config_path: Option<String>,
+    /// 服务实际下发给 aria2c 的下载目录绝对路径（M5-f）。
+    ///
+    /// - `null` = 没有核心在跑，或下载目录被护栏拒绝而没下发（原因在 `service.log`）。
+    pub download_dir: Option<String>,
 }
 
 impl ServiceStatus {
@@ -125,7 +141,19 @@ impl ServiceStatus {
             aria2_pid: None,
             started_at,
             updated_at: ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
+            config_path: None,
+            download_dir: None,
         }
+    }
+
+    /// 填「服务用的是哪份配置、下载到哪」（M5-f）。
+    ///
+    /// 这两个值在一次服务会话内是**常量**（配置只在服务启动时读一次），
+    /// 与核心三项不同——它们不需要每次现取。
+    pub fn with_paths(mut self, config_path: Option<String>, download_dir: Option<String>) -> Self {
+        self.config_path = config_path;
+        self.download_dir = download_dir;
+        self
     }
 
     /// 填「核心正在跑」的三个字段（来源/版本/PID）。
@@ -274,11 +302,12 @@ mod tests {
     }
 
     fn sample() -> ServiceStatus {
-        ServiceStatus::starting("0.1.3", "2026-11-26T02:33:34.510Z").with_running_core(
-            CoreSource::Managed,
-            Some("1.37.0".to_owned()),
-            Some(1234),
-        )
+        ServiceStatus::starting("0.1.3", "2026-11-26T02:33:34.510Z")
+            .with_running_core(CoreSource::Managed, Some("1.37.0".to_owned()), Some(1234))
+            .with_paths(
+                Some("C:\\Users\\alice\\AppData\\Roaming\\AriaHost\\config.toml".to_owned()),
+                Some("D:\\Downloads\\aria2".to_owned()),
+            )
     }
 
     /// ① 字段完整 + `schema_version` 是契约值；`core_source` 序列化成稳定小写文本。
@@ -293,7 +322,7 @@ mod tests {
         println!("STATUS_JSON {text}");
         let value: serde_json::Value = serde_json::from_str(&text).expect("合法 JSON");
 
-        assert_eq!(value["schema_version"], serde_json::json!(1));
+        assert_eq!(value["schema_version"], serde_json::json!(2));
         assert_eq!(value["service_version"], serde_json::json!("0.1.3"));
         assert_eq!(value["core_source"], serde_json::json!("managed"));
         assert_eq!(value["core_version"], serde_json::json!("1.37.0"));
@@ -306,9 +335,32 @@ mod tests {
             value["updated_at"],
             serde_json::json!("2026-11-26T02:34:00.000Z")
         );
-        // 契约就是这七个键，多一个少一个都不行。
+        // M5-f：两个新字段必须真的落盘（面板据此提示「设置不生效」）。
+        assert_eq!(
+            value["config_path"],
+            serde_json::json!("C:\\Users\\alice\\AppData\\Roaming\\AriaHost\\config.toml")
+        );
+        assert_eq!(
+            value["download_dir"],
+            serde_json::json!("D:\\Downloads\\aria2")
+        );
+        // 契约就是这九个键，多一个少一个都不行。
         let keys: Vec<&String> = value.as_object().expect("对象").keys().collect();
-        assert_eq!(keys.len(), 7, "契约字段数变了：{keys:?}");
+        assert_eq!(keys.len(), 9, "契约字段数变了：{keys:?}");
+    }
+
+    /// M5-f：内置默认 / 没下发下载目录时，两个字段都必须是 `null`（不是空串）。
+    #[test]
+    fn config_and_download_dir_are_null_when_absent() {
+        let dir = TempDir::new("paths-absent");
+        let status = ServiceStatus::starting("0.1.3", "2026-11-26T02:33:34.510Z")
+            .stamped_at("2026-11-26T02:34:00.000Z");
+        let path = write(dir.path(), &status).expect("写");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("读")).expect("JSON");
+        assert!(value["config_path"].is_null(), "{value}");
+        assert!(value["download_dir"].is_null(), "{value}");
+        assert_eq!(value["core_source"], serde_json::json!("none"));
     }
 
     /// ② 原子写：成功后不留 `.tmp`；重复写也只留一个正式文件。
@@ -420,12 +472,15 @@ mod tests {
     }
 
     /// 序列化结果**绝不**出现机密词（模块文档的内容边界，回归即失败）。
+    ///
+    /// 注意 `download_dir` 字段名本身含 `download`（M5-f 明确要求加它），所以断言表里
+    /// 不再包含 `download`；但**值**里也不许出现机密形态（secret/token/password）。
     #[test]
     fn serialized_form_carries_no_secrets() {
         let status = sample();
         let text = serde_json::to_string(&status).expect("序列化");
         let lower = text.to_ascii_lowercase();
-        for word in ["secret", "token", "password", "passwd", "auth", "download"] {
+        for word in ["secret", "token", "password", "passwd", "auth"] {
             assert!(!lower.contains(word), "状态文件不该出现 {word:?}：{text}");
         }
     }

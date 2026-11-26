@@ -288,6 +288,10 @@ pub struct StatusTarget<'a> {
     pub dir: &'a std::path::Path,
     /// 服务二进制版本（写进 `service_version`）。
     pub service_version: &'a str,
+    /// M5-f：服务实际读到的配置文件绝对路径（内置默认时 `None` → 写 `null`）。
+    pub config_path: Option<&'a str>,
+    /// M5-f：服务实际下发给 aria2c 的下载目录（没有核心或被护栏拒绝时 `None`）。
+    pub download_dir: Option<&'a str>,
 }
 
 /// 生命周期里写 `status.json` 的那一层（M5-e）。
@@ -310,6 +314,9 @@ struct StatusWriter<'a> {
     started_at: String,
     /// 最近一次探到的核心版本（点 4 要写「仍有核心」时的版本；来源与 PID 仍现取）。
     core_version: Option<String>,
+    /// M5-f：本次服务会话的配置来源与下载目录（常量，整个会话不变）。
+    config_path: Option<String>,
+    download_dir: Option<String>,
 }
 
 impl<'a> StatusWriter<'a> {
@@ -320,12 +327,16 @@ impl<'a> StatusWriter<'a> {
             log,
             started_at: utc_stamp(std::time::SystemTime::now()),
             core_version: None,
+            config_path: target.config_path.map(str::to_owned),
+            download_dir: target.download_dir.map(str::to_owned),
         }
     }
 
     /// 落一份快照并盖上「现在」。写失败只留 WARN（[`status_file::write_or_warn`] 内部处理）。
     fn commit(&mut self, status: crate::status_file::ServiceStatus) {
-        let status = status.stamped_at(utc_stamp(std::time::SystemTime::now()));
+        let status = status
+            .with_paths(self.config_path.clone(), self.download_dir.clone())
+            .stamped_at(utc_stamp(std::time::SystemTime::now()));
         crate::status_file::write_or_warn(self.dir, &status, self.log);
     }
 
@@ -516,6 +527,8 @@ fn report_all(
 mod tests {
     use super::*;
 
+    /// 测试用的配置路径（raw string：避免 Windows 分隔符转义歧义）。
+    const CONFIG_PATH: &str = r"C:\Users\alice\AppData\Roaming\AriaHost\config.toml";
     /// 假 Supervisor：可配置成功/失败，记录被调次数。
     #[derive(Default)]
     struct FakeSupervisor {
@@ -1025,6 +1038,8 @@ mod tests {
         let target = StatusTarget {
             dir: dir.dir(),
             service_version: "0.1.3",
+            config_path: Some(CONFIG_PATH),
+            download_dir: Some("D:\\Downloads\\aria2"),
         };
         drive_service_with_status(
             supervisor,
@@ -1051,8 +1066,22 @@ mod tests {
         assert_eq!(after["core_source"], serde_json::json!("none"));
         assert!(after["core_version"].is_null(), "{after}");
         assert!(after["aria2_pid"].is_null(), "停止后不许留已死的 PID");
-        assert_eq!(after["schema_version"], serde_json::json!(1));
+        assert_eq!(after["schema_version"], serde_json::json!(2));
         assert_eq!(after["service_version"], serde_json::json!("0.1.3"));
+
+        // M5-f：配置来源与下载目录是会话常量——点 4 与点 3 都必须带着它们。
+        for (label, value) in [("点 4", &before), ("点 3", &after)] {
+            assert_eq!(
+                value["config_path"],
+                serde_json::json!(CONFIG_PATH),
+                "{label}必须带着命中的配置路径"
+            );
+            assert_eq!(
+                value["download_dir"],
+                serde_json::json!(r"D:\Downloads\aria2"),
+                "{label}必须带着下发的下载目录"
+            );
+        }
 
         // started_at 是会话常量：点 4 与点 3 必须一致（面板靠它认「同一次启动」）。
         assert_eq!(
@@ -1074,6 +1103,8 @@ mod tests {
         let target = StatusTarget {
             dir: dir.dir(),
             service_version: "0.1.3",
+            config_path: Some(CONFIG_PATH),
+            download_dir: Some("D:\\Downloads\\aria2"),
         };
 
         let error = drive_service_with_status(
@@ -1114,6 +1145,8 @@ mod tests {
             Some(StatusTarget {
                 dir: &blocker,
                 service_version: "0.1.3",
+                config_path: None,
+                download_dir: None,
             }),
         );
         assert!(outcome.is_ok(), "写不出状态文件不能拖垮服务：{outcome:?}");

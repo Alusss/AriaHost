@@ -14,6 +14,43 @@ use crate::{InstallOutcome, ServiceError, ServiceState, UninstallOutcome};
 /// 服务形态启动参数（SCM `binPath` 的尾部）。
 pub const SERVICE_ARGUMENT: &str = "--service";
 
+/// M5-f：安装器传「安装用户的配置路径」用的环境变量名。
+///
+/// 为什么走环境变量而不是命令行参数：`--install-service` 的**参数契约在
+/// `crates/ariahost/src/cli.rs`**（本批写域之外），而安装器早已用 cmd 包了一层提权调用——
+/// 在那里 `set AH_CONFIG_PATH=<安装用户算好的字面路径> && ...` 是最小改动。
+///
+/// 为什么必须是「安装用户算好的字面路径」：提权后进程的 `%APPDATA%` 可能属于**另一个**
+/// 管理员账户；助手自己展开会指到别人家里去（那正是 M5-f 这个 P0 的同类问题）。
+pub const CONFIG_PATH_ENV: &str = "AH_CONFIG_PATH";
+
+/// 读安装器传进来的配置路径（绝对路径才算数；其它形态当没传）。
+pub fn requested_config_path() -> Option<std::path::PathBuf> {
+    config_path_from(std::env::var_os(CONFIG_PATH_ENV).as_deref())
+}
+
+/// [`requested_config_path`] 的判据本体（拆出来才能在 Linux 门禁里单测：
+/// 单测改环境变量在并行测试下不安全，Rust 2024 起还是 `unsafe`）。
+pub fn config_path_from(raw: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let raw = raw?;
+    let text = raw.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 只接受绝对路径：相对路径在这里没有任何合理含义（助手的工作目录是 system32）。
+    let bytes = trimmed.as_bytes();
+    let drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let unc = trimmed.starts_with("\\\\");
+    if !drive_absolute && !unc {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
 // ---- Win32 错误码（只列本模块要区分的） ----
 /// `ERROR_ACCESS_DENIED`：需要管理员。
 pub const ERROR_ACCESS_DENIED: i32 = 5;
@@ -279,5 +316,38 @@ mod tests {
         assert_eq!(delays, vec![1, 2, 4], "架构 §5：1s → 2s → 4s");
         assert_eq!(failure_reset_period(), Duration::from_secs(3600));
         assert!(!SERVICE_DESCRIPTION.is_empty());
+    }
+
+    // ---- M5-f：安装器传进来的配置路径 --------------------------------------
+
+    #[test]
+    fn config_path_env_only_accepts_absolute_paths() {
+        use std::ffi::OsStr;
+
+        let ok = config_path_from(Some(OsStr::new(
+            r"C:\Users\alice\AppData\Roaming\AriaHost\config.toml",
+        )))
+        .expect("盘符绝对路径必须接受");
+        assert_eq!(
+            ok,
+            std::path::PathBuf::from(r"C:\Users\alice\AppData\Roaming\AriaHost\config.toml")
+        );
+
+        // 前后空白要吃掉（cmd 的 set 会把空格一起带进来）。
+        let padded = config_path_from(Some(OsStr::new("  D:/AriaHost/config.toml  ")))
+            .expect("前后空白要 trim");
+        assert_eq!(padded, std::path::PathBuf::from("D:/AriaHost/config.toml"));
+
+        // UNC 路径也接受。
+        assert!(config_path_from(Some(OsStr::new(r"\\server\share\config.toml"))).is_some());
+
+        // 相对路径 / 空 / 缺失一律当没传（助手的工作目录是 system32，相对路径等于随机位置）。
+        for bad in ["config.toml", r"AriaHost\config.toml", "", "   "] {
+            assert!(
+                config_path_from(Some(OsStr::new(bad))).is_none(),
+                "不该接受 {bad:?}"
+            );
+        }
+        assert!(config_path_from(None).is_none());
     }
 }
