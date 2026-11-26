@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use ariahost_common::config::{
-    download_dir_for_service_with, Config, ConfigErrorKind, DlSection, ServiceDirGuards,
+    download_dir_for_service_with, download_dir_for_service_with_guards, Config, ConfigErrorKind,
+    DlSection, ServiceDirGuards,
 };
 use ariahost_core::runtime::{render_conf, RuntimePaths};
 
@@ -62,22 +63,35 @@ fn user_configured_dir_reaches_the_rendered_aria2_conf() {
     );
 }
 
-/// 用户把目录设成默认的 `~/Downloads`：展开到**当前进程**的用户目录，
-/// 而不是 SYSTEM 的 systemprofile（Linux 门禁上是 `$HOME`，等价语义）。
+/// 用户把目录设成默认的 `~/Downloads`：展开用**注入的主目录**，并且真的进了守卫。
+///
+/// 这一条以前是「假绿」：它拿当前进程的 `~` 展开结果去比字符串，Linux 门禁上
+/// 恒真、且**守卫根本没被执行到**（Windows 形态路径在 Linux 上不会被展开）。
+/// 现在走注入式入口 `download_dir_for_service_with_guards(config, guards, home)`：
+/// 注入 SYSTEM 形态的主目录 → 必须被拒；注入普通用户主目录 → 必须放行。
 #[test]
-fn tilde_dir_expands_to_the_current_user_not_to_systemprofile() {
+fn tilde_dir_expands_through_the_injected_home_and_really_hits_the_guard() {
     let config = config_with_dir("~/Downloads/aria2");
-    let resolved = download_dir_for_service_with(&config, &guards()).expect("展开后放行");
-    let text = resolved.display().to_string();
+
+    // ① 服务身份的主目录 = SYSTEM 的 profile → `~` 展开后必须被守卫拦下。
+    let system_profile = Path::new(r"C:\WINDOWS\system32\config\systemprofile");
+    let error = download_dir_for_service_with_guards(&config, &guards(), Some(system_profile))
+        .expect_err("服务身份下 ~ 展开到 systemprofile，必须拒");
     assert!(
-        !text.to_ascii_lowercase().contains("systemprofile"),
-        "绝不能落到 systemprofile：{text}"
+        error.to_string().contains("systemprofile"),
+        "错误里要点名 systemprofile：{error}"
     );
-    assert!(
-        text.ends_with("Downloads/aria2") || text.ends_with("Downloads\\aria2"),
-        "{text}"
+    println!("INJECTED_HOME_REFUSED {error}");
+
+    // ② 普通用户主目录 → 放行，且结果就是那个绝对路径。
+    let user_home = Path::new(r"C:\Users\alice");
+    let resolved = download_dir_for_service_with_guards(&config, &guards(), Some(user_home))
+        .expect("用户主目录下的 ~ 必须放行");
+    assert_eq!(
+        resolved,
+        std::path::PathBuf::from(r"C:\Users\alice\Downloads\aria2")
     );
-    println!("EXPANDED_DIR {text}");
+    println!("INJECTED_HOME_DIR {}", resolved.display());
 }
 
 /// 反过来：护栏命中的目录在**渲染之前**就被拒，绝不会写进 conf。

@@ -147,30 +147,39 @@ fn establish_and_drive(log: &ServiceLog) -> Result<(), ServiceError> {
         service_version: env!("CARGO_PKG_VERSION"),
         config_path: config_path_text.as_deref(),
         download_dir: Some(download_dir_text.as_str()),
+        // 走到这里说明配置已经读成功了（坏配置在上面的 from_env 里就 StartupFailed 了）。
+        config_error: None,
     });
     drive_service_with_status(supervisor, &sink, &command_receiver, log, target)
 }
 
-/// M5-f：**启动前**就失败时也落一份 `status.json`。
+/// M5-f/M6-bA：**启动前**就失败时也落一份 `status.json`。
 ///
-/// 为什么需要：护栏拒绝下载目录时，服务在 `drive_service` 之前就退出了——那份「四个挂钩点」
-/// 的状态文件根本不会产生。面板会看到「服务没起来」却不知道为什么；写一份
-/// `core_source=none` + `config_path`（命中的那级）+ `download_dir=null` 就能立刻指向配置问题。
+/// 为什么需要：护栏拒绝下载目录、或配置坏到不能启动时，服务在 `drive_service` 之前就退出了
+/// ——那份「四个挂钩点」的状态文件根本不会产生。面板会看到「服务没起来」却不知道为什么；
+/// 写一份 `core_source=none` + `config_path` + `download_dir=null` + `config_error` 就能
+/// 直接指向问题。
+///
+/// 关于「无配置文件 → 内置默认 + WARN」那条：它**看起来**像「服务在用默认配置跑」，
+/// 但实际上内置默认的 `dl.dir` 是 `~/Downloads`，按 SYSTEM 展开就是
+/// `…\config\systemprofile\Downloads` → 一定命中下面的 `systemprofile` 守卫 → 服务照样
+/// 起不来。也就是说：**没有配置文件时服务根本不会用默认值成功启动**，那条 WARN 只是
+/// 把「为什么起不来」说清楚，别误读成「有默认配置兜底」。
 ///
 /// 写失败只留 WARN（状态文件是观测手段，不能反过来影响错误传播）。
-fn write_startup_status(log: &ServiceLog, config_path: Option<&Path>, download_dir: Option<&Path>) {
+///
+/// 这里只负责「算目录」；快照的构造与写入在 [`crate::status_file::write_startup_status`]
+/// ——**同一份实现**给 Linux 门禁单测，避免两处各写一遍而漂移。
+fn write_startup_status(
+    log: &ServiceLog,
+    config_path: Option<&Path>,
+    download_dir: Option<&Path>,
+    config_error: Option<&str>,
+) {
     let Some(dir) = ariahost_common::paths::service_runtime_dir() else {
         return;
     };
-    let status = crate::status_file::ServiceStatus::starting(
-        env!("CARGO_PKG_VERSION"),
-        ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
-    )
-    .with_paths(
-        config_path.map(|path| path.display().to_string()),
-        download_dir.map(|path| path.display().to_string()),
-    );
-    crate::status_file::write_or_warn(&dir, &status, log);
+    crate::status_file::write_startup_status(&dir, log, config_path, download_dir, config_error);
 }
 
 /// 送一条命令进工作线程；通道断了（进程正在退出）如实回服务不可用，不 panic。
@@ -292,6 +301,33 @@ impl Aria2Supervisor {
             }
         }
         let config_path = loaded.config_path().map(Path::to_path_buf);
+
+        // M6-bA（C 条）：配置**坏**（文件在、但读不动 / TOML 坏）不许静默回默认。
+        //
+        // `load_for_service` 会把这类失败记成 Error 级 note 并继续下一级——「继续」的
+        // 后果是服务拿一份**用户没设过**的配置跑起来（正是 M5-f 那个 P0 的形态）。
+        // 这里把它升级成启动失败，并把同一段文案写进 status.json：面板要能一眼看到
+        // 「是配置坏了」，而不是只看到「服务没起来」。
+        //
+        // 与之相对的一条（无配置文件 → 内置默认 + WARN）保持不变，但请读
+        // [`write_startup_status`] 的注释：那种情况实际会被下面的 dl.dir 守卫拦住，
+        // 不是真的在用默认配置跑。
+        if let Some(detail) = loaded
+            .notes
+            .iter()
+            .find(|note| note.level == config_layer::ConfigNoteLevel::Error)
+            .map(|note| note.text.clone())
+        {
+            log.error(&format!(
+                "配置文件读不了，服务拒绝以「内置默认值」启动：{detail}"
+            ));
+            write_startup_status(log, config_path.as_deref(), None, Some(&detail));
+            return Err(ServiceError::StartupFailed {
+                code: ErrorCode::ConfigIoFailed,
+                detail,
+            });
+        }
+
         let mut config = loaded.config;
 
         let paths = RuntimePaths::service().ok_or_else(|| ServiceError::Unavailable {
@@ -317,12 +353,13 @@ impl Aria2Supervisor {
         let download_dir = match config_layer::download_dir_for_service(&config) {
             Ok(dir) => dir,
             Err(error) => {
-                log.error(&format!(
+                let detail = format!(
                     "下载目录被拒绝（fail-closed，{}）：{error}；服务拒绝启动 aria2c，\
                      以免把文件写进系统目录",
                     error.code().map(|code| code.code()).unwrap_or("无码")
-                ));
-                write_startup_status(log, config_path.as_deref(), None);
+                );
+                log.error(&detail);
+                write_startup_status(log, config_path.as_deref(), None, Some(&detail));
                 return Err(ServiceError::StartupFailed {
                     code: error.code().unwrap_or(ErrorCode::Usage),
                     detail: format!("{error}（服务模式拒绝启动：请把下载目录改到自己的目录）"),
@@ -468,28 +505,37 @@ pub fn install(exe_path: &Path) -> Result<InstallOutcome, ServiceError> {
     // 描述与失败动作都属「锦上添花」：写不进去不至于让安装失败（SCM 走默认行为）。
     let _ = service.set_description(install::SERVICE_DESCRIPTION);
     let _ = service.update_failure_actions(failure_actions());
-    // M5-f：把「安装用户的 config.toml」记进 `Parameters\ConfigPath`。
+    // M5-f/M6-bA：把「服务要读的那份 config.toml」记进 `Parameters\ConfigPath`。
     //
     // 为什么在这里写而不是安装器里写：`Parameters` 在 HKLM 下，per-user 安装的
     // 安装器没有管理员权限（`WriteRegStr HKLM` 会静默失败）；而这里是**提权助手内部**，
     // 既在管理员上下文、又刚确认服务建好了。
     //
-    // 路径由安装器通过环境变量 `AH_CONFIG_PATH` 传进来——必须是**安装用户**算好的字面路径：
-    // 提权后 `%APPDATA%` 可能属于另一个管理员账户，助手自己展开会指错人。
-    // 写失败不阻断安装（服务仍可用，只是会退回机器级/默认配置并记 WARN）。
-    match install::requested_config_path() {
-        Some(path) => match write_parameters_config_path(&path) {
-            Ok(()) => {}
-            Err(detail) => {
-                // 服务已经建好了，这里只提醒；SCM 状态才是安装成败的事实来源。
-                eprintln!("警告：写 Parameters\\ConfigPath 失败（服务仍已注册）：{detail}");
+    // M6-bA 起配置路径不再只靠外部喂（`AH_CONFIG_PATH`）：面板「一键装服务」不传它，
+    // 结果是注册表不写 → 服务侧第 1/2 级全空 → 内置默认 → `dl.dir` 落在 SYSTEM 的
+    // profile → 守卫拦下 → **装完起不来**（那个 P0）。现在统一走
+    // [`install::resolve_service_config`]：有 env 就校验着用、没有就自算并自建。
+    match install::resolve_service_config() {
+        Ok(ready) => {
+            for note in &ready.notes {
+                eprintln!("服务配置：{note}");
             }
-        },
-        None => {
-            eprintln!(
-                "提示：没有收到 AH_CONFIG_PATH（安装器未传），服务的配置将回退到\
-                 %ProgramData%\\AriaHost\\config.toml 或内置默认值"
-            );
+            if let Err(detail) = write_parameters_config_path(&ready.path) {
+                // 服务已经建好了，这里只提醒；SCM 状态才是安装成败的事实来源。
+                eprintln!(
+                    "警告：写 Parameters\\ConfigPath 失败（服务仍已注册）：{detail}；\
+                     服务将退回机器级/内置默认配置并记 WARN"
+                );
+            }
+        }
+        Err(problem) => {
+            // **fail-closed**：配置不满足服务侧要求就不注册。宁可让用户看到一条
+            // 「改哪里、改成什么」的文案，也不要装出一个必然起不来的服务。
+            let message = problem.message();
+            eprintln!("拒绝注册服务：{message}");
+            // 服务已创建 → 先删掉，别留一个起不来的半状态。
+            let _ = service.delete();
+            return Err(ServiceError::Unavailable { detail: message });
         }
     }
     Ok(InstallOutcome::Created)

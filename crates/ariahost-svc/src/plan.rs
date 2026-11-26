@@ -292,6 +292,8 @@ pub struct StatusTarget<'a> {
     pub config_path: Option<&'a str>,
     /// M5-f：服务实际下发给 aria2c 的下载目录（没有核心或被护栏拒绝时 `None`）。
     pub download_dir: Option<&'a str>,
+    /// M6-bA：配置坏到服务起不来时的原因摘要（正常运行时 `None`）。
+    pub config_error: Option<&'a str>,
 }
 
 /// 生命周期里写 `status.json` 的那一层（M5-e）。
@@ -317,6 +319,8 @@ struct StatusWriter<'a> {
     /// M5-f：本次服务会话的配置来源与下载目录（常量，整个会话不变）。
     config_path: Option<String>,
     download_dir: Option<String>,
+    /// M6-bA：配置错误摘要（常量；正常运行时为空）。
+    config_error: Option<String>,
 }
 
 impl<'a> StatusWriter<'a> {
@@ -329,6 +333,7 @@ impl<'a> StatusWriter<'a> {
             core_version: None,
             config_path: target.config_path.map(str::to_owned),
             download_dir: target.download_dir.map(str::to_owned),
+            config_error: target.config_error.map(str::to_owned),
         }
     }
 
@@ -336,6 +341,7 @@ impl<'a> StatusWriter<'a> {
     fn commit(&mut self, status: crate::status_file::ServiceStatus) {
         let status = status
             .with_paths(self.config_path.clone(), self.download_dir.clone())
+            .with_config_error(self.config_error.clone())
             .stamped_at(utc_stamp(std::time::SystemTime::now()));
         crate::status_file::write_or_warn(self.dir, &status, self.log);
     }
@@ -1040,6 +1046,7 @@ mod tests {
             service_version: "0.1.3",
             config_path: Some(CONFIG_PATH),
             download_dir: Some("D:\\Downloads\\aria2"),
+            config_error: None,
         };
         drive_service_with_status(
             supervisor,
@@ -1066,7 +1073,7 @@ mod tests {
         assert_eq!(after["core_source"], serde_json::json!("none"));
         assert!(after["core_version"].is_null(), "{after}");
         assert!(after["aria2_pid"].is_null(), "停止后不许留已死的 PID");
-        assert_eq!(after["schema_version"], serde_json::json!(2));
+        assert_eq!(after["schema_version"], serde_json::json!(3));
         assert_eq!(after["service_version"], serde_json::json!("0.1.3"));
 
         // M5-f：配置来源与下载目录是会话常量——点 4 与点 3 都必须带着它们。
@@ -1105,6 +1112,7 @@ mod tests {
             service_version: "0.1.3",
             config_path: Some(CONFIG_PATH),
             download_dir: Some("D:\\Downloads\\aria2"),
+            config_error: None,
         };
 
         let error = drive_service_with_status(
@@ -1147,6 +1155,7 @@ mod tests {
                 service_version: "0.1.3",
                 config_path: None,
                 download_dir: None,
+                config_error: None,
             }),
         );
         assert!(outcome.is_ok(), "写不出状态文件不能拖垮服务：{outcome:?}");

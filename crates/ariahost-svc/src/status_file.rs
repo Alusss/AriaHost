@@ -55,7 +55,9 @@ pub const STATUS_FILE_NAME: &str = "status.json";
 ///
 /// - 1：M5-e 初版（七字段）。
 /// - 2：M5-f 追加 `config_path` / `download_dir`（服务模式「用的是哪份配置、下载到哪」）。
-pub const STATUS_SCHEMA_VERSION: u32 = 2;
+/// - 3：M6-bA 追加 `config_error`（配置坏到服务起不来时，面板要能看到原因，
+///   而不是只看到「服务没起来」）。
+pub const STATUS_SCHEMA_VERSION: u32 = 3;
 
 /// 核心来源（写进文件的 `core_source`）。
 ///
@@ -124,6 +126,13 @@ pub struct ServiceStatus {
     ///
     /// - `null` = 没有核心在跑，或下载目录被护栏拒绝而没下发（原因在 `service.log`）。
     pub download_dir: Option<String>,
+    /// 配置坏到服务起不来时的原因摘要（M6-bA）。
+    ///
+    /// - `null` = 配置没问题（或还没到读配置那一步）。
+    /// - 非空 = 服务在 `drive_service` 之前就退出了；面板据此直接告诉用户「配置坏了，
+    ///   坏在哪」——否则用户只会看到「服务没起来」而不知道去看 `config.toml`。
+    ///   文案与 `service.log` 里的 ERROR 行同源（同一段字符串，不许两边各写一份）。
+    pub config_error: Option<String>,
 }
 
 impl ServiceStatus {
@@ -143,6 +152,7 @@ impl ServiceStatus {
             updated_at: ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
             config_path: None,
             download_dir: None,
+            config_error: None,
         }
     }
 
@@ -153,6 +163,12 @@ impl ServiceStatus {
     pub fn with_paths(mut self, config_path: Option<String>, download_dir: Option<String>) -> Self {
         self.config_path = config_path;
         self.download_dir = download_dir;
+        self
+    }
+
+    /// 填「配置坏在哪」（M6-bA）。
+    pub fn with_config_error(mut self, config_error: Option<String>) -> Self {
+        self.config_error = config_error;
         self
     }
 
@@ -250,6 +266,37 @@ pub fn write_or_warn(
     }
 }
 
+/// **启动前**就失败时落的那一份快照（M5-f 护栏 / M6-bA 坏配置）。
+///
+/// 为什么需要：这类失败发生在 `drive_service` 之前——「四个挂钩点」那份状态文件根本不会
+/// 产生。面板会看到「服务没起来」却不知道为什么；写一份 `core_source=none` +
+/// `config_path` + `download_dir=null` + `config_error` 就能直接指向问题。
+///
+/// 关于「无配置文件 → 内置默认 + WARN」：它**看起来**像兜底，但内置默认的 `dl.dir`
+/// 是 `~/Downloads`，按 SYSTEM 展开就是 `…\config\systemprofile\Downloads` → 一定命中
+/// `systemprofile` 守卫 → 服务照样起不来。也就是说：**没有配置文件时服务不会靠默认值
+/// 成功启动**，那条 WARN 只是把「为什么起不来」说清楚。
+///
+/// 参数显式化（目录 + 日志 + 三个字段）是为了 Linux 门禁能单测它，不必起真服务。
+pub fn write_startup_status(
+    dir: &Path,
+    log: &dyn crate::log::LogSink,
+    config_path: Option<&Path>,
+    download_dir: Option<&Path>,
+    config_error: Option<&str>,
+) {
+    let status = ServiceStatus::starting(
+        env!("CARGO_PKG_VERSION"),
+        ariahost_common::time::utc_stamp(std::time::SystemTime::now()),
+    )
+    .with_paths(
+        config_path.map(|path| path.display().to_string()),
+        download_dir.map(|path| path.display().to_string()),
+    )
+    .with_config_error(config_error.map(str::to_owned));
+    write_or_warn(dir, &status, log);
+}
+
 /// 给状态文件设「Users 读 + SYSTEM 写」的显式 DACL（**best-effort**）。
 ///
 /// 现状：Windows 分支尚未启用显式 DACL（见模块文档「机密为什么可以放宽读权限」）——
@@ -263,13 +310,14 @@ fn apply_acl(_path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn apply_acl(_path: &Path) -> Result<(), String> {
-    // TODO(M5-e)：显式 DACL（Users 读 + SYSTEM 写）。
-    // 需要 windows-sys 的 `Win32_Security_Authorization`（`SetNamedSecurityInfoW` /
-    // `ConvertStringSecurityDescriptorToSecurityDescriptorW`）；当前 workspace 的
-    // windows-sys 只开了 Foundation / Storage_FileSystem / JobObjects / Threading /
-    // Security_Cryptography 五个 feature，不含它。按约定「workspace 依赖变更先报 Lead」
-    // 未擅自改根 Cargo.toml，本批先依赖 ProgramData 的默认继承（Users 可读、
-    // 仅 SYSTEM/Administrators 可写，与 secret.bin 一致）。
+    // **故意不显式设 DACL**（M6-bA 裁定）：这份文件靠 `%ProgramData%\AriaHost\` 的**继承**
+    // ACL 就够——继承结果恰好是 `SYSTEM:F` + `BUILTIN\Users:(RX)`，也就是「服务能写、
+    // 面板（普通用户）能读」。显式设 DACL 只有坏处、没有安全收益：
+    //   * 写错一个 ACE，面板就读不到 `status.json`（用户侧功能直接坏），
+    //   * 文件内容本来就按模块文档的边界裁剪过（无 secret/token/密码/下载凭据），
+    //     放宽「Users 读」不构成新弱点。
+    // 与 `secret.bin` 的分野：那个是**密文**且只有 SYSTEM 解（M5-g 才需要显式收紧并去继承）。
+    // 一句话：**status.json 依赖继承，故意不设**；别照着 secret.bin 的样子给它加 DACL。
     Ok(())
 }
 
@@ -322,7 +370,7 @@ mod tests {
         println!("STATUS_JSON {text}");
         let value: serde_json::Value = serde_json::from_str(&text).expect("合法 JSON");
 
-        assert_eq!(value["schema_version"], serde_json::json!(2));
+        assert_eq!(value["schema_version"], serde_json::json!(3));
         assert_eq!(value["service_version"], serde_json::json!("0.1.3"));
         assert_eq!(value["core_source"], serde_json::json!("managed"));
         assert_eq!(value["core_version"], serde_json::json!("1.37.0"));
@@ -344,9 +392,9 @@ mod tests {
             value["download_dir"],
             serde_json::json!("D:\\Downloads\\aria2")
         );
-        // 契约就是这九个键，多一个少一个都不行。
+        // 契约就是这十个键，多一个少一个都不行。
         let keys: Vec<&String> = value.as_object().expect("对象").keys().collect();
-        assert_eq!(keys.len(), 9, "契约字段数变了：{keys:?}");
+        assert_eq!(keys.len(), 10, "契约字段数变了：{keys:?}");
     }
 
     /// M5-f：内置默认 / 没下发下载目录时，两个字段都必须是 `null`（不是空串）。
@@ -471,9 +519,56 @@ mod tests {
         assert!(quiet.warn_lines().is_empty(), "成功时不该有 WARN");
     }
 
+    /// M6-bA：启动前失败（护栏拒绝 / 坏配置）那份状态必须是「无核心 + 下载目录 null +
+    /// 带原因」，否则面板只能看到「服务没起来」。
+    #[test]
+    fn startup_failure_status_is_null_download_dir_plus_the_reason() {
+        let dir = TempDir::new("startup-failure");
+        let log = RecordingLog::default();
+        let config = std::path::Path::new(r"C:\Users\alice\AppData\Roaming\AriaHost\config.toml");
+        let reason = "下载目录被拒绝（fail-closed，AH-E1001）：落在 systemprofile";
+
+        write_startup_status(dir.path(), &log, Some(config), None, Some(reason));
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(STATUS_FILE_NAME)).expect("读回"),
+        )
+        .expect("合法 JSON");
+
+        assert_eq!(value["schema_version"], serde_json::json!(3));
+        assert_eq!(value["core_source"], serde_json::json!("none"));
+        assert!(value["aria2_pid"].is_null(), "启动前失败不该有 PID");
+        assert!(
+            value["download_dir"].is_null(),
+            "被守卫拒绝时 download_dir 必须是 null，不能是那个被拒的路径：{value}"
+        );
+        assert_eq!(
+            value["config_path"],
+            serde_json::json!(r"C:\Users\alice\AppData\Roaming\AriaHost\config.toml"),
+            "配置路径要留着——面板才知道去看哪份文件"
+        );
+        assert_eq!(value["config_error"], serde_json::json!(reason));
+        assert!(log.warn_lines().is_empty(), "正常写入不该有 WARN");
+    }
+
+    /// 写失败时也只是 WARN（启动前失败这条路径同样不能反过来把服务搞挂）。
+    #[test]
+    fn startup_failure_status_degrades_to_a_warning() {
+        let dir = TempDir::new("startup-failure-unwritable");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("造占位文件");
+        let log = RecordingLog::default();
+
+        write_startup_status(&blocker, &log, None, None, Some("坏配置"));
+
+        let warns = log.warn_lines();
+        assert_eq!(warns.len(), 1, "必须且只记一条 WARN：{warns:?}");
+        assert!(warns[0].contains("降级"), "{warns:?}");
+    }
+
     /// 序列化结果**绝不**出现机密词（模块文档的内容边界，回归即失败）。
     ///
-    /// 注意 `download_dir` 字段名本身含 `download`（M5-f 明确要求加它），所以断言表里
+    /// 注意 `download_dir` 字段名本身含 `download`（M5-f 明确要求加它），所以关键词表
     /// 不再包含 `download`；但**值**里也不许出现机密形态（secret/token/password）。
     #[test]
     fn serialized_form_carries_no_secrets() {
