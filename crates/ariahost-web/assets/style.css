@@ -85,8 +85,17 @@
   }
 }
 
+/* 内容列的**宽度上限与水平居中在 body**：顶部标题（h1）与卡片同处一个流里，
+   两边留白用 auto，所以 360~1920 之间都是「内容列居中 + 左右各 24px 内边距」。
+   为什么不放 main：main 只管内容区，header 在它外面，放 main 会只居中卡片、标题仍在左边。 */
+html {
+  /* body 收窄后页面两侧露出的画布仍要是页面底色（否则 1920 下出现白条）。 */
+  background: var(--bg);
+}
+
 body {
-  margin: 0;
+  max-width: 1080px;
+  margin: 0 auto;
   padding: 16px 24px 48px;
   background: var(--bg);
   color: var(--text);
@@ -127,9 +136,7 @@ h2 {
   color: var(--bad);
 }
 
-main {
-  max-width: 1080px;
-}
+/* main 不再自带 max-width：宽度上限与居中统一由 body 负责（见上）。 */
 
 /* ---- 卡片：替代页面级分割线（规格 §4.1）---- */
 /* 控件必须放进卡片：--border-strong 只保证在 --card 上过 3:1。 */
