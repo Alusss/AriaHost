@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ariahost-aria2",
  "ariahost-common",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-aria2"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ariahost-common",
  "serde",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-common"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "toml 1.2.2+spec-1.1.0",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ariahost-aria2",
  "ariahost-common",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-svc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ariahost-common",
  "ariahost-core",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-ui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ariahost-aria2",
  "ariahost-common",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "ariahost-web"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ariahost-common",
  "serde_json",
