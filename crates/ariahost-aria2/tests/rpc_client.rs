@@ -579,7 +579,14 @@ fn semantic_methods_use_expected_wire_names_and_params() {
     assert_eq!(requests[6]["params"], json!(["token:tok", "gid-1"]));
 }
 
-/// 判据 #2 的配套：`worker.rs` 要写 `tell_stopped(-N, N)` 取最近 N 条。
+/// 判据 #2 的配套：`worker.rs` 要取「最近 N 条已经停止的任务」，正确写法是
+/// `tell_stopped(-1, N)` —— `offset = -1` 表示从最新一条开始向更旧取 N 条。
+///
+/// 别写成 `-N`：aria2 的 `offset = -k` 是「从倒数第 k 条起向更旧取」，`(-N, N)` 会取到
+/// 「第 N 新 ~ 第 2N-1 新」这一带，已停止数 ≤ N-1 时返回空（1.37.0 实测，
+/// 见 `.scratch/wasm-taskfix/review-n2.md` F1）。本条测试只固化 wire 参数形状，
+/// 不引入依赖真实 aria2c/端口的集成测试（语义由上述实测定案）。
+///
 /// 负 offset 必须原样进 JSON（历史上这里曾把参数定成 `u32`，负数根本传不进来）。
 #[test]
 fn tell_stopped_accepts_negative_offset() {
@@ -589,12 +596,12 @@ fn tell_stopped_accepts_negative_offset() {
     });
 
     let client = server.client(Some("tok"));
-    assert!(client.tell_stopped(-5, 25).expect("tellStopped").is_empty());
+    assert!(client.tell_stopped(-1, 25).expect("tellStopped").is_empty());
 
     let requests = server.finish();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], "aria2.tellStopped");
-    assert_eq!(requests[0]["params"], json!(["token:tok", -5, 25]));
+    assert_eq!(requests[0]["params"], json!(["token:tok", -1, 25]));
 }
 
 // ---------------------------------------------------------------------------

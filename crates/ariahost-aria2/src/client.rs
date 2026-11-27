@@ -395,7 +395,15 @@ impl RpcClient {
     /// 结果是 FIFO 队列，长度受 `--max-download-result` 约束（默认 1000），所以**不能**当作
     /// 完整历史：面板的「已停止」列表必须自建持久化，RPC 只当增量来源。
     ///
-    /// 负 offset = 从最新倒数，与 `tell_waiting` 语义一致（`worker.rs` 用 `-N, N` 取最近 N 条）。
+    /// 负 offset 的真实语义（aria2c 1.37.0 实测，见 `.scratch/wasm-taskfix/review-n2.md` F1）：
+    /// `offset = -k` 表示**从倒数第 k 条开始、向更旧的方向**取 `num` 条（跳过最新 k-1 条），
+    /// 结果按**最新在前**排列；条数不足 `num` 时按实际条数返回。
+    ///
+    /// 因此「最近 num 条」= `offset = -1`，**不是** `-num`：
+    /// `(-num, num)` 取的是「第 num 新 ~ 第 2num-1 新」这一带，总条数 ≤ num-1 时直接返回空数组。
+    ///
+    /// 5 条 a..e（e 最新）实测：`(-1, 25)` → e d c b a；`(-2, 25)` → d c b a；
+    /// `(-5, 25)` → 仅 a；`(0, 25)` → a b c d e（最旧→最新）。
     pub fn tell_stopped(&self, offset: i64, num: u32) -> Result<Vec<Value>, RpcCallError> {
         self.call_typed(METHOD_TELL_STOPPED, vec![json!(offset), json!(num)])
     }

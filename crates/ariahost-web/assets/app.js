@@ -228,7 +228,10 @@ async function tick() {
     const [active, waiting, stopped, stat] = await Promise.all([
       rpc("aria2.tellActive", [FIELDS]),
       rpc("aria2.tellWaiting", [0, 100, FIELDS]),
-      rpc("aria2.tellStopped", [-100, 100, FIELDS]),
+      // tellStopped 的 offset 语义：0 = 从最旧端取；-k = 从倒数第 k 条向更旧取。
+      // 想拿「最近 100 条」只有 -1 这一个写法；写成 -100 会取到「第 100 新 ~ 第 199 新」
+      // 那一段，已停止数不足 100 时直接返回空（1.37.0 实测）。
+      rpc("aria2.tellStopped", [-1, 100, FIELDS]),
       rpc("aria2.getGlobalStat", []),
     ]);
     hideNotice();

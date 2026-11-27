@@ -825,11 +825,15 @@ fn refresh_tasks(client: &RpcClient) -> Result<TaskList, Aria2Failure> {
     let waiting = client
         .tell_waiting(0, MAX_ROWS_PER_BUCKET)
         .map_err(|error| Aria2Failure::from_error(&error))?;
-    // 负 offset = 从**最新**往前数（aria2 的约定；实测 1.37.0：
-    // `tellStopped(0, n)` 给最旧 n 条，`tellStopped(-n, n)` 给最新 n 条）。
-    // 面板要的是「最近下完的」，所以这里必须是负数。
+    // aria2 的真实语义（1.37.0 实测，见 `.scratch/wasm-taskfix/review-n2.md` F1）：
+    // `offset = 0` → 从**最旧**端开始向新取 num 条；`offset = -k` → 从**倒数第 k 条**
+    // 开始向**更旧**方向取 num 条（即跳过最新 k-1 条）。
+    //   例（5 条 a..e，e 最新）：`(-1, 25)` → e d c b a；`(-2, 25)` → d c b a；
+    //   `(-5, 25)` → 仅 a；条数不足 num 时按实际条数返回，不会返回空。
+    // 所以「最近 num 条」只能写成 `offset = -1`，绝对不能写成 `-num`：
+    // `(-num, num)` 取的是「第 num 新 ~ 第 2num-1 新」这一带，已停止数 ≤ num-1 时直接返回空。
     let stopped = client
-        .tell_stopped(-i64::from(MAX_ROWS_PER_BUCKET), MAX_ROWS_PER_BUCKET)
+        .tell_stopped(-1, MAX_ROWS_PER_BUCKET)
         .map_err(|error| Aria2Failure::from_error(&error))?;
     let truncated =
         waiting.len() as u32 >= MAX_ROWS_PER_BUCKET || stopped.len() as u32 >= MAX_ROWS_PER_BUCKET;
