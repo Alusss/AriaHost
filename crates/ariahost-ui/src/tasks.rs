@@ -15,8 +15,10 @@
 //! 名称优先取 `bittorrent.info.name`，其次 `files[0].path` 的文件名，再次 `files[0].uris[0].uri`；
 //! 磁力「元数据下载」阶段 aria2 给的是 `[METADATA]xxx`，这里把前缀去掉再显示。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use ariahost_core::{HistoryEntry, HistoryStatus};
 use serde_json::Value;
 
 /// 每类（活动 / 等待 / 已停止）最多取多少条。
@@ -134,6 +136,11 @@ pub struct TaskRow {
     pub kind: TaskStatus,
     /// aria2 的错误码（0 = 无错）。
     pub error_code: u64,
+    /// 这一行来自**本地历史**（`downloads.jsonl`）而不是当前 aria2 快照（根因 R1）。
+    ///
+    /// 历史行的用处是「下过什么还看得见」：aria2 已经不持有这些 gid，
+    /// 三个行操作必须禁用，否则用户点下去只会拿到 `GID not found`。
+    pub historical: bool,
 }
 
 impl TaskRow {
@@ -150,6 +157,7 @@ impl TaskRow {
             status: Arc::from(TaskStatus::Waiting.label()),
             kind: TaskStatus::Waiting,
             error_code: 0,
+            historical: false,
         }
     }
 
@@ -183,7 +191,54 @@ impl TaskRow {
             status: Arc::from(kind.label()),
             kind,
             error_code: u64_of(value, "errorCode"),
+            historical: false,
         })
+    }
+
+    /// 由一条**本地历史**记录构造（根因 R1）。
+    ///
+    /// 历史里只有落盘时抓到的字段：没有速率、没有剩余时间（任务早已结束），
+    /// 大小/进度按记录的字节数还原；`historical = true` 让操作列整体禁用。
+    pub fn from_history(entry: &HistoryEntry) -> Self {
+        let kind = match entry.status {
+            HistoryStatus::Complete => TaskStatus::Complete,
+            HistoryStatus::Error => TaskStatus::Error,
+            HistoryStatus::Removed => TaskStatus::Removed,
+        };
+        // 名字缺失时按 URI 推（老记录可能只写了 uri），再不行退回 gid。
+        let name = if entry.name.trim().is_empty() {
+            if entry.uri.trim().is_empty() {
+                format!("任务 {}", entry.gid)
+            } else {
+                uri_name(&entry.uri)
+            }
+        } else {
+            entry.name.clone()
+        };
+        let total = entry.total_bytes;
+        let error_code = entry
+            .error_code
+            .as_deref()
+            .and_then(|code| code.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        Self {
+            gid: Arc::from(entry.gid.as_str()),
+            name: Arc::from(name.as_str()),
+            size: Arc::from(if total == 0 {
+                "—".to_owned()
+            } else {
+                format_bytes(total)
+            }),
+            progress: progress_ratio(entry.completed_bytes, total, kind),
+            speed: Arc::from("—"),
+            eta: Arc::from("—"),
+            // 用 `TaskStatus` 的词表而不是 `HistoryStatus::label()`：同一张表里
+            // 「出错」和「失败」混着写像是两个不同状态。
+            status: Arc::from(kind.label()),
+            kind,
+            error_code,
+            historical: true,
+        }
     }
 
     /// 自测用的假行（`--panel-selftest --seed-rows N`）：内容稳定、覆盖各种状态与列宽。
@@ -230,6 +285,7 @@ impl TaskRow {
             status: Arc::from(kind.label()),
             kind,
             error_code: if kind == TaskStatus::Error { 1 } else { 0 },
+            historical: false,
         }
     }
 }
@@ -245,6 +301,76 @@ pub fn rows_from(active: &[Value], waiting: &[Value], stopped: &[Value]) -> Vec<
         }
     }
     rows
+}
+
+/// 把本地历史行接到实时行后面（同一个 gid **以实时行为准**）。
+///
+/// 为什么实时行优先：aria2 还持有这个 gid 时，实时行有真实速率/剩余时间，
+/// 历史行只是同一条任务的旧快照；先到先得会让界面停在过时数据上。
+/// 历史里 aria2 已经不认识的 gid 才补一行（`historical = true`，操作列禁用）。
+pub fn with_history(live: Vec<TaskRow>, history: &[TaskRow]) -> Vec<TaskRow> {
+    if history.is_empty() {
+        return live;
+    }
+    let seen: HashSet<Arc<str>> = live.iter().map(|row| Arc::clone(&row.gid)).collect();
+    let mut merged = live;
+    merged.reserve(history.len());
+    for row in history {
+        if seen.contains(&row.gid) {
+            continue;
+        }
+        merged.push(row.clone());
+    }
+    merged
+}
+
+/// aria2 的一条**终态**对象 → 历史记录（根因 R1 的落盘入口）。
+///
+/// `finished_at` 由调用方给：时间戳格式的唯一实现在 `ariahost_common::time`，
+/// 本模块不引第二份。尚未结束的任务返回 `None`（暂停/等待/活动都不是终态）。
+pub fn history_entry(value: &Value, finished_at: &str) -> Option<HistoryEntry> {
+    let gid = text_of(value, "gid")?;
+    let kind = TaskStatus::from_raw(&text_of(value, "status").unwrap_or_default());
+    let status = match kind {
+        TaskStatus::Complete => HistoryStatus::Complete,
+        TaskStatus::Error => HistoryStatus::Error,
+        TaskStatus::Removed => HistoryStatus::Removed,
+        TaskStatus::Active | TaskStatus::Waiting | TaskStatus::Paused | TaskStatus::Unknown => {
+            return None
+        }
+    };
+    let entry = HistoryEntry::new(
+        gid.clone(),
+        display_name(value, &gid),
+        text_of(value, "dir").unwrap_or_default(),
+        first_uri(value),
+        status,
+        finished_at,
+    )
+    .with_bytes(total_length(value), completed_length(value));
+    // 成功完成的任务没有错误码：`errorCode = 0` 不写进记录（记录里 None 才是「无错」）。
+    let error_code = u64_of(value, "errorCode");
+    Some(if error_code == 0 {
+        entry
+    } else {
+        entry.with_error_code(error_code.to_string())
+    })
+}
+
+/// 第一条 `files[].uris[].uri`：历史记录里的源地址（**落盘前由 `History::record` 脱敏**）。
+fn first_uri(value: &Value) -> String {
+    value
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|files| files.first())
+        .and_then(|file| file.get("uris"))
+        .and_then(Value::as_array)
+        .and_then(|uris| uris.first())
+        .and_then(|uri| uri.get("uri"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// 行的三种操作（UI 只发意图，RPC 方法名在 [`TaskStatus::remove_method`] 里定）。
@@ -710,5 +836,122 @@ mod tests {
         // 残缺的转义不能 panic，也不吞字符。
         assert_eq!(percent_decode("a%"), "a%");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn history_entry_only_accepts_finished_tasks() {
+        let stopped = json!({
+            "gid": "g9",
+            "status": "complete",
+            "dir": "C:\\Users\\Alusss\\Downloads",
+            "totalLength": "2048",
+            "completedLength": "2048",
+            "files": [{ "uris": [{ "uri": "http://127.0.0.1:8080/a.bin" }] }]
+        });
+        let entry = history_entry(&stopped, "2026-11-27T10:00:00.000Z").expect("终态要有记录");
+        assert_eq!(entry.gid, "g9");
+        assert_eq!(entry.name, "a.bin");
+        assert_eq!(entry.dir, "C:\\Users\\Alusss\\Downloads");
+        assert_eq!(entry.uri, "http://127.0.0.1:8080/a.bin");
+        assert_eq!((entry.total_bytes, entry.completed_bytes), (2048, 2048));
+        assert_eq!(entry.status, HistoryStatus::Complete);
+        assert_eq!(entry.finished_at, "2026-11-27T10:00:00.000Z");
+        assert!(entry.error_code.is_none());
+
+        // 还在跑的任务不是终态，不能落历史。
+        for status in ["active", "waiting", "paused", "weird"] {
+            let value = json!({ "gid": "g1", "status": status });
+            assert!(history_entry(&value, "2026-11-27T10:00:00.000Z").is_none());
+        }
+        // 没有 gid 的行连身份都没有。
+        assert!(history_entry(&json!({ "status": "complete" }), "x").is_none());
+    }
+
+    #[test]
+    fn history_entry_keeps_error_code_only_when_present() {
+        let failed = json!({
+            "gid": "g8",
+            "status": "error",
+            "errorCode": "3",
+            "totalLength": "0",
+            "completedLength": "0"
+        });
+        let entry = history_entry(&failed, "2026-11-27T10:00:01.000Z").expect("出错也是终态");
+        assert_eq!(entry.status, HistoryStatus::Error);
+        assert_eq!(entry.error_code.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn history_row_is_marked_and_not_actionable() {
+        let entry = HistoryEntry::new(
+            "g7",
+            "ubuntu.iso",
+            "C:\\Downloads",
+            "http://127.0.0.1:8080/ubuntu.iso",
+            HistoryStatus::Complete,
+            "2026-11-27T10:00:00.000Z",
+        )
+        .with_bytes(1024 * 1024, 1024 * 1024);
+        let row = TaskRow::from_history(&entry);
+        assert!(row.historical, "历史行必须打标，操作列才会禁用");
+        assert_eq!(&*row.gid, "g7");
+        assert_eq!(&*row.name, "ubuntu.iso");
+        assert_eq!(&*row.status, "已完成");
+        assert_eq!(row.kind, TaskStatus::Complete);
+        assert_eq!(row.progress, 1.0);
+        assert_eq!(&*row.size, "1.0 MiB");
+        // 任务早已结束：速率与剩余时间不编数据。
+        assert_eq!(&*row.speed, "—");
+        assert_eq!(&*row.eta, "—");
+    }
+
+    #[test]
+    fn history_row_falls_back_to_uri_name_when_record_has_no_name() {
+        let entry = HistoryEntry::new(
+            "g6",
+            "",
+            "",
+            "http://127.0.0.1:8080/dir/movie.mkv?token=abc",
+            HistoryStatus::Removed,
+            "2026-11-27T10:00:00.000Z",
+        );
+        let row = TaskRow::from_history(&entry);
+        assert_eq!(&*row.name, "movie.mkv");
+        assert_eq!(&*row.status, "已移除");
+        assert_eq!(&*row.size, "—");
+    }
+
+    #[test]
+    fn with_history_appends_only_gids_aria2_no_longer_has() {
+        let live = vec![TaskRow::from_value(&json!({ "gid": "a", "status": "active" })).unwrap()];
+        let history = vec![
+            TaskRow::from_history(&HistoryEntry::new(
+                "a",
+                "same.bin",
+                "",
+                "",
+                HistoryStatus::Complete,
+                "2026-11-27T10:00:00.000Z",
+            )),
+            TaskRow::from_history(&HistoryEntry::new(
+                "b",
+                "old.bin",
+                "",
+                "",
+                HistoryStatus::Complete,
+                "2026-11-27T09:00:00.000Z",
+            )),
+        ];
+        let merged = with_history(live, &history);
+        let gids: Vec<&str> = merged.iter().map(|row| &*row.gid).collect();
+        assert_eq!(gids, vec!["a", "b"]);
+        // 同 gid 以实时行为准：实时行仍可操作，历史行没有覆盖它。
+        assert!(!merged[0].historical);
+        assert_eq!(&*merged[0].status, "下载中");
+        assert!(merged[1].historical);
+
+        // 没有历史时原样返回（不复制、不重排）。
+        let only_live = with_history(merged[..1].to_vec(), &[]);
+        assert_eq!(only_live.len(), 1);
     }
 }

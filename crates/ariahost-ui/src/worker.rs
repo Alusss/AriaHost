@@ -13,13 +13,17 @@
 //!
 //! 本模块**不托管 aria2c 进程**——那是 [`crate::core_host`] 的职责。这里只负责「连上去做什么」。
 
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ariahost_aria2::{GlobalStat, RpcCallError, RpcClient, VersionInfo, DEFAULT_PORT, RPC_PATH};
+use ariahost_common::paths::Plane;
+use ariahost_common::time::utc_stamp;
 use ariahost_common::ErrorCode;
+use ariahost_core::{History, HistorySource};
 use ariahost_svc::{status_report, ServiceQueryError, ServiceState, ServiceStatusReport};
 use serde_json::Value;
 
@@ -49,6 +53,10 @@ pub const REFRESH_INTERVAL_MIN: Duration = Duration::from_millis(500);
 
 /// 刷新间隔上限（再慢就不像「实时」了）。
 pub const REFRESH_INTERVAL_MAX: Duration = Duration::from_secs(60);
+
+/// 历史记录推给 UI 的条数上限：文件最多存 `MAX_ENTRIES`(5000) 条，
+/// 但一次全推到表格里既没人看也拖慢首帧，这里只取最近的 500 条。
+pub const HISTORY_ROWS_SHOWN: usize = 500;
 
 /// 失败退避上限：`AH-E2005` 的口径是「最长 30 秒重试一次」。
 pub const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -308,6 +316,11 @@ pub enum Update {
     Service(ServiceSnapshot),
     /// 任务列表。
     Tasks(TasksUpdate),
+    /// 历史记录里的任务（**只追加新写入的行**；启动时先推一次存量的最近若干条）。
+    ///
+    /// 和 [`Update::Tasks`] 分开是因为两者的生命周期不同：`Tasks` 每 2s 覆盖一次，
+    /// 历史只增不改（写盘成功后才会出现一行）。
+    History(Vec<TaskRow>),
     /// 行操作结果。
     Action(ActionOutcome),
     /// 新建下载结果。
@@ -352,6 +365,33 @@ enum Command {
     Stop,
 }
 
+/// 历史记录的写入目标（根因 R1）：哪个平面的 `downloads.jsonl`、来源标哪个。
+///
+/// 为什么由 UI 传进来而不是 worker 自己算：**运行中翻不了平面**。平面在面板启动时
+/// 定死一次（`app::managed_plane`），在这之后就算服务被拉起来，本次会话仍然写启动平面，
+/// 免得同一个 gid 在两个文件里各记一笔。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryConfig {
+    /// 写哪个平面的历史文件（用户平面 / 服务平面）。
+    pub plane: Plane,
+    /// 记录里的来源标记：用户平面记 [`HistorySource::User`]，服务平面记
+    /// [`HistorySource::Service`]（由 [`HistoryConfig::new`] 按平面推出，不自造第三种）。
+    pub source: HistorySource,
+}
+
+impl HistoryConfig {
+    /// 按平面推断来源标记。
+    pub fn new(plane: Plane) -> Self {
+        Self {
+            plane,
+            source: match plane {
+                Plane::Service => HistorySource::Service,
+                Plane::User => HistorySource::User,
+            },
+        }
+    }
+}
+
 /// worker 的构建参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerOptions {
@@ -361,6 +401,8 @@ pub struct WorkerOptions {
     pub secret: Option<String>,
     /// 成功刷新间隔（默认 [`ARIA2_REFRESH_INTERVAL`]）。
     pub interval: Duration,
+    /// 历史记录落点（`None` = 不记录，测试与自测路径用）。
+    pub history: Option<HistoryConfig>,
 }
 
 impl Default for WorkerOptions {
@@ -369,6 +411,7 @@ impl Default for WorkerOptions {
             port: DEFAULT_PORT,
             secret: None,
             interval: ARIA2_REFRESH_INTERVAL,
+            history: None,
         }
     }
 }
@@ -388,7 +431,14 @@ impl WorkerOptions {
             port,
             secret,
             interval,
+            history: None,
         }
+    }
+
+    /// 指定历史落点（面板启动路径在 `detect` 之后接这一步）。
+    pub fn with_history(mut self, config: HistoryConfig) -> Self {
+        self.history = Some(config);
+        self
     }
 }
 
@@ -572,6 +622,26 @@ fn run(
     let mut last_aria2_line: Option<String> = None;
     let mut last_service_line: Option<String> = None;
 
+    // 历史记录（根因 R1）：线程启动就打开一次，磁盘 IO 不落在 UI 线程。
+    // `None` = 不记录（自测/测试路径），这时也不会有 `Update::History`。
+    let mut recorder = match options.history {
+        Some(config) => match HistoryRecorder::open(config, &log) {
+            Ok(recorder) => {
+                // 先把存量最近若干条推给 UI：aria2 还没连上也能看到「刚才下了什么」。
+                let rows = recorder.recent_rows(HISTORY_ROWS_SHOWN);
+                if !rows.is_empty() && updates.send(Update::History(rows)).is_err() {
+                    return;
+                }
+                Some(recorder)
+            }
+            Err(error) => {
+                log.push(format!("历史记录不可用：{error}（本次运行不写历史）"));
+                None
+            }
+        },
+        None => None,
+    };
+
     loop {
         let now = Instant::now();
 
@@ -606,14 +676,28 @@ fn run(
             // 只有 RPC 通的时候才拉任务列表：连不上时多打三次 RPC 只是白等三次超时。
             // 失败时也要推一条空的 Tasks（`Err`）：否则界面会拿着「上一次的幽灵列表」继续显示。
             let tasks_update = match &outcome {
-                Ok(_) => {
-                    let tasks = refresh_tasks(&client);
-                    let truncated = tasks.as_ref().map(|list| list.truncated).unwrap_or(false);
-                    TasksUpdate {
-                        outcome: tasks.map(|list| list.rows),
-                        truncated,
+                Ok(_) => match refresh_tasks(&client) {
+                    Ok(list) => {
+                        // 历史记录（根因 R1）：把这一轮里**新出现的终态任务**写进
+                        // `downloads.jsonl`。差分由 `HistoryRecorder` 按 gid 持有，
+                        // 同一任务只在第一次见到终态时写一次。
+                        if let Some(recorder) = recorder.as_mut() {
+                            let online = recorder.record_finished(&list.stopped, &log);
+                            if !online.is_empty() && updates.send(Update::History(online)).is_err()
+                            {
+                                return;
+                            }
+                        }
+                        TasksUpdate {
+                            outcome: Ok(list.rows),
+                            truncated: list.truncated,
+                        }
                     }
-                }
+                    Err(failure) => TasksUpdate {
+                        outcome: Err(failure),
+                        truncated: false,
+                    },
+                },
                 Err(failure) => TasksUpdate {
                     outcome: Err(*failure),
                     truncated: false,
@@ -741,21 +825,125 @@ fn refresh_tasks(client: &RpcClient) -> Result<TaskList, Aria2Failure> {
     let waiting = client
         .tell_waiting(0, MAX_ROWS_PER_BUCKET)
         .map_err(|error| Aria2Failure::from_error(&error))?;
+    // 负 offset = 从**最新**往前数（aria2 的约定；实测 1.37.0：
+    // `tellStopped(0, n)` 给最旧 n 条，`tellStopped(-n, n)` 给最新 n 条）。
+    // 面板要的是「最近下完的」，所以这里必须是负数。
     let stopped = client
-        .tell_stopped(0, MAX_ROWS_PER_BUCKET)
+        .tell_stopped(-i64::from(MAX_ROWS_PER_BUCKET), MAX_ROWS_PER_BUCKET)
         .map_err(|error| Aria2Failure::from_error(&error))?;
     let truncated =
         waiting.len() as u32 >= MAX_ROWS_PER_BUCKET || stopped.len() as u32 >= MAX_ROWS_PER_BUCKET;
     Ok(TaskList {
         rows: tasks::rows_from(&active, &waiting, &stopped),
         truncated,
+        stopped,
     })
 }
 
-/// 一次任务列表结果（带截断标记）。
+/// 一次任务列表结果（带截断标记 + 原始 stopped 对象，历史记录要用原始字段）。
 struct TaskList {
     rows: Vec<TaskRow>,
     truncated: bool,
+    /// `tellStopped` 的原始对象（`TaskRow` 里没有 `dir`/`files[].uris[].uri`，
+    /// 历史记录需要这些字段，所以原样带出来）。
+    stopped: Vec<Value>,
+}
+
+/// 历史记录器：把**新出现的终态任务**写进本平面的 `downloads.jsonl`（根因 R1）。
+///
+/// 为什么要差分而不是每轮全写：`tellStopped` 每 2s 都会把这些对象再送一遍，
+/// 照写就会每 2 秒给同一条任务追加一行（文件很快变成垃圾）。
+/// `recorded` 用启动时 `History::load()` 的 gid 预填，所以**重启也不会重复写**。
+struct HistoryRecorder {
+    history: History,
+    config: HistoryConfig,
+    recorded: HashSet<String>,
+    /// 已经报过写盘错误：只在第一次失败时写日志，否则每 2s 刷满缓冲。
+    warned: bool,
+}
+
+impl HistoryRecorder {
+    /// 打开本平面的历史文件（`<数据根>\history\downloads.jsonl`）。
+    fn open(config: HistoryConfig, log: &LogBuffer) -> Result<Self, String> {
+        let Some(history) = History::for_plane(config.plane) else {
+            return Err(format!("找不到{}的数据目录", plane_label(config.plane)));
+        };
+        let path = history.path().display().to_string();
+        let loaded = match history.load() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log.push(format!("历史记录读取失败：{error}（从空集合开始）"));
+                Default::default()
+            }
+        };
+        if loaded.skipped_lines > 0 {
+            log.push(format!(
+                "历史记录有 {} 行无法解析（已跳过，不影响其余记录）",
+                loaded.skipped_lines
+            ));
+        }
+        // 启动时先按已有 gid 预填：否则重启后 `tellStopped` 会把同一批任务再记一遍。
+        let recorded: HashSet<String> = loaded.entries.into_iter().map(|entry| entry.gid).collect();
+        log.push(format!(
+            "历史记录：{} 条已记（{}，{}）",
+            recorded.len(),
+            path,
+            plane_label(config.plane)
+        ));
+        Ok(Self {
+            history,
+            config,
+            recorded,
+            warned: false,
+        })
+    }
+
+    /// 存量里最近的 `limit` 条，转成表格行（名字/大小/状态，operation 列会被禁用）。
+    fn recent_rows(&self, limit: usize) -> Vec<TaskRow> {
+        self.history
+            .recent(limit)
+            .unwrap_or_default()
+            .iter()
+            .map(TaskRow::from_history)
+            .collect()
+    }
+
+    /// 把这一轮 `tellStopped` 里**还没记过**的终态任务写盘，返回可推给 UI 的行。
+    ///
+    /// 写失败的 gid 也会进 `recorded`：否则同一条任务每 2s 重试一次，日志被刷满而
+    /// 磁盘问题并不会自己好。真正的重试留给下次启动（重新 `load`）。
+    fn record_finished(&mut self, stopped: &[Value], log: &LogBuffer) -> Vec<TaskRow> {
+        let stamp = utc_stamp(SystemTime::now());
+        let mut written = Vec::new();
+        for value in stopped {
+            let Some(entry) = tasks::history_entry(value, &stamp) else {
+                continue;
+            };
+            if !self.recorded.insert(entry.gid.clone()) {
+                continue;
+            }
+            let entry = entry.with_source(self.config.source);
+            match self.history.record(&entry) {
+                Ok(outcome) => {
+                    if outcome.rotated {
+                        log.push(format!(
+                            "历史记录超过上限，已轮转为 {}（{} 行）",
+                            ariahost_core::HISTORY_ROTATED,
+                            outcome.total_lines
+                        ));
+                    }
+                    written.push(TaskRow::from_history(&entry));
+                }
+                Err(error) => {
+                    if !self.warned {
+                        self.warned = true;
+                        log.push(format!("历史记录写入失败：{error}（本次运行不再提示）"));
+                    }
+                }
+            }
+        }
+        written
+    }
 }
 
 /// 一次行操作。成功的判据是「RPC 没报错」——aria2 对 removeDownloadResult 回 `"OK"`，
@@ -973,6 +1161,14 @@ fn shorten(text: &str, max: usize) -> String {
     }
     let head: String = text.chars().take(max).collect();
     format!("{head}…（共 {count} 字符）")
+}
+
+/// 平面在日志/文案里的中文名（`Plane` 只有 `Debug`，不给用户看 `User`/`Service`）。
+pub fn plane_label(plane: Plane) -> &'static str {
+    match plane {
+        Plane::User => "用户平面",
+        Plane::Service => "服务平面",
+    }
 }
 
 #[cfg(test)]

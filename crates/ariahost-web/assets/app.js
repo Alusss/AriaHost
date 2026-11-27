@@ -228,7 +228,7 @@ async function tick() {
     const [active, waiting, stopped, stat] = await Promise.all([
       rpc("aria2.tellActive", [FIELDS]),
       rpc("aria2.tellWaiting", [0, 100, FIELDS]),
-      rpc("aria2.tellStopped", [0, 100, FIELDS]),
+      rpc("aria2.tellStopped", [-100, 100, FIELDS]),
       rpc("aria2.getGlobalStat", []),
     ]);
     hideNotice();

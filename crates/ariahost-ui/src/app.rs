@@ -12,12 +12,14 @@
 //! 3. 键盘焦点只在第一帧请求一次（EG-2：`request_focus` 会 `interrupt_ime()`，
 //!    每帧请求 = 中文一个字符都打不进去，egui #8813 至今未修）。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ariahost_common::logfile::Level;
+use ariahost_common::paths::Plane;
 use ariahost_common::{ErrorCode, PRODUCT_NAME, VERSION};
 use egui::{Color32, RichText};
 use egui_extras::{Column, TableBuilder};
@@ -368,8 +370,21 @@ pub struct PanelApp {
     aria2: Option<Aria2Update>,
     /// 最近一次服务状态。
     service: Option<ServiceSnapshot>,
-    /// 任务表（worker 送来的真行）。
+    /// 任务表（渲染视图 = 实时行 + 历史行）。
     tasks: Vec<TaskRow>,
+    /// worker 送来的**实时**行（每 2s 整表覆盖一次）。
+    ///
+    /// 单独留一份是因为历史行也要进同一张表：历史更新（只增）与实时刷新（覆盖）
+    /// 各来各的，合并只能在 `tasks` 里做，所以必须保得住「最近一次的实时行」。
+    live_rows: Vec<TaskRow>,
+    /// 历史记录行（根因 R1：`downloads.jsonl` 里有、aria2 已不再持有的任务）。
+    ///
+    /// 一律只读：它们不在 aria2 的任务表里，暂停/继续/移除只会回 "GID not found"。
+    history_rows: Vec<TaskRow>,
+    /// 启动时定死的托管平面（根因 R5）：未完成数与历史记录都按它的路径取文件。
+    plane: Plane,
+    /// 暂停集合（根因 R4）：aria2 自己不持久化暂停态，重启后靠它把任务按回去。
+    paused: PausedSet,
     /// 任务表本轮失败原因（`None` = 正常）。
     tasks_error: Option<worker::Aria2Failure>,
     /// 是否触到每类上限（界面给一行提示）。
@@ -549,6 +564,17 @@ impl PanelApp {
             None => Vec::new(),
         };
 
+        // 根因 R5：平面在启动时定一次。服务在跑 = 任务由服务平面的 aria2 持有，
+        // 未完成数与历史记录都读那一平面的文件；会话中途起服务不改本次的落点
+        // （理由见 `worker::HistoryConfig`：同一个 gid 不能在两个文件里各记一笔）。
+        let plane = managed_plane();
+        log.push(format!(
+            "托管平面：{}（未完成数与历史记录都读写这一平面的文件）",
+            worker::plane_label(plane)
+        ));
+        let worker_options = worker_options.with_history(worker::HistoryConfig::new(plane));
+        let paused = PausedSet::load(&log);
+
         let (host, probe, core) = match (&seeded.is_empty(), setup) {
             (true, Some(setup)) => {
                 let probe = setup.probe().clone();
@@ -609,6 +635,10 @@ impl PanelApp {
             aria2: None,
             service: None,
             tasks: seeded,
+            live_rows: Vec::new(),
+            history_rows: Vec::new(),
+            plane,
+            paused,
             tasks_error: None,
             tasks_truncated: false,
             optimistic: Vec::new(),
@@ -1879,17 +1909,21 @@ impl PanelApp {
         });
     }
 
-    /// 启动检测：`session\aria2.session` 非空 → 顶部信息条（不是弹窗）。
+    /// 启动检测：session 文件非空 → 顶部信息条（不是弹窗）。
     fn detect_pending_session(&mut self) {
         if self.seed_mode() || self.selftest_mode() || self.session_pending.is_some() {
             return;
         }
-        let count = pending_session_count();
+        let plane = self.plane;
+        let count = pending_session_count(plane);
         match count {
             Some(0) | None => {}
             Some(count) => {
-                self.log
-                    .push(format!("启动检测：session 里有 {count} 个未完成任务"));
+                self.log.push(format!(
+                    "启动检测：{}的 session 里有 {count} 个未完成任务（{}）",
+                    worker::plane_label(plane),
+                    session_path_text(plane)
+                ));
                 self.session_pending = Some(count);
             }
         }
@@ -1976,12 +2010,15 @@ impl PanelApp {
                     }
                 }
                 worker::Update::Service(snapshot) => self.service = Some(snapshot),
+                worker::Update::History(rows) => self.on_history(rows),
                 worker::Update::Tasks(tasks) => {
                     self.tasks_truncated = tasks.truncated;
                     match tasks.outcome {
                         Ok(rows) => {
                             self.tasks_error = None;
-                            self.tasks = rows;
+                            self.live_rows = rows;
+                            self.apply_paused();
+                            self.rebuild_tasks();
                             // 真实行接管乐观行。
                             let tasks = &self.tasks;
                             self.optimistic
@@ -1990,13 +2027,102 @@ impl PanelApp {
                         }
                         Err(failure) => {
                             self.tasks_error = Some(failure);
-                            self.tasks.clear();
+                            // 实时行清空，但**历史仍然可看**：那是本地文件里的数据，
+                            // 不依赖 aria2 连得上（正好覆盖「核心没起、想找上次下完的」）。
+                            self.live_rows.clear();
+                            self.rebuild_tasks();
                         }
                     }
                 }
                 worker::Update::Action(outcome) => self.on_action(outcome),
                 worker::Update::Added(outcome) => self.on_added(outcome),
             }
+        }
+    }
+
+    /// 收历史记录（根因 R1）：worker 首轮推存量，之后只推刚写盘的新行。
+    fn on_history(&mut self, rows: Vec<TaskRow>) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut seen: BTreeSet<Arc<str>> = self
+            .history_rows
+            .iter()
+            .map(|row| Arc::clone(&row.gid))
+            .collect();
+        let mut fresh: Vec<TaskRow> = rows
+            .into_iter()
+            .filter(|row| seen.insert(Arc::clone(&row.gid)))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        if self.history_rows.is_empty() {
+            // 首轮（存量）：`History::recent` 已经按 `finished_at` 倒序给好，直接用。
+            self.history_rows = fresh;
+        } else {
+            // 之后每批都是更晚完成的：整体插到最前面（批内也是最新在前）。
+            fresh.append(&mut self.history_rows);
+            self.history_rows = fresh;
+        }
+        self.rebuild_tasks();
+    }
+
+    /// 实时行 + 历史行 → 表格行（实时优先：同一 gid 在两边都有时只显示实时行）。
+    fn rebuild_tasks(&mut self) {
+        self.tasks = tasks::with_history(self.live_rows.clone(), &self.history_rows);
+    }
+
+    /// 根因 R4：把「用户暂停过的任务」重新按回去。
+    ///
+    /// aria2 不持久化暂停态（`pause` 只是本次进程内的状态），重启后任务会自己跑起来。
+    /// 这里对着当前实时行做一次核对：还在等待/活动、且在暂停集合里的，补发一次 `pause`；
+    /// 已经结束或已不在列表里的 gid 从集合里清掉（否则文件越长越大）。
+    ///
+    /// 每条 gid 只补发一次（`restored`），失败也不重试：真失败了下一轮列表会显示
+    /// 「运行中」，用户点一下暂停就是了，比每 2 秒发一次 pause 更不容易出事。
+    fn apply_paused(&mut self) {
+        if self.paused.is_empty() {
+            return;
+        }
+        let mut requests: Vec<TaskRequest> = Vec::new();
+        let mut finished: Vec<Arc<str>> = Vec::new();
+        for row in &self.live_rows {
+            if !self.paused.contains(&row.gid) {
+                continue;
+            }
+            if row.kind.is_finished() {
+                // 用户暂停过的任务已经下完了：暂停记录到此为止。
+                finished.push(Arc::clone(&row.gid));
+                continue;
+            }
+            if row.kind != TaskStatus::Waiting && row.kind != TaskStatus::Active {
+                continue;
+            }
+            if !self.paused.mark_restored(&row.gid) {
+                continue;
+            }
+            requests.push(TaskRequest {
+                action: TaskAction::Pause,
+                gid: Arc::clone(&row.gid),
+                kind: row.kind,
+            });
+        }
+        for gid in finished {
+            self.paused.remove(&gid);
+        }
+        if requests.is_empty() {
+            return;
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        for request in requests {
+            self.log.push(format!(
+                "暂停集合：把任务 {} 重新暂停（aria2 重启后丢了暂停态）",
+                request.gid
+            ));
+            worker.request_task(request);
         }
     }
 
@@ -2095,9 +2221,18 @@ impl PanelApp {
     }
 
     /// 行操作结果。
+    ///
+    /// 顺手维护暂停集合（根因 R4）：aria2 不记暂停态，面板得自己记，重启后才能按回去。
     fn on_action(&mut self, outcome: ActionOutcome) {
         match outcome.result {
-            Ok(()) => self.notify(format!("已{}任务 {}", outcome.action.label(), outcome.gid)),
+            Ok(()) => {
+                match outcome.action {
+                    TaskAction::Pause => self.paused.insert(&outcome.gid),
+                    // 继续/移除都意味着「这条不再需要恢复暂停」。
+                    TaskAction::Unpause | TaskAction::Remove => self.paused.remove(&outcome.gid),
+                }
+                self.notify(format!("已{}任务 {}", outcome.action.label(), outcome.gid));
+            }
             Err(failure) => self.set_banner(
                 Banner::with_code(
                     Tone::Bad,
@@ -2449,15 +2584,11 @@ impl PanelApp {
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!(
-                        "aria2 正在下载 {downloading} 个任务，退出会中断它们。"
+                        "退出会中断当前 {downloading} 个下载任务，下次启动会自动续传。"
                     ))
                     .small(),
                 );
-                ui.label(
-                    RichText::new("最小化到托盘可以让下载继续；退出会先优雅停止 aria2。")
-                        .weak()
-                        .small(),
-                );
+                ui.label(RichText::new("最小化到托盘可以让下载继续。").weak().small());
                 // A 的判据（task-71）：托盘真的不可用时，「藏进托盘」这一档必须当场面说清，
                 // 而不是点了没反应、让用户以为程序坏了。原因直接来自 `ChannelAvailability`。
                 let tray_ok = prompt.tray_blocked.is_none();
@@ -2613,7 +2744,10 @@ impl PanelApp {
         }
         let setup = core_host::HostSetup::prepare(&self.log);
         self.core_probe = setup.probe().clone();
-        let options = setup.worker_options(&self.log);
+        let options = setup
+            .worker_options(&self.log)
+            // 历史落点跟启动时定下的平面走（`self.plane`），换核心不改写哪个文件。
+            .with_history(crate::worker::HistoryConfig::new(self.plane));
         self.worker_options = options.clone();
         self.core = HostState::Idle;
         // 旧的 host 在这里被丢弃：`CoreHost::drop` 会发 `Shutdown`，线程自己收工。
@@ -2907,9 +3041,12 @@ impl PanelApp {
             ui.label(RichText::new(format!("任务（{total}）")).font(subtitle_font(ui)));
             if self.tasks_truncated {
                 ui.label(
-                    RichText::new(format!("仅显示每类前 {} 条", tasks::MAX_ROWS_PER_BUCKET))
-                        .weak()
-                        .small(),
+                    RichText::new(format!(
+                        "仅显示最近 {} 条（未开始的最旧在前，已结束的取最近）",
+                        tasks::MAX_ROWS_PER_BUCKET
+                    ))
+                    .weak()
+                    .small(),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3148,18 +3285,26 @@ impl PanelApp {
                             })
                             .inner
                         };
+                        // 历史行（R1）：aria2 已经不再持有这个 gid，三个动作发过去只会得到
+                        // "GID not found"。所以槽位照画（对齐不变）但全部禁用，并说明原因。
+                        let live = !row.historical;
                         ui.horizontal(|ui| {
-                            if slot(ui, "暂停", row.kind.can_pause()) {
+                            if slot(ui, "暂停", live && row.kind.can_pause()) {
                                 action = Some((TaskAction::Pause, Arc::clone(&row.gid), row.kind));
                             }
-                            if slot(ui, "继续", row.kind.can_resume()) {
+                            if slot(ui, "继续", live && row.kind.can_resume()) {
                                 action =
                                     Some((TaskAction::Unpause, Arc::clone(&row.gid), row.kind));
                             }
-                            if slot(ui, "移除", row.kind.can_remove()) {
+                            if slot(ui, "移除", live && row.kind.can_remove()) {
                                 action = Some((TaskAction::Remove, Arc::clone(&row.gid), row.kind));
                             }
                         });
+                        if !live {
+                            ui.response().on_hover_text(
+                                "来自本地历史记录：aria2 已不再持有该任务，不能操作",
+                            );
+                        }
                     });
                 });
             });
@@ -4020,22 +4165,219 @@ fn open_url(url: &str) -> std::io::Result<()> {
     }
 }
 
-/// `%APPDATA%\AriaHost\session\aria2.session` 里的未完成任务数（`None` = 文件不存在）。
+/// 当前实际托管的平面（根因 R5）。
 ///
-/// aria2 的 session 文件一行一个 URI，`#` 开头是注释；只数非空非注释行。
-fn pending_session_count() -> Option<usize> {
-    let dir = ariahost_common::paths::session_dir(ariahost_common::paths::Plane::User)?;
+/// 服务在跑 = 下载由服务平面的 aria2 持有，session 文件也在服务平面的数据目录里
+/// （`%ProgramData%\AriaHost`）；否则是用户平面（`%APPDATA%\AriaHost`）。
+///
+/// 只在启动时算一次：本次会话读写哪个平面必须从头到尾一致，否则同一个任务会在两个
+/// 文件里各记一笔（见 `worker::HistoryConfig` 的注释）。查询失败按用户平面——面板
+/// 自己恒跑在用户平面，这是最保守的默认。
+fn managed_plane() -> Plane {
+    match ariahost_svc::query_state() {
+        Ok(ariahost_svc::ServiceState::Running) => Plane::Service,
+        _ => Plane::User,
+    }
+}
+
+/// session 文件的完整路径（写日志用；拿不到数据目录就说明白）。
+fn session_path_text(plane: Plane) -> String {
+    match ariahost_common::paths::session_dir(plane) {
+        Some(dir) => dir
+            .join(ariahost_core::SESSION_FILE_NAME)
+            .display()
+            .to_string(),
+        None => "数据目录不可用".to_owned(),
+    }
+}
+
+/// 本平面 session 文件里的未完成任务数（`None` = 文件不存在或数据目录不可用）。
+///
+/// aria2 的 session 文件一行一个 URI，紧跟其后是缩进的选项行（` gid=…`、` dir=…`）；
+/// 只有行首非空白、非 `#` 的行才是任务行。
+fn pending_session_count(plane: Plane) -> Option<usize> {
+    let dir = ariahost_common::paths::session_dir(plane)?;
     let file = dir.join(ariahost_core::SESSION_FILE_NAME);
     let text = std::fs::read_to_string(&file).ok()?;
     Some(count_session_lines(&text))
 }
 
-/// 数 session 文件里的任务行（`#` 注释与空行不算）——单独拆出来是为了能纯函数测。
+/// 数 session 文件里的任务行（`#` 注释、空行与**缩进的选项行**都不算）。
+///
+/// 单独拆出来是为了能纯函数测，也因为这正是根因 R3：旧写法先 `trim()` 再判非空非 `#`，
+/// 而 aria2 的选项行是空格开头的（`" gid=…"`），trim 之后看起来就是普通文本，
+/// 于是 1 个任务被数成 9 个（1 行 URI + 8 行选项）。所以这里**不 trim**，
+/// 只认行首第一个字符：空白 → 选项行；`#` → 注释。
 fn count_session_lines(text: &str) -> usize {
     text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter(|line| match line.chars().next() {
+            Some(first) => !first.is_whitespace() && first != '#',
+            None => false,
+        })
         .count()
+}
+
+/// 用户手动暂停过的 gid（根因 R4：aria2 自己不持久化暂停态）。
+///
+/// aria2 的 `pause` 只活在这次进程里：重启后任务会自己跑起来，用户「暂停过」这件事
+/// 面板不记就彻底丢了。所以面板自己记一份，启动后对还在等/还在跑的 gid 补发一次 `pause`。
+///
+/// 落点是 `%LOCALAPPDATA%\AriaHost\paused.json`（和 `window.json` 同一个目录、同样的
+/// 原子写），内容 `{"paused":["gid",…]}`。**不写进 config** 是有意的：这是运行期小状态，
+/// 不是用户配置项，而 `config` 的键集合有 schema 管着（见 `lib.rs` 里关于
+/// `ui.quit_stops_aria2` 不在定版 schema 的注释）。
+///
+/// 服务模式下 gid 可能对不上当前 aria2（服务平面用的是另一个 aria2 实例），
+/// 对不上就当没有——`pause` 失败只影响这一个 gid，不会推翻别的暂停记录。
+#[derive(Debug, Default)]
+struct PausedSet {
+    /// 需要恢复暂停的 gid。
+    gids: BTreeSet<String>,
+    /// 本次会话已经补发过 `pause` 的 gid（每个只补一次，避免每 2 秒刷一遍 RPC）。
+    restored: BTreeSet<String>,
+    /// 落盘路径；拿不到数据目录时为 `None`（内存态，只本次会话有效）。
+    path: Option<PathBuf>,
+}
+
+impl PausedSet {
+    /// `paused.json` 的路径：`%LOCALAPPDATA%\AriaHost\paused.json`。
+    ///
+    /// 和 [`crate::window::window_file`] 一样借 `cache_dir()` 的父目录，
+    /// 不在 `ariahost-common` 里新增只服务 UI 的路径约定。
+    fn file() -> Option<PathBuf> {
+        ariahost_common::paths::cache_dir()
+            .and_then(|cache| cache.parent().map(Path::to_path_buf))
+            .map(|root| root.join("paused.json"))
+    }
+
+    /// 读盘。文件不存在、坏掉、路径拿不到都只留一条日志，绝不让面板起不来。
+    fn load(log: &LogBuffer) -> Self {
+        let path = Self::file();
+        let Some(file) = path.as_deref() else {
+            log.push("暂停集合：拿不到数据目录，本次会话不持久化暂停态".to_owned());
+            return Self::default();
+        };
+        match std::fs::read_to_string(file) {
+            Ok(raw) => {
+                let gids = parse_paused(&raw);
+                log.push(format!(
+                    "暂停集合：读到 {} 条暂停记录（{}）",
+                    gids.len(),
+                    file.display()
+                ));
+                Self {
+                    gids,
+                    restored: BTreeSet::new(),
+                    path,
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self {
+                gids: BTreeSet::new(),
+                restored: BTreeSet::new(),
+                path,
+            },
+            Err(err) => {
+                log.push(format!(
+                    "暂停集合：{} 读不了（{err}），本次会话不恢复暂停态",
+                    file.display()
+                ));
+                Self {
+                    gids: BTreeSet::new(),
+                    restored: BTreeSet::new(),
+                    path,
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.gids.is_empty()
+    }
+
+    fn contains(&self, gid: &str) -> bool {
+        self.gids.contains(gid)
+    }
+
+    /// 记一条暂停并落盘（用户刚点了「暂停」）。
+    fn insert(&mut self, gid: &str) {
+        if self.gids.insert(gid.to_owned()) {
+            self.save();
+        }
+    }
+
+    /// 撤销一条暂停并落盘（用户点了「继续」/「移除」，或任务已经结束）。
+    fn remove(&mut self, gid: &str) {
+        self.restored.remove(gid);
+        if self.gids.remove(gid) {
+            self.save();
+        }
+    }
+
+    /// 标记「这个 gid 本次会话已经补发过 pause」，返回是否**首次**标记。
+    fn mark_restored(&mut self, gid: &str) -> bool {
+        self.restored.insert(gid.to_owned())
+    }
+
+    /// 原子写：先写 `.tmp` 再 rename（同目录 rename 在 Windows 上是覆盖语义）。
+    ///
+    /// 写失败只在日志里留一条（`log` 不在这里传，就用 `eprintln` 兜底）：
+    /// 暂停态丢了的后果是「重启后任务自己跑起来」，不值得弹窗打断用户。
+    fn save(&self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!("暂停集合：建目录 {} 失败：{err}", parent.display());
+                return;
+            }
+        }
+        let mut tmp = path.to_path_buf();
+        tmp.set_extension("json.tmp");
+        if let Err(err) = std::fs::write(&tmp, render_paused(&self.gids).as_bytes()) {
+            eprintln!("暂停集合：写 {} 失败：{err}", tmp.display());
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            eprintln!("暂停集合：rename 到 {} 失败：{err}", path.display());
+        }
+    }
+}
+
+/// 解析 `paused.json`：只认 `paused` 里的字符串数组，其余字段一律忽略。
+///
+/// 用 `serde_json` 的对象遍历而不是 `Deserialize`：不想为一条运行期小状态引入
+/// 结构体与容错分支，`Value` 遍历已经够，坏数据也只丢自己的内容。
+fn parse_paused(raw: &str) -> BTreeSet<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return BTreeSet::new();
+    };
+    value
+        .get("paused")
+        .and_then(|list| list.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.as_str())
+                .filter(|gid| !gid.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 生成 `paused.json` 的内容（排序固定，方便人眼看 diff）。
+fn render_paused(gids: &BTreeSet<String>) -> String {
+    let mut body = String::from("{\"paused\":[");
+    for (index, gid) in gids.iter().enumerate() {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push('"');
+        body.push_str(&gid.replace('\\', "\\\\").replace('"', "\\\""));
+        body.push('"');
+    }
+    body.push_str("]}\n");
+    body
 }
 
 /// 用系统文件管理器打开目录。
@@ -4521,11 +4863,68 @@ mod tests {
 
     #[test]
     fn session_line_count_ignores_comments_and_blank_lines() {
-        let text = "# AriaHost session\n\nhttp://a/1.bin\ngid=abc\n  \nhttp://a/2.bin\n";
-        // ariahost 的 session 一行一个 URI / 选项，注释与空行不计数。
-        assert_eq!(count_session_lines(text), 3);
+        let text = "# AriaHost session\n\nhttp://a/1.bin\n gid=abc\n  \nhttp://a/2.bin\n";
+        // ariahost 的 session 一行一个 URI，选项行是缩进的；注释与空行不计数。
+        assert_eq!(count_session_lines(text), 2);
         assert_eq!(count_session_lines(""), 0);
         assert_eq!(count_session_lines("# only comments\n\n"), 0);
+    }
+
+    #[test]
+    fn session_count_does_not_count_indented_option_lines() {
+        // 根因 R3：真实 session 文件里一个任务 = 1 行 URI + 若干行缩进选项。
+        // 旧实现先 trim 再判「非空非 #」，把选项行也数成了任务（1 个任务数成 9 个）。
+        let one_task = "\
+http://example.com/a.bin
+ gid=2089b05ecca3d829
+ dir=C:\\Downloads
+ out=a.bin
+ continue=true
+ max-connection-per-server=16
+ split=16
+ min-split-size=1M
+ user-agent=AriaHost
+";
+        assert_eq!(count_session_lines(one_task), 1, "1 个任务只能数成 1");
+        // 两个任务 → 2。
+        let two = format!("{one_task}https://example.com/b.bin\n gid=0123456789abcdef\n");
+        assert_eq!(count_session_lines(&two), 2);
+        // 行首是制表符也算选项行（aria2 只写空格，但别把「^\s」写死成空格）。
+        assert_eq!(count_session_lines("http://a/1.bin\n\tgid=x\n"), 1);
+    }
+
+    #[test]
+    fn paused_set_parses_only_string_gids() {
+        let text = r#"{"paused":["a1","b2","",null,3]}"#;
+        let gids: Vec<String> = parse_paused(text).into_iter().collect();
+        assert_eq!(gids, vec!["a1".to_owned(), "b2".to_owned()]);
+        // 坏 JSON / 缺字段 / 字段类型不对：一律空集合，绝不让面板起不来。
+        assert!(parse_paused("not json").is_empty());
+        assert!(parse_paused("{}").is_empty());
+        assert!(parse_paused(r#"{"paused":"a1"}"#).is_empty());
+    }
+
+    #[test]
+    fn paused_set_round_trips_through_its_own_writer() {
+        let mut gids = BTreeSet::new();
+        gids.insert("gid-1".to_owned());
+        gids.insert(r#"weird"quote"#.to_owned());
+        let rendered = render_paused(&gids);
+        assert_eq!(parse_paused(&rendered), gids, "写出去的内容必须能读回来");
+        // 空集合也要是合法 JSON（否则下次启动是「文件坏了」而不是「没有暂停」）。
+        assert!(parse_paused(&render_paused(&BTreeSet::new())).is_empty());
+    }
+
+    #[test]
+    fn paused_set_restores_each_gid_only_once() {
+        let mut set = PausedSet::default();
+        set.insert("a1");
+        assert!(set.contains("a1"));
+        assert!(set.mark_restored("a1"), "第一次补发");
+        assert!(!set.mark_restored("a1"), "同一个 gid 不能每 2 秒补发一次");
+        set.remove("a1");
+        assert!(!set.contains("a1"));
+        assert!(set.mark_restored("a1"), "移除后重新暂停应当能再补发一次");
     }
 
     #[test]
