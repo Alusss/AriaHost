@@ -579,6 +579,24 @@ fn semantic_methods_use_expected_wire_names_and_params() {
     assert_eq!(requests[6]["params"], json!(["token:tok", "gid-1"]));
 }
 
+/// 判据 #2 的配套：`worker.rs` 要写 `tell_stopped(-N, N)` 取最近 N 条。
+/// 负 offset 必须原样进 JSON（历史上这里曾把参数定成 `u32`，负数根本传不进来）。
+#[test]
+fn tell_stopped_accepts_negative_offset() {
+    let server = FakeServer::start(1, |request| {
+        let id = request["id"].clone();
+        jsonrpc_ok(&id, json!([]))
+    });
+
+    let client = server.client(Some("tok"));
+    assert!(client.tell_stopped(-5, 25).expect("tellStopped").is_empty());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "aria2.tellStopped");
+    assert_eq!(requests[0]["params"], json!(["token:tok", -5, 25]));
+}
+
 // ---------------------------------------------------------------------------
 // H. 配置与脱敏
 // ---------------------------------------------------------------------------

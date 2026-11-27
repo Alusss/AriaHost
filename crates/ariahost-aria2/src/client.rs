@@ -394,7 +394,9 @@ impl RpcClient {
     ///
     /// 结果是 FIFO 队列，长度受 `--max-download-result` 约束（默认 1000），所以**不能**当作
     /// 完整历史：面板的「已停止」列表必须自建持久化，RPC 只当增量来源。
-    pub fn tell_stopped(&self, offset: u32, num: u32) -> Result<Vec<Value>, RpcCallError> {
+    ///
+    /// 负 offset = 从最新倒数，与 `tell_waiting` 语义一致（`worker.rs` 用 `-N, N` 取最近 N 条）。
+    pub fn tell_stopped(&self, offset: i64, num: u32) -> Result<Vec<Value>, RpcCallError> {
         self.call_typed(METHOD_TELL_STOPPED, vec![json!(offset), json!(num)])
     }
 

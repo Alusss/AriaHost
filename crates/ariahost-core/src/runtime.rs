@@ -806,6 +806,11 @@ pub trait Readiness {
     fn shutdown(&self) -> Result<(), String>;
     /// `aria2.forceShutdown`（次一级）。
     fn force_shutdown(&self) -> Result<(), String>;
+    /// `aria2.saveSession`：把 error/unfinished 列表落盘（停止链的兜底）。
+    ///
+    /// **best-effort**：最低支持的 aria2 1.19.1 与精简构建可能根本没有这个方法
+    /// （得到 `MethodNotFound`），实现者如实返回 `Err` 即可——调用方不会因此中断停止链。
+    fn save_session(&self) -> Result<(), String>;
 }
 
 /// 各项超时/轮询参数（可注入，单测用小值）。
@@ -1109,7 +1114,8 @@ impl CoreRuntime {
         }
     }
 
-    /// 优雅停止：`shutdown` → 等 `stop_grace` → `forceShutdown` → 等 `force_grace` → 强杀。
+    /// 优雅停止：`saveSession` 兜底落盘 → `shutdown` → 等 `stop_grace` → `forceShutdown`
+    /// → 等 `force_grace` → 强杀。
     ///
     /// 任何一步超时都继续往下走（**不卡死**），返回的 [`CoreStatus::forced`] 说明是否走到强杀。
     pub fn stop(
@@ -1126,6 +1132,19 @@ impl CoreRuntime {
 
         self.status.state = CoreState::Stopping;
         events(RuntimeEvent::Stopping);
+
+        // 第零段：先让 aria2 把 error/unfinished 列表落盘（R6）。
+        //
+        // 为什么在 `shutdown` **之前**：`aria2.shutdown` 一旦生效 RPC 通道就断了，
+        // 再发 `aria2.saveSession` 没有对端；而已下载字节由 `.aria2` 控制文件保住，
+        // 这里兜的是「最多 `save-session-interval`（30s）内的状态变化」。
+        // 为什么先 `try_wait`：进程已经退出时发 RPC 只会白等一次超时（500ms）。
+        // 为什么吞掉错误：`aria2.saveSession` 在最低支持的 1.19.1 与精简构建上可能不存在
+        // （`MethodNotFound`），停止链的职责是「一定停掉」，兜底落盘失败只能降级——
+        // 不能让停止链 panic，也不能因为兜底失败而卡住（与上面 `shutdown` 的错误处理同款）。
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = self.probe.save_session();
+        }
 
         // 第一段：优雅。
         let _ = self.probe.shutdown();
@@ -1420,6 +1439,12 @@ impl Readiness for RpcProbe {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    fn save_session(&self) -> Result<(), String> {
+        self.client
+            .save_session()
+            .map_err(|error| error.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1541,12 @@ mod tests {
         probes: Arc<Mutex<u32>>,
         shutdown_calls: Arc<Mutex<u32>>,
         force_calls: Arc<Mutex<u32>>,
+        /// `save_session` 被调次数（R6：停止链必须先落盘再 shutdown）。
+        save_calls: Arc<Mutex<u32>>,
+        /// 调 `save_session` 时进程是不是已经收到过停止请求（`exit` 已被置位）。
+        save_after_stop: Arc<Mutex<bool>>,
+        /// `save_session` 是否成功；`false` 模拟老版本 aria2 没有这个方法（`MethodNotFound`）。
+        save_works: bool,
         shutdown_works: bool,
         force_works: bool,
         exit: Arc<Mutex<Option<u32>>>,
@@ -1533,10 +1564,27 @@ mod tests {
                 probes: Arc::new(Mutex::new(0)),
                 shutdown_calls: Arc::new(Mutex::new(0)),
                 force_calls: Arc::new(Mutex::new(0)),
+                save_calls: Arc::new(Mutex::new(0)),
+                save_after_stop: Arc::new(Mutex::new(false)),
+                save_works: true,
                 shutdown_works,
                 force_works,
                 exit: child_exit,
             }
+        }
+
+        /// 模拟不支持 `aria2.saveSession` 的老版本 aria2。
+        fn without_save_session(mut self) -> Self {
+            self.save_works = false;
+            self
+        }
+
+        fn save_calls(&self) -> Arc<Mutex<u32>> {
+            Arc::clone(&self.save_calls)
+        }
+
+        fn save_after_stop(&self) -> Arc<Mutex<bool>> {
+            Arc::clone(&self.save_after_stop)
         }
     }
 
@@ -1568,6 +1616,18 @@ mod tests {
                 Ok(())
             } else {
                 Err("forceShutdown 无响应".to_owned())
+            }
+        }
+
+        fn save_session(&self) -> Result<(), String> {
+            *self.save_calls.lock().expect("锁") += 1;
+            if self.exit.lock().expect("锁").is_some() {
+                *self.save_after_stop.lock().expect("锁") = true;
+            }
+            if self.save_works {
+                Ok(())
+            } else {
+                Err("Method not found: aria2.saveSession".to_owned())
             }
         }
     }
@@ -1662,6 +1722,82 @@ mod tests {
             names(&events.lock().expect("锁")),
             vec!["starting", "running", "stopping", "stopped"]
         );
+    }
+
+    /// R6（冻结判据 #6）：停止链必须先把 error/unfinished 列表落盘，再发 `shutdown`。
+    ///
+    /// 判据靠假件的时间线取证：`save_session` 被调时 `exit` 必须**还没**被置位
+    /// （置位等于「已经发过停止请求」），所以这条断言能区分「先落盘后停」与「先停后落盘」。
+    #[test]
+    fn stop_saves_session_before_shutdown() {
+        let exit = Arc::new(Mutex::new(None));
+        let child_exit = Arc::clone(&exit);
+        let spawner = FakeSpawner::new(move |_| {
+            Box::new(FakeChild::shared(5151, Arc::clone(&child_exit), 0))
+        });
+        let probe = FakeProbe::new(1, true, true, Arc::clone(&exit));
+        let save_calls = probe.save_calls();
+        let save_after_stop = probe.save_after_stop();
+        let mut runtime = CoreRuntime::new(Box::new(spawner), Box::new(probe), fast_timeouts());
+
+        let (_events, mut callback) = recorder();
+        runtime.start(&spec(), &mut callback).expect("应就绪");
+        let stopped = runtime.stop(&mut callback).expect("应停");
+        assert_eq!(stopped.state, CoreState::Stopped);
+        assert_eq!(
+            *save_calls.lock().expect("锁"),
+            1,
+            "停止链必须恰好调一次 saveSession"
+        );
+        assert!(
+            !*save_after_stop.lock().expect("锁"),
+            "saveSession 必须在 shutdown 之前调，不能等 aria2 已经在退了再落盘"
+        );
+    }
+
+    /// 降级路径：老版本 aria2 没有 `aria2.saveSession`（`MethodNotFound`）。
+    /// 兜底落盘失败**不得**影响停止链——不 panic、不提前返回，照样走到强杀。
+    #[test]
+    fn stop_degrades_when_save_session_is_unsupported() {
+        let exit = Arc::new(Mutex::new(None));
+        let spawner = FakeSpawner::new(|_| Box::new(FakeChild::new(7171, None, 0)));
+        let probe = FakeProbe::new(1, false, false, Arc::clone(&exit)).without_save_session();
+        let save_calls = probe.save_calls();
+        let mut runtime = CoreRuntime::new(Box::new(spawner), Box::new(probe), fast_timeouts());
+
+        let (events, mut callback) = recorder();
+        runtime.start(&spec(), &mut callback).expect("应就绪");
+        let stopped = runtime
+            .stop(&mut callback)
+            .expect("saveSession 失败不得影响停止");
+        assert_eq!(stopped.state, CoreState::Stopped);
+        assert!(stopped.forced, "shutdown/forceShutdown 都无效 → 应走到强杀");
+        assert_eq!(*save_calls.lock().expect("锁"), 1);
+        assert_eq!(
+            names(&events.lock().expect("锁")),
+            vec!["starting", "running", "stopping", "stopped"]
+        );
+    }
+
+    /// 进程在 stop 前已被外部杀掉：不再白发 `saveSession`（RPC 没有对端，只会白等一次超时）。
+    #[test]
+    fn stop_skips_save_session_when_child_is_already_gone() {
+        let exit = Arc::new(Mutex::new(None));
+        let child_exit = Arc::clone(&exit);
+        let spawner = FakeSpawner::new(move |_| {
+            Box::new(FakeChild::shared(8181, Arc::clone(&child_exit), 0))
+        });
+        let probe = FakeProbe::new(1, true, true, Arc::clone(&exit));
+        let save_calls = probe.save_calls();
+        let mut runtime = CoreRuntime::new(Box::new(spawner), Box::new(probe), fast_timeouts());
+
+        let (_events, mut callback) = recorder();
+        runtime.start(&spec(), &mut callback).expect("应就绪");
+        // 外部把进程杀掉：子进程 try_wait 立刻报已退出。
+        *exit.lock().expect("锁") = Some(0);
+        let stopped = runtime.stop(&mut callback).expect("仍应正常收尾");
+        assert_eq!(stopped.state, CoreState::Stopped);
+        assert_eq!(*save_calls.lock().expect("锁"), 0, "进程已死就别再发 RPC");
     }
 
     #[test]
